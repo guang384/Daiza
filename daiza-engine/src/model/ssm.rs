@@ -87,6 +87,9 @@ fn l2norm_inplace(x: &mut [f32], eps: f32) {
 /// 融合 5 个原步骤为 2 pass(减少 S 流量 50%):
 /// - Pass 1: s *= decay 同时累加 kv_mem[i] = sum_j S[i,j] * k[j]
 /// - Pass 2: S += delta ⊗ k 同时计算 y[i] = sum_j S_new[i,j] * q[j]
+///
+/// ★ P0-2 优化: 内层 j 循环手写 AVX2 (head_dim=128 = 16 × 8-wide FMA)
+///   原标量循环有 read-after-write 依赖,rustc 无法自动向量化
 #[inline]
 pub(crate) fn ssm_scan_vhead(
     s: &mut [f32],
@@ -106,6 +109,33 @@ pub(crate) fn ssm_scan_vhead(
 
     let mut kv_mem = [0.0f32; 128];
 
+    // Pass 1 + Pass 2 (AVX2 向量化的内层循环)
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        #[allow(unsafe_code)]
+        unsafe {
+            ssm_scan_pass1_avx2(s, k_head, decay, &mut kv_mem, head_dim);
+            ssm_scan_pass2_avx2(s, q_head, k_head, v_head, &kv_mem, beta, y, head_dim);
+        }
+        return;
+    }
+    // Fallback: 标量实现(非 x86_64 或无 AVX2)
+    ssm_scan_scalar(s, y, q_head, k_head, v_head, decay, beta, &mut kv_mem, head_dim);
+}
+
+/// 标量 fallback(与 AVX2 版本逻辑一致)
+#[inline(never)]
+fn ssm_scan_scalar(
+    s: &mut [f32],
+    y: &mut [f32],
+    q_head: &[f32],
+    k_head: &[f32],
+    v_head: &[f32],
+    decay: f32,
+    beta: f32,
+    kv_mem: &mut [f32; 128],
+    head_dim: usize,
+) {
     // Pass 1: s *= decay 同时累加 kv_mem
     for i in 0..head_dim {
         let srow = &mut s[i * head_dim..(i + 1) * head_dim];
@@ -117,7 +147,6 @@ pub(crate) fn ssm_scan_vhead(
         }
         kv_mem[i] = acc;
     }
-
     // Pass 2: S += delta ⊗ k 同时计算 y
     for i in 0..head_dim {
         let di = (v_head[i] - kv_mem[i]) * beta;
@@ -131,6 +160,85 @@ pub(crate) fn ssm_scan_vhead(
     }
 }
 
+/// AVX2 向量化的 Pass 1: s *= decay 同时累加 kv_mem[i] = sum_j s[i,j] * k[j]
+///
+/// 内层 128 元素循环 = 16 次 8-wide FMA,完全打破标量依赖链
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_code)]
+#[inline]
+unsafe fn ssm_scan_pass1_avx2(
+    s: &mut [f32],
+    k_head: &[f32],
+    decay: f32,
+    kv_mem: &mut [f32; 128],
+    head_dim: usize,
+) {
+    use core::arch::x86_64::*;
+    let decay_v = _mm256_set1_ps(decay);
+    for i in 0..head_dim {
+        let srow = &mut s[i * head_dim..(i + 1) * head_dim];
+        let mut acc = _mm256_setzero_ps();
+        for j in (0..head_dim).step_by(8) {
+            let s_old = _mm256_loadu_ps(srow.as_ptr().add(j));
+            let k = _mm256_loadu_ps(k_head.as_ptr().add(j));
+            let s_new = _mm256_mul_ps(s_old, decay_v);
+            _mm256_storeu_ps(srow.as_mut_ptr().add(j), s_new);
+            acc = _mm256_fmadd_ps(s_new, k, acc);
+        }
+        kv_mem[i] = horizontal_sum_ps(acc);
+    }
+}
+
+/// AVX2 向量化的 Pass 2: S += delta ⊗ k 同时计算 y[i] = sum_j S_new[i,j] * q[j]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_code)]
+#[inline]
+unsafe fn ssm_scan_pass2_avx2(
+    s: &mut [f32],
+    q_head: &[f32],
+    k_head: &[f32],
+    v_head: &[f32],
+    kv_mem: &[f32; 128],
+    beta: f32,
+    y: &mut [f32],
+    head_dim: usize,
+) {
+    use core::arch::x86_64::*;
+    for i in 0..head_dim {
+        let di = (v_head[i] - kv_mem[i]) * beta;
+        let di_v = _mm256_set1_ps(di);
+        let srow = &mut s[i * head_dim..(i + 1) * head_dim];
+        let mut acc = _mm256_setzero_ps();
+        for j in (0..head_dim).step_by(8) {
+            let s_old = _mm256_loadu_ps(srow.as_ptr().add(j));
+            let k = _mm256_loadu_ps(k_head.as_ptr().add(j));
+            let q = _mm256_loadu_ps(q_head.as_ptr().add(j));
+            let s_new = _mm256_fmadd_ps(di_v, k, s_old);
+            _mm256_storeu_ps(srow.as_mut_ptr().add(j), s_new);
+            acc = _mm256_fmadd_ps(s_new, q, acc);
+        }
+        y[i] = horizontal_sum_ps(acc);
+    }
+}
+
+/// __m256 → f32 横向求和(纯寄存器内,无 store)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[inline]
+unsafe fn horizontal_sum_ps(v: core::arch::x86_64::__m256) -> f32 {
+    use core::arch::x86_64::*;
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(hi, lo);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+}
+
 /// 单 token 前向 (decode)
 ///
 /// 输入:`h` 为主残差流(上一 block 输出)
@@ -141,10 +249,8 @@ pub fn ssm_forward_into(
     w: &SsmBlockWeights,
     cfg: &crate::model::Config,
     state: &mut SsmState,
-    pos: usize,
     ws: &mut Workspace,
 ) {
-    let _ = pos;
     let inner = cfg.ssm_inner_size;              // 6144 = num_v_heads * head_v_dim
     let num_k_heads = cfg.ssm_group_count;        // 16  (GGUF 命名误导, 实际 num_k_heads)
     let state_size = cfg.ssm_state_size;          // 128 = head_k_dim = head_v_dim
@@ -166,48 +272,39 @@ pub fn ssm_forward_into(
     // 3. Conv1d (depthwise, causal, kernel=4) + silu on cat(q,k,v)
     if state.conv_history.is_empty() {
         state.conv_history.resize(conv_k * qkv_full_len, 0.0);
+        state.conv_head = 0;
     }
-    // 滑窗左移
-    for t in 0..conv_k - 1 {
-        let src = (t + 1) * qkv_full_len;
-        let dst = t * qkv_full_len;
-        state.conv_history.copy_within(src..src + qkv_full_len, dst);
-    }
-    // 末位写当前 qkv
-    let cur_offset = (conv_k - 1) * qkv_full_len;
+    // ★ P2-2: 环形 buffer — 写入 conv_head 行(最旧位置), 然后 head 前进
+    //   原实现滑窗左移 O((conv_k-1)*qkv_full_len) copy, 现只写 1 行
+    let cur_offset = state.conv_head * qkv_full_len;
     state.conv_history[cur_offset..cur_offset + qkv_full_len].copy_from_slice(&ws.ssm_qkv);
+    state.conv_head = (state.conv_head + 1) % conv_k;
 
     // depthwise conv1d + silu
     // ssm_conv1d.weight GGUF dims=[conv_k=4, qkv_full_len=10240]
     //   行优先存储: (channel=ch, kernel_pos=t) 偏移 = ch * conv_k + t
     //
-    // ★ 循环顺序交换(零成本优化):外层 t,内层 ch
-    //   原顺序:外层 ch(10240),内层 t(4) — conv_history 访问 stride=10240,
-    //   每 t 读取 40KB,4 次全部 L1 cache miss
-    //   新顺序:外层 t(4),内层 ch(10240) — conv_history 连续读取,
-    //   rustc 自动 AVX2 向量化 saxpy,cache 完美命中
+    // ★ P2-2: 环形读取 — 第 t 个历史 token 在 (conv_head + t) % conv_k 行
+    //   conv_head 现指向最旧 token, t=0 最旧, t=conv_k-1 最新
+    //   conv_k=4 行共 160KB 全在 L2, 环形访问顺序不影响 cache 命中
     let conv_w = &w.ssm_conv1d.data;
     // 先清零 conv_out(fill 更易被识别为 memset)
     ws.ssm_conv_out.fill(0.0);
-    // 外层 t,内层 ch:hist_row[ch] 连续,conv_w[ch*conv_k+t] stride=4 但总 size 仅 160KB
-    // (放得下 L2,硬件预取器能识别 stride 模式)
     for t in 0..conv_k {
-        let hist_row = &state.conv_history[t * qkv_full_len..(t + 1) * qkv_full_len];
+        let row = (state.conv_head + t) % conv_k;
+        let hist_row = &state.conv_history[row * qkv_full_len..(row + 1) * qkv_full_len];
         for ch in 0..qkv_full_len {
             ws.ssm_conv_out[ch] += hist_row[ch] * conv_w[ch * conv_k + t];
         }
     }
-    // ★ silu 融合进拆分 copy + SIMD silu_fast
+    // ★ P2-9: silu 向量化 — 原 10240 次 silu_fast (broadcast+extract 浪费 7 lane)
+    //   改为先原地 SIMD silu (8-way),再 memcpy 拆分
     //   10240 次/SSM 块 × 48 SSM 块 = 491520 次/token
-    //   silu_fast 内部走 AVX2 8-way exp,标量 ~30c vs SIMD ~1.5c
-    use crate::math::simd_exp::silu_fast;
-    for i in 0..qkv_dim {
-        ws.ssm_q[i] = silu_fast(ws.ssm_conv_out[i]);
-        ws.ssm_k[i] = silu_fast(ws.ssm_conv_out[qkv_dim + i]);
-    }
-    for i in 0..inner {
-        ws.ssm_v[i] = silu_fast(ws.ssm_conv_out[2 * qkv_dim + i]);
-    }
+    use crate::math::simd_exp::silu_inplace_simd;
+    silu_inplace_simd(&mut ws.ssm_conv_out[..2 * qkv_dim + inner]);
+    ws.ssm_q[..qkv_dim].copy_from_slice(&ws.ssm_conv_out[..qkv_dim]);
+    ws.ssm_k[..qkv_dim].copy_from_slice(&ws.ssm_conv_out[qkv_dim..2 * qkv_dim]);
+    ws.ssm_v[..inner].copy_from_slice(&ws.ssm_conv_out[2 * qkv_dim..2 * qkv_dim + inner]);
 
     // 4. q/k per-head L2 normalization (无权重, use_qk_l2norm_in_kernel)
     for h_i in 0..num_k_heads {
@@ -244,8 +341,6 @@ pub fn ssm_forward_into(
     // 注:SSM scan 计算量仅 75M FMA/token(vs matvec 20G FMA/token,占 0.3%),
     // 并行化经实测无收益(spawn 开销 > 并行收益),保持串行。
     let state_buf = &mut state.state;
-    // 清零 y(fill 更易被识别为 memset)
-    ws.ssm_y.fill(0.0);
 
     for vh in 0..num_v_heads {
         let kh = vh / v_heads_per_group;

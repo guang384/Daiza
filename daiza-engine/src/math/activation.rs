@@ -1,19 +1,6 @@
-//! 激活函数:SiLU/Swish + SwiGLU
+//! SwiGLU 激活函数
 
-use crate::math::simd_exp::{silu_fast, silu_inplace_simd, swiglu_inplace_simd};
-
-/// SiLU / Swish / x * sigmoid(x)
-///
-/// ★ 优化:用 SIMD exp 内核(标量入口,内部走 AVX2)
-#[inline]
-pub fn silu(x: f32) -> f32 {
-    silu_fast(x)
-}
-
-/// 原地 SiLU(批量 SIMD 版本)
-pub fn silu_inplace(x: &mut [f32]) {
-    silu_inplace_simd(x)
-}
+use crate::math::simd_exp::swiglu_inplace_simd;
 
 /// SwiGLU 激活:`y = silu(gate) * up`
 ///

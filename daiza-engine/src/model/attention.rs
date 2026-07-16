@@ -58,7 +58,6 @@ pub fn attention_forward_into(
     w: &FullAttentionBlockWeights,
     cfg: &crate::model::Config,
     kv_cache: &mut KvCache,
-    pos: usize,
     cos_sin: (&[f32], &[f32]),
     ws: &mut Workspace,
 ) {
@@ -107,7 +106,7 @@ pub fn attention_forward_into(
     }
 
     // 7. 写入 KV cache
-    kv_cache.append(pos, &ws.attn_k, &ws.attn_v);
+    kv_cache.append(&ws.attn_k, &ws.attn_v);
 
     // 8. Attention scores + softmax + V 加权
     let n_cached = kv_cache.len;
@@ -143,9 +142,7 @@ pub fn attention_forward_into(
 
     // 9. Gated: attn_out *= sigmoid(gate) — 融合 sigmoid + multiply
     math::sigmoid_inplace_simd(&mut ws.attn_gate);
-    for i in 0..ws.attn_out.len() {
-        ws.attn_out[i] *= ws.attn_gate[i];
-    }
+    math::mul_inplace_simd(&mut ws.attn_out, &ws.attn_gate);
 
     // 10. Output projection + residual: h += W_output @ attn_out
     //     ★ &ws.attn_out (不可变) + &mut h (可变) 不冲突(h 不是 ws 字段)

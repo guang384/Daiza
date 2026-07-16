@@ -13,6 +13,10 @@ pub struct SsmState {
     /// Conv1d 滑窗历史:长度 = conv_kernel 个 token 的 qkv 缓存
     /// 形状: `[conv_kernel, qkv_dim]` (qkv_dim = 2 * num_k_heads * state_size + inner)
     pub conv_history: Vec<f32>,
+    /// 环形 buffer 头指针:指向最旧的 token 行 (P2-2)
+    /// 写入新 token 时覆盖此位置, 然后 head = (head + 1) % conv_kernel
+    /// 读取时第 t 个历史 token 在 (head + t) % conv_kernel 行
+    pub conv_head: usize,
 }
 
 impl SsmState {
@@ -22,11 +26,13 @@ impl SsmState {
         Self {
             state: vec![0.0; n],
             conv_history: Vec::new(),
+            conv_head: 0,
         }
     }
 
     pub fn reset(&mut self) {
         self.state.fill(0.0);
         self.conv_history.clear();
+        self.conv_head = 0;
     }
 }

@@ -29,14 +29,14 @@ fn main() -> Result<()> {
 
     // --inspect 模式:只显示元信息
     if prompt == "--inspect" {
-        let engine = Engine::load_metadata_only(&gguf_path)?;
+        let engine = Engine::load(&gguf_path)?;
         engine.print_summary();
         return Ok(());
     }
 
     // --dump-template 模式:输出 chat_template 的原始字节(用于调试 emoji 问题)
     if prompt == "--dump-template" {
-        let engine = Engine::load_metadata_only(&gguf_path)?;
+        let engine = Engine::load(&gguf_path)?;
         if let Some(tmpl) = engine.gguf.metadata.get_str("tokenizer.chat_template") {
             // 输出原始字节(十六进制)以便区分 brain emoji 与字面量 "mind"
             let bytes: Vec<u8> = tmpl.bytes().collect();

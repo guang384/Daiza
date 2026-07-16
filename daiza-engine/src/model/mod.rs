@@ -32,8 +32,7 @@ pub mod block;
 pub mod forward;
 pub mod workspace;
 
-pub use block::Block;
 pub use config::Config;
 pub use forward::{ForwardContext, ModelState};
-pub use weights::{BlockWeights, FullAttentionBlockWeights, GlobalWeights, SsmBlockWeights, WeightLoader};
+pub use weights::{BlockWeights, FullAttentionBlockWeights, GlobalWeights, SsmBlockWeights};
 pub use workspace::Workspace;

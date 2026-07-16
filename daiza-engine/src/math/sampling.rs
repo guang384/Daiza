@@ -149,13 +149,3 @@ pub fn sample_top_k_top_p_into(
     }
     chosen
 }
-
-/// 从 logits 中采样一个 token(向后兼容包装,内部创建临时 buffer)
-pub fn sample_top_k_top_p(
-    logits: &[f32],
-    params: SamplingParams,
-    rng: &mut impl FnMut() -> f32,
-) -> usize {
-    let mut buf = SamplingBuffers::new(logits.len());
-    sample_top_k_top_p_into(logits, params, rng, &mut buf)
-}

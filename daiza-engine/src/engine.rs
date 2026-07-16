@@ -63,11 +63,6 @@ impl Engine {
         })
     }
 
-    /// 只解析 GGUF 头部(用于调试)
-    pub fn load_metadata_only(path: &Path) -> Result<Self> {
-        Self::load(path)
-    }
-
     /// 一次性加载所有 block 权重到内存(约 13GB)
     pub fn load_weights(&mut self) -> Result<()> {
         let w = LoadedWeights::load_all(&self.gguf, &self.config)?;
@@ -152,30 +147,32 @@ impl Engine {
         let mut ctx = make_context(weights, cfg);
 
         // 4. prefill: 批量前向(一次读权重, 13GB 只读一次而非 N 次)
+        //    logits 直接写入 ctx.logits_buf,decode 阶段复用同一 buffer(无 clone)
         let n_input = input_ids.len();
         let prefill_start = std::time::Instant::now();
-        let last_logits = if n_input == 0 {
-            None
-        } else if n_input == 1 {
-            // 单 token 直接用 forward_single_token(避免 batch 额外开销)
-            Some(forward_single_token(&mut ctx, input_ids[0])?)
-        } else {
-            Some(forward_batch(&mut ctx, &input_ids, 0)?)
-        };
+        if n_input == 1 {
+            forward_single_token(&mut ctx, input_ids[0])?;
+        } else if n_input > 1 {
+            forward_batch(&mut ctx, &input_ids, 0)?;
+        }
         let prefill_ms = prefill_start.elapsed().as_millis();
         eprintln!("\r[prefill] {n_input}/{n_input} done");
         eprintln!("[bench] load={load_ms}ms prefill({n_input}t)={prefill_ms}ms (~{}ms/tok)",
             if n_input > 0 { prefill_ms / n_input as u128 } else { 0 });
 
-        // 4. decode:采样 → 前向 → 重复
+        if n_input == 0 {
+            return Ok(String::new());
+        }
+
+        // 5. decode:采样 → 前向 → 重复
+        //    每 token 直接读 ctx.logits_buf 采样,前向覆盖 ctx.logits_buf(无 clone)
         let mut rng = LcgRng::new(0xC0FFEE);
         let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
-        let mut current_logits = last_logits.ok_or_else(|| {
-            crate::BonsaiError::Model("no logits from prefill".into())
-        })?;
 
-        // [debug] 打印 prefill 后的 top-5 logits
-        {
+        // [debug] 打印 prefill 后的 top-K logits(用 DAIZA_DEBUG_LOGITS env var 控制,
+        //   避免每次生成都做一次 O(n log n) sort on 248320 元素,~15-20ms 损耗)
+        if std::env::var("DAIZA_DEBUG_LOGITS").is_ok() {
+            let current_logits = &ctx.logits_buf;
             eprintln!("[debug] logits len: {}, any NaN: {}",
                 current_logits.len(),
                 current_logits.iter().any(|x| x.is_nan()));
@@ -186,7 +183,6 @@ impl Engine {
                 let tok_str = self.tokenizer.vocab.tokens.get(*tid).cloned().unwrap_or_default();
                 eprintln!("  id={tid:>6} logit={logit:>10.4} token={tok_str:?}");
             }
-            // 检查 logit 范围
             let max_l = indexed[0].1;
             let min_l = indexed.last().unwrap().1;
             eprintln!("[debug] logit range: [{min_l:.4}, {max_l:.4}]");
@@ -195,18 +191,20 @@ impl Engine {
         let decode_start = std::time::Instant::now();
         // 预分配采样 buffer(复用 scaled[248320] + indices[248320] = ~3MB),
         // 避免每 token 重新分配
-        let mut sampling_buf = SamplingBuffers::new(current_logits.len());
+        let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
         for step in 0..max_tokens {
-            // 采样一个 token
-            let next_id = sample_top_k_top_p_into(&current_logits, params, &mut || rng.next_f32(), &mut sampling_buf);
+            // 采样一个 token(直接读 ctx.logits_buf,无需 clone)
+            let next_id = sample_top_k_top_p_into(
+                &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
+            );
             // 遇到 EOS 提前停止
             if next_id as u32 == self.config.eos_token_id {
                 break;
             }
             generated_ids.push(next_id as u32);
 
-            // 前向得到新 logits
-            current_logits = forward_single_token(&mut ctx, next_id as u32)?;
+            // 前向(覆盖 ctx.logits_buf,无 clone)
+            forward_single_token(&mut ctx, next_id as u32)?;
 
             eprint!("\r[decode] {step}/{max_tokens}");
             // 流式输出当前生成的 token 文本
@@ -289,7 +287,7 @@ impl Engine {
         );
         println!();
         println!("[Dtype histogram]");
-        crate::model::weights::WeightLoader::print_dtype_summary(&self.gguf);
+        crate::model::weights::LoadedWeights::print_dtype_summary(&self.gguf);
         println!();
         println!("[Sample tensor shapes]");
         for name in [

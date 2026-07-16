@@ -17,7 +17,6 @@ pub mod tensor;
 
 pub use dtype::{byte_size, TensorType};
 pub use quant::{
-    bf16_to_f32, dequantize_q1_0, dequantize_q1_0_row, dequantize_q1_0_row_into, dot_q1_0_row,
-    f16_to_f32,
+    bf16_to_f32, dequantize_q1_0, dequantize_q1_0_row_into, f16_to_f32,
 };
-pub use tensor::{Tensor, TensorView};
+pub use tensor::Tensor;

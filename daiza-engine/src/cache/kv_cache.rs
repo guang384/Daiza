@@ -17,18 +17,23 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    pub fn new(n_kv_heads: usize, head_dim: usize, context_length: usize) -> Self {
+    /// 初始预留 4096 token 容量(避免 32GB 全 context_length 虚拟地址预留),
+    /// Vec 会按需 grow(2x amortized),对长对话也只是几次 realloc
+    const INITIAL_TOKEN_CAPACITY: usize = 4096;
+
+    pub fn new(n_kv_heads: usize, head_dim: usize, _context_length: usize) -> Self {
         let per_token = n_kv_heads * head_dim;
+        let cap = Self::INITIAL_TOKEN_CAPACITY * per_token;
         Self {
-            k: Vec::with_capacity(context_length * per_token),
-            v: Vec::with_capacity(context_length * per_token),
+            k: Vec::with_capacity(cap),
+            v: Vec::with_capacity(cap),
             len: 0,
             per_token,
         }
     }
 
     /// 追加一个新 token 的 K/V 向量
-    pub fn append(&mut self, _pos: usize, k: &[f32], v: &[f32]) {
+    pub fn append(&mut self, k: &[f32], v: &[f32]) {
         self.k.extend_from_slice(k);
         self.v.extend_from_slice(v);
         self.len += 1;

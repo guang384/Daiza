@@ -153,19 +153,6 @@ pub fn dequantize_q1_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
-/// 反量化单行(用于 GEMM 中按需反量化,避免一次性展开整个大矩阵)
-///
-/// - `data`:整个 Q1_0 张量的字节
-/// - `row_idx`:第几行(0-based)
-/// - `n_cols`:权重列数(输入维度)
-pub fn dequantize_q1_0_row(data: &[u8], row_idx: usize, n_cols: usize) -> Vec<f32> {
-    // Q1_0 在 GGUF 中按行连续存储:第 i 行从第 i*n_cols 字节偏移开始(按权重)
-    // 每 128 权重占 18 字节,所以第 i 行的字节偏移 = i * n_cols / 128 * 18
-    let row_byte_offset = row_idx * (n_cols.div_ceil(Q1_0_GROUP_SIZE) * Q1_0_BLOCK_BYTES);
-    let row_bytes = &data[row_byte_offset..];
-    dequantize_q1_0(row_bytes, n_cols)
-}
-
 /// 反量化单行,写入提供的缓冲区(避免每行分配 Vec)
 ///
 /// - `data`:整个 Q1_0 张量的字节
@@ -208,47 +195,6 @@ pub fn dequantize_q1_0_row_into(data: &[u8], row_idx: usize, n_cols: usize, out:
     }
 }
 
-/// 直接计算 Q1_0 一行与 x 的点积,不分配中间 F32 缓冲
-///
-/// 利用 Q1_0 的二值性质:`w_k = bit_k ? scale : -scale`
-/// - `dot = sum_k w_k * x_k = sum_g scale_g * (2 * sum_pos_g - sum_x_g)`
-///   其中 `sum_pos_g` 是该组中 bit=1 对应的 x 之和,`sum_x_g` 是该组全部 x 之和
-///
-/// **关键优化 v4**:AVX2 intrinsics 手写内核 + scalar fallback
-///
-/// v2/v3 的 safe Rust 版本经汇编验证完全未向量化(全是 `vmulss`/`vaddss` 标量),
-/// 即使 `RUSTFLAGS="-C target-feature=+avx2,+fma"` 也无效 —— rustc 无法把
-/// `(b>>n)&1` + `as f32` 这种位运算+类型转换组合识别为可向量化模式。
-///
-/// v4 直接手写 AVX2 内核:
-/// - 每 byte_idx (16 次) 处理 1 个 sign byte + 8 个连续 x (单 __m256)
-/// - sign byte → 8 个 ±1.0 f32 (单 __m256):`broadcast b` + `and masks`
-///   + `cmpgt zero` + `blendv ±1.0`
-/// - `vfmadd231ps` 累加 → 单 group 16 次 FMA
-/// - 对比标量 128 次 vmulss/vaddss,理论 8x 加速
-///
-/// 仍保留 scalar fallback 供非 x86_64 / 无 AVX2 环境使用。
-///
-/// - `data`:整个 Q1_0 张量的字节
-/// - `row_idx`:第几行(0-based)
-/// - `n_cols`:权重列数(输入维度)
-/// - `x`:输入向量,长度必须等于 `n_cols`
-pub fn dot_q1_0_row(data: &[u8], row_idx: usize, n_cols: usize, x: &[f32]) -> f32 {
-    debug_assert!(x.len() >= n_cols);
-    #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx2")
-        && std::is_x86_feature_detected!("fma")
-        && std::is_x86_feature_detected!("f16c")
-    {
-        // 调用 AVX2 + F16C 内核 —— unsafe 在此处用 deny(unsafe_code) 全局豁免
-        #[allow(unsafe_code)]
-        unsafe {
-            return dot_q1_0_row_avx2(data, row_idx, n_cols, x);
-        }
-    }
-    dot_q1_0_row_scalar(data, row_idx, n_cols, x)
-}
-
 /// Sign bit LUT(查表优化):每个 sign byte (0..256) 对应 8 个 ±1.0 的固定组合。
 ///
 /// 原实现:AND(bit_mask) → CMPGT → BLENDV → FMA,4-cycle 依赖链,且 BLENDV 占用
@@ -280,6 +226,22 @@ const SIGN_LUT: [SignLutEntry; 256] = {
     lut
 };
 
+/// 一次性 runtime AVX2+FMA+F16C feature 检测 (P2-1)
+///
+/// 供 `weights.rs` 在循环外调用一次, 避免每行 `dot_q1_0_row` 内部的
+/// `is_x86_feature_detected!` atomic load + branch 开销 (~3c × 4.15M 行/token)。
+#[cfg(target_arch = "x86_64")]
+pub fn avx2_q1_0_available() -> bool {
+    std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("fma")
+        && std::is_x86_feature_detected!("f16c")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn avx2_q1_0_available() -> bool {
+    false
+}
+
 /// AVX2 内联版本(unsafe,需 runtime feature detect)
 ///
 /// 两项关键优化(相比 v7 baseline):
@@ -291,7 +253,8 @@ const SIGN_LUT: [SignLutEntry; 256] = {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
-unsafe fn dot_q1_0_row_avx2(
+#[inline]
+pub unsafe fn dot_q1_0_row_avx2(
     data: &[u8],
     row_idx: usize,
     n_cols: usize,
@@ -415,4 +378,173 @@ pub fn dot_q1_0_row_scalar(data: &[u8], row_idx: usize, n_cols: usize, x: &[f32]
         acc += scale * group_acc;
     }
     acc
+}
+
+/// 批量计算 Q1_0 一行与多个 x 的点积 (P1-4 优化)
+///
+/// 固定 `row_idx`, 对 `n_batch` 个 `x[t]` 同时计算点积, 写入 `y[t * y_stride]`。
+///
+/// **核心优化**: scale 广播和 LUT 查表在 group 内只做一次, 对 batch 内所有 token 复用,
+/// 消除原 `matvec_batch_into_slice` 中 `dot_q1_0_row` 重复加载 LUT 和 scale 的开销。
+///
+/// - `x`: `[n_batch * x_stride]` 行优先 (通常 `x_stride = n_cols`)
+/// - `y`: `[n_batch * y_stride]` 输出 (通常 `y_stride = 1`, 即 `y[t]` 是第 t 个输出)
+pub fn dot_q1_0_row_batch(
+    data: &[u8],
+    row_idx: usize,
+    n_cols: usize,
+    x: &[f32],
+    x_stride: usize,
+    n_batch: usize,
+    y: &mut [f32],
+    y_stride: usize,
+) {
+    debug_assert!(x.len() >= n_batch * x_stride);
+    debug_assert!(y.len() >= n_batch * y_stride);
+    if n_batch == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("fma")
+        && std::is_x86_feature_detected!("f16c")
+    {
+        #[allow(unsafe_code)]
+        unsafe {
+            dot_q1_0_row_batch_avx2(data, row_idx, n_cols, x, x_stride, n_batch, y, y_stride);
+        }
+        return;
+    }
+    // Fallback: 逐 token 调用 scalar
+    for t in 0..n_batch {
+        let xt = &x[t * x_stride..t * x_stride + n_cols];
+        y[t * y_stride] = dot_q1_0_row_scalar(data, row_idx, n_cols, xt);
+    }
+}
+
+/// AVX2 batched kernel
+///
+/// **设计**: 分块 2 token, 每 group 内 4 路 FMA 并行 × 2 token = 8 个 group-level acc,
+/// 加上 4 个 LUT temp + 1 个 scale_v = 13 寄存器, 不溢出。
+///
+/// 相比原 `dot_q1_0_row_avx2` 调用 n_batch 次:
+/// - LUT load 次数从 n_batch × 64 降到 64 (节省 ~75%)
+/// - scale F16C + broadcast 从 n_batch 降到 1 (节省 ~96%)
+/// - hsum 次数不变 (n_batch, 每 token 行末一次)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+#[allow(unsafe_code)]
+#[inline]
+pub unsafe fn dot_q1_0_row_batch_avx2(
+    data: &[u8],
+    row_idx: usize,
+    n_cols: usize,
+    x: &[f32],
+    x_stride: usize,
+    n_batch: usize,
+    y: &mut [f32],
+    y_stride: usize,
+) {
+    use std::arch::x86_64::*;
+    let groups_per_row = n_cols / Q1_0_GROUP_SIZE;
+    let row_byte_offset = row_idx * (groups_per_row * Q1_0_BLOCK_BYTES);
+
+    // ★ 分块 2 token: 寄存器分配 = 2 row_acc + 8 group_acc + 4 LUT + 1 scale = 15 寄存器
+    let mut t_start = 0usize;
+    while t_start < n_batch {
+        let has_pair = t_start + 1 < n_batch;
+
+        // 行级累加器 (跨 group 累加, 行末一次 hsum)
+        let mut row_acc0 = _mm256_setzero_ps();
+        let mut row_acc1 = _mm256_setzero_ps();
+
+        for g in 0..groups_per_row {
+            let block_start = row_byte_offset + g * Q1_0_BLOCK_BYTES;
+            let scale_bits = u16::from_le_bytes([
+                *data.get_unchecked(block_start),
+                *data.get_unchecked(block_start + 1),
+            ]);
+            // ★ scale F16C + broadcast 每 group 只做一次, 2 token 共享
+            let scale_xmm = _mm_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
+            let scale_v = _mm256_broadcastss_ps(scale_xmm);
+            let sign_ptr = data.as_ptr().add(block_start + 2);
+            let x_base0 = x.as_ptr().add(t_start * x_stride + g * Q1_0_GROUP_SIZE);
+            let x_base1 = x
+                .as_ptr()
+                .add((t_start + 1) * x_stride + g * Q1_0_GROUP_SIZE);
+
+            // group 级 4 路并行 acc (每 token 一组)
+            let mut g0a = _mm256_setzero_ps();
+            let mut g1a = _mm256_setzero_ps();
+            let mut g2a = _mm256_setzero_ps();
+            let mut g3a = _mm256_setzero_ps();
+            let mut g0b = _mm256_setzero_ps();
+            let mut g1b = _mm256_setzero_ps();
+            let mut g2b = _mm256_setzero_ps();
+            let mut g3b = _mm256_setzero_ps();
+
+            for byte_idx in (0..16).step_by(4) {
+                // ★ LUT 查表提到 token 循环外, 2 token 共享 (省一半 LUT load)
+                let b0 = *sign_ptr.add(byte_idx) as usize;
+                let b1 = *sign_ptr.add(byte_idx + 1) as usize;
+                let b2 = *sign_ptr.add(byte_idx + 2) as usize;
+                let b3 = *sign_ptr.add(byte_idx + 3) as usize;
+                let lut0 = _mm256_loadu_ps(SIGN_LUT[b0].0.as_ptr());
+                let lut1 = _mm256_loadu_ps(SIGN_LUT[b1].0.as_ptr());
+                let lut2 = _mm256_loadu_ps(SIGN_LUT[b2].0.as_ptr());
+                let lut3 = _mm256_loadu_ps(SIGN_LUT[b3].0.as_ptr());
+
+                // token 0
+                g0a = _mm256_fmadd_ps(lut0, _mm256_loadu_ps(x_base0.add(byte_idx * 8)), g0a);
+                g1a = _mm256_fmadd_ps(lut1, _mm256_loadu_ps(x_base0.add((byte_idx + 1) * 8)), g1a);
+                g2a = _mm256_fmadd_ps(lut2, _mm256_loadu_ps(x_base0.add((byte_idx + 2) * 8)), g2a);
+                g3a = _mm256_fmadd_ps(lut3, _mm256_loadu_ps(x_base0.add((byte_idx + 3) * 8)), g3a);
+
+                if has_pair {
+                    g0b = _mm256_fmadd_ps(lut0, _mm256_loadu_ps(x_base1.add(byte_idx * 8)), g0b);
+                    g1b = _mm256_fmadd_ps(lut1, _mm256_loadu_ps(x_base1.add((byte_idx + 1) * 8)), g1b);
+                    g2b = _mm256_fmadd_ps(lut2, _mm256_loadu_ps(x_base1.add((byte_idx + 2) * 8)), g2b);
+                    g3b = _mm256_fmadd_ps(lut3, _mm256_loadu_ps(x_base1.add((byte_idx + 3) * 8)), g3b);
+                }
+            }
+
+            // 4 路 merge → group_acc, 然后 FMA scale 累加到 row_acc
+            let group_acc0 = _mm256_add_ps(
+                _mm256_add_ps(g0a, g1a),
+                _mm256_add_ps(g2a, g3a),
+            );
+            row_acc0 = _mm256_fmadd_ps(scale_v, group_acc0, row_acc0);
+            if has_pair {
+                let group_acc1 = _mm256_add_ps(
+                    _mm256_add_ps(g0b, g1b),
+                    _mm256_add_ps(g2b, g3b),
+                );
+                row_acc1 = _mm256_fmadd_ps(scale_v, group_acc1, row_acc1);
+            }
+        }
+
+        // 行末一次性横向求和
+        *y.get_unchecked_mut(t_start * y_stride) = horizontal_sum_avx2(row_acc0);
+        if has_pair {
+            *y.get_unchecked_mut((t_start + 1) * y_stride) = horizontal_sum_avx2(row_acc1);
+        }
+
+        t_start += if has_pair { 2 } else { 1 };
+    }
+}
+
+/// __m256 → f32 横向求和 (纯寄存器内 SSE, 无 store)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[inline]
+unsafe fn horizontal_sum_avx2(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(hi, lo);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
 }

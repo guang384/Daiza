@@ -102,20 +102,6 @@ pub fn simd_available() -> bool {
     }
 }
 
-/// SIMD exp 标量入口(自动选择 AVX2 或标量)
-pub fn exp_fast(x: f32) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    if simd_available() {
-        #[allow(unsafe_code)]
-        unsafe {
-            let v = _mm256_set1_ps(x);
-            let r = exp_ps(v);
-            return _mm256_cvtss_f32(r);
-        }
-    }
-    x.exp()
-}
-
 /// SIMD sigmoid 标量入口
 pub fn sigmoid_fast(x: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -221,6 +207,32 @@ pub fn silu_inplace_simd(x: &mut [f32]) {
     }
 }
 
+/// dst[i] *= src[i],原地修改 dst (P2-3: attn_out *= sigmoid(gate))
+pub fn mul_inplace_simd(dst: &mut [f32], src: &[f32]) {
+    debug_assert_eq!(dst.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    if simd_available() {
+        #[allow(unsafe_code)]
+        unsafe {
+            let n = dst.len();
+            let n8 = (n / 8) * 8;
+            for i in (0..n8).step_by(8) {
+                let d = _mm256_loadu_ps(dst.as_ptr().add(i));
+                let s = _mm256_loadu_ps(src.as_ptr().add(i));
+                let r = _mm256_mul_ps(d, s);
+                _mm256_storeu_ps(dst.as_mut_ptr().add(i), r);
+            }
+            for i in n8..n {
+                dst[i] *= src[i];
+            }
+            return;
+        }
+    }
+    for i in 0..dst.len() {
+        dst[i] *= src[i];
+    }
+}
+
 /// SwiGLU: gate[i] = silu(gate[i]) * up[i],原地修改 gate
 pub fn swiglu_inplace_simd(gate: &mut [f32], up: &[f32]) {
     debug_assert_eq!(gate.len(), up.len());
@@ -278,10 +290,16 @@ pub fn dot_product_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
             i += 8;
         }
         sum0 = _mm256_add_ps(sum0, sum1);
-        // 水平求和: store → scalar reduce(8 个 f32)
-        let mut tmp: [f32; 8] = [0.0; 8];
-        _mm256_storeu_ps(tmp.as_mut_ptr(), sum0);
-        tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7]
+        // ★ P1-1: 水平求和改纯寄存器内 SSE (无 store+scalar reduce)
+        //   原 store + 7 次标量 add ~5c; 寄存器内 ~3c
+        //   attention scores 调用频次高 (24 qh × n_cached × 16 attn blocks)
+        let hi = _mm256_extractf128_ps(sum0, 1);
+        let lo = _mm256_castps256_ps128(sum0);
+        let sum128 = _mm_add_ps(hi, lo);
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
     }
 }
 

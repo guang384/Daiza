@@ -28,10 +28,10 @@ pub mod simd_exp;
 
 pub use rmsnorm::{rmsnorm_inplace, rmsnorm_into};
 pub use rope::{apply_rope_partial, rope_cos_sin_mrope_text, rope_cos_sin_mrope_text_into, rope_freqs};
-pub use softmax::{softmax_inplace, softmax_masked_inplace};
-pub use activation::{silu, silu_inplace, swiglu_inplace};
-pub use sampling::{sample_top_k_top_p, sample_top_k_top_p_into, SamplingBuffers, SamplingParams};
+pub use softmax::softmax_inplace;
+pub use activation::swiglu_inplace;
+pub use sampling::{sample_top_k_top_p_into, SamplingBuffers, SamplingParams};
 pub use simd_exp::{
-    exp_fast, exp_inplace_simd, sigmoid_fast, sigmoid_inplace_simd,
+    exp_inplace_simd, mul_inplace_simd, sigmoid_fast, sigmoid_inplace_simd,
     silu_fast, silu_inplace_simd, swiglu_inplace_simd,
 };

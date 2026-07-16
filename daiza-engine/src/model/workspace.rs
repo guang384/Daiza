@@ -25,7 +25,7 @@
 //! - 大小固定(由 Config 决定),`attn_scores` 例外(随序列长度增长)
 //! - 最终输出仍返回 owned `Vec`(每 token 1 个 alloc,可接受),内部 buffer 全部复用
 
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 
 use crate::model::config::Config;
 
@@ -45,28 +45,29 @@ pub fn get_thread_pool() -> Option<&'static ThreadPool> {
     GLOBAL_POOL.get()
 }
 
-/// 持久线程池: mpsc channel + N 个 worker 线程, 消除 std::thread::scope 的创建开销
+/// 持久线程池: per-worker channel + N 个 worker 线程, 消除 std::thread::scope 的创建开销
+///
+/// ★ P1-2 优化: per-worker channel 替代共享 Mutex<Receiver>
+///   原实现 N 个 worker 抢同一个 Mutex<Receiver>, 每次 scatter_wait 派发 n_threads
+///   个任务都产生 N-way 互斥争用 (Windows Mutex lock+unlock ~200-500ns)
+///   新实现每个 worker 有独立 channel, 主线程 round-robin dispatch 无争用
 pub struct ThreadPool {
-    sender: mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>,
+    senders: Vec<mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
 impl ThreadPool {
     pub fn new(n_threads: usize) -> Self {
-        let (tx, rx) = mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
-        let rx = Arc::new(Mutex::new(rx));
+        let mut senders = Vec::with_capacity(n_threads);
         for _ in 0..n_threads {
-            let rx = Arc::clone(&rx);
+            let (tx, rx) = mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
+            senders.push(tx);
             std::thread::spawn(move || {
-                loop {
-                    let job = match rx.lock().unwrap().recv() {
-                        Ok(job) => job,
-                        Err(_) => break, // channel closed, exit
-                    };
+                for job in rx {
                     job();
                 }
             });
         }
-        Self { sender: tx }
+        Self { senders }
     }
 
     /// 提交 N 个任务并等待全部完成
@@ -80,27 +81,36 @@ impl ThreadPool {
             return;
         }
         let f = Arc::new(f);
-        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let n_threads = self.senders.len();
+        // 用 Arc<AtomicUsize> 计数替代 done channel, 减少 alloc
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for i in 0..n {
             let f = Arc::clone(&f);
-            let done_tx = done_tx.clone();
-            self.sender
-                .send(Box::new(move || {
-                    f(i);
-                    done_tx.send(()).unwrap();
-                }))
+            let done = Arc::clone(&done);
+            let job = Box::new(move || {
+                f(i);
+                done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+            // round-robin 分发到各 worker 的独立 channel
+            self.senders[i % n_threads]
+                .send(job)
                 .expect("thread pool worker panicked");
         }
-        drop(done_tx); // 确保 recv 不会永远阻塞
-        for _ in 0..n {
-            done_rx.recv().unwrap();
+        // 自旋等待所有任务完成 (短任务场景比 condvar 更快)
+        while done.load(std::sync::atomic::Ordering::SeqCst) < n {
+            std::hint::spin_loop();
         }
     }
 }
 
-/// 工作线程数,由 `DAIZA_THREADS` env var 控制,默认物理核数
+/// 工作线程数,由 `DAIZA_THREADS` env var 控制,默认所有逻辑核
 ///
 /// 缓存结果避免每次调用 `std::env::var`。第一次调用时初始化。
+///
+/// ★ P2-4 修正: 原 `(logical/2).max(1)` 假设 SMT (logical=物理×2), 但无 SMT 的 CPU
+///   (如 Intel Core Ultra 5 225H, 6P+8E=14核无SMT) 会浪费一半核数。
+///   实测 14 threads vs 7 threads: decode -18% (261→214ms/tok)。
+///   改为默认用所有逻辑核; 有 SMT 的 CPU 如需避开超线程可手动设 DAIZA_THREADS。
 pub fn thread_count() -> usize {
     use std::sync::OnceLock;
     static N_THREADS: OnceLock<usize> = OnceLock::new();
@@ -112,13 +122,12 @@ pub fn thread_count() -> usize {
                 }
             }
         }
-        // 默认:物理核数(避开 SMT 超线程,避免 false sharing)
-        // std::thread::available_parallelism 返回逻辑核数,SMT 下通常 = 物理×2
-        // 取一半更接近物理核数,但避免 0
-        let logical = std::thread::available_parallelism()
+        // 默认:所有逻辑核
+        // 无 SMT CPU (如 Arrow Lake): logical = 物理核数,全部使用
+        // 有 SMT CPU (如 Alder Lake P+HT): logical = 物理×2, SMT 线程在内存带宽场景仍能贡献
+        std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(4);
-        (logical / 2).max(1)
+            .unwrap_or(4)
     })
 }
 

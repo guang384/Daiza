@@ -9,10 +9,14 @@
 //!   - 64 个 block × 几 KB = 几 MB
 
 use crate::gguf::parser::GgufFile;
-use crate::gguf::tensor_info::{TensorInfo, TensorType};
+use crate::gguf::tensor_info::TensorType;
 use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::load_as_f32;
-use crate::tensor::quant::{dequantize_q1_0_row, dot_q1_0_row};
+use crate::tensor::quant::{
+    avx2_q1_0_available, dot_q1_0_row_batch, dot_q1_0_row_scalar,
+};
+#[cfg(target_arch = "x86_64")]
+use crate::tensor::quant::{dot_q1_0_row_avx2, dot_q1_0_row_batch_avx2};
 use crate::BonsaiError;
 
 /// Q1_0 编码的矩阵(保留原始字节,按需反量化单行)
@@ -37,29 +41,10 @@ impl Q1_0Matrix {
         })
     }
 
-    /// 反量化单行,返回长度 = cols 的 F32 向量(用于 embedding 查找)
-    #[inline]
-    pub fn row(&self, row_idx: usize) -> Vec<f32> {
-        dequantize_q1_0_row(&self.bytes, row_idx, self.cols)
-    }
-
     /// 反量化单行,写入 caller 提供的 slice(避免堆分配)
     #[inline]
     pub fn row_into_slice(&self, row_idx: usize, y: &mut [f32]) {
         crate::tensor::quant::dequantize_q1_0_row_into(&self.bytes, row_idx, self.cols, y);
-    }
-
-    /// 流式 GEMM:`y[i] = sum_j W[i, j] * x[j]`
-    ///
-    /// 使用融合点积 `dot_q1_0_row`:直接在 Q1_0 原始字节上计算点积,
-    /// 无需中间 F32 缓冲。内层循环是无分支 FMA,可被编译器自动向量化(AVX2)。
-    pub fn matvec(&self, x: &[f32]) -> Vec<f32> {
-        let k = self.cols;
-        let n = self.rows;
-        debug_assert_eq!(x.len(), k);
-        let mut y = vec![0.0f32; n];
-        self.matvec_into_slice(x, &mut y);
-        y
     }
 
     /// 流式 GEMM into caller-provided slice(避免堆分配)
@@ -67,7 +52,7 @@ impl Q1_0Matrix {
     /// `y[i] = dot_q1_0_row(W, i, k, x)`,覆盖写入 `y`(不是累加)。
     /// `y.len()` 必须等于 `self.rows`。
     ///
-    /// **多线程并行**:当 `self.rows >= 4096` 时按行切分到 N 个 OS thread,
+    /// **多线程并行**:当 `self.rows >= 1024` 时按行切分到 N 个 OS thread,
     /// 每 thread 处理 rows/N 行,各自独立累加。threads 数由 `DAIZA_THREADS` env var 控制。
     ///
     /// 优先使用全局持久线程池(若已初始化),否则回退到 `std::thread::scope`。
@@ -80,9 +65,19 @@ impl Q1_0Matrix {
         debug_assert_eq!(y.len(), n);
 
         let n_threads = crate::model::workspace::thread_count();
-        if n_threads <= 1 || n < 4096 {
+        // ★ P2-1: runtime AVX2 check 提到循环外, 避免每行 dot_q1_0_row 内部重复检测
+        let use_avx2 = avx2_q1_0_available();
+        // ★ P2-5: 阈值从 4096 降到 1024, 让 attn_k/v (1024 rows) 也走线程池
+        if n_threads <= 1 || n < 1024 {
+            #[cfg(target_arch = "x86_64")]
+            if use_avx2 {
+                for i in 0..n {
+                    y[i] = unsafe { dot_q1_0_row_avx2(&self.bytes, i, k, x) };
+                }
+                return;
+            }
             for i in 0..n {
-                y[i] = dot_q1_0_row(&self.bytes, i, k, x);
+                y[i] = dot_q1_0_row_scalar(&self.bytes, i, k, x);
             }
             return;
         }
@@ -100,9 +95,18 @@ impl Q1_0Matrix {
                 let end = (start + chunk).min(n);
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
+                #[cfg(target_arch = "x86_64")]
+                if use_avx2 {
+                    for i in start..end {
+                        unsafe {
+                            *((y_addr as *mut f32).add(i)) = dot_q1_0_row_avx2(bytes, i, k, x);
+                        }
+                    }
+                    return;
+                }
                 for i in start..end {
                     unsafe {
-                        *((y_addr as *mut f32).add(i)) = dot_q1_0_row(bytes, i, k, x);
+                        *((y_addr as *mut f32).add(i)) = dot_q1_0_row_scalar(bytes, i, k, x);
                     }
                 }
             });
@@ -120,8 +124,15 @@ impl Q1_0Matrix {
                 let start = row_start;
                 row_start += chunk_len;
                 let h = s.spawn(move || {
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 {
+                        for (i, y_i) in y_chunk.iter_mut().enumerate() {
+                            *y_i = unsafe { dot_q1_0_row_avx2(bytes, start + i, k, x) };
+                        }
+                        return;
+                    }
                     for (i, y_i) in y_chunk.iter_mut().enumerate() {
-                        *y_i = dot_q1_0_row(bytes, start + i, k, x);
+                        *y_i = dot_q1_0_row_scalar(bytes, start + i, k, x);
                     }
                 });
                 handles.push(h);
@@ -146,9 +157,19 @@ impl Q1_0Matrix {
         debug_assert_eq!(y.len(), n);
 
         let n_threads = crate::model::workspace::thread_count();
-        if n_threads <= 1 || n < 4096 {
+        // ★ P2-1: runtime AVX2 check 提到循环外
+        let use_avx2 = avx2_q1_0_available();
+        // ★ P2-5: 阈值从 4096 降到 1024, 让 attn_k/v (1024 rows) 也走线程池
+        if n_threads <= 1 || n < 1024 {
+            #[cfg(target_arch = "x86_64")]
+            if use_avx2 {
+                for i in 0..n {
+                    y[i] += unsafe { dot_q1_0_row_avx2(&self.bytes, i, k, x) };
+                }
+                return;
+            }
             for i in 0..n {
-                y[i] += dot_q1_0_row(&self.bytes, i, k, x);
+                y[i] += dot_q1_0_row_scalar(&self.bytes, i, k, x);
             }
             return;
         }
@@ -166,9 +187,18 @@ impl Q1_0Matrix {
                 let end = (start + chunk).min(n);
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
+                #[cfg(target_arch = "x86_64")]
+                if use_avx2 {
+                    for i in start..end {
+                        unsafe {
+                            *((y_addr as *mut f32).add(i)) += dot_q1_0_row_avx2(bytes, i, k, x);
+                        }
+                    }
+                    return;
+                }
                 for i in start..end {
                     unsafe {
-                        *((y_addr as *mut f32).add(i)) += dot_q1_0_row(bytes, i, k, x);
+                        *((y_addr as *mut f32).add(i)) += dot_q1_0_row_scalar(bytes, i, k, x);
                     }
                 }
             });
@@ -186,8 +216,15 @@ impl Q1_0Matrix {
                 let start = row_start;
                 row_start += chunk_len;
                 let h = s.spawn(move || {
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 {
+                        for (i, y_i) in y_chunk.iter_mut().enumerate() {
+                            *y_i += unsafe { dot_q1_0_row_avx2(bytes, start + i, k, x) };
+                        }
+                        return;
+                    }
                     for (i, y_i) in y_chunk.iter_mut().enumerate() {
-                        *y_i += dot_q1_0_row(bytes, start + i, k, x);
+                        *y_i += dot_q1_0_row_scalar(bytes, start + i, k, x);
                     }
                 });
                 handles.push(h);
@@ -218,10 +255,29 @@ impl Q1_0Matrix {
         }
 
         let n_threads = crate::model::workspace::thread_count();
-        if n_threads <= 1 || n < 4096 {
+        // ★ P2-1: runtime AVX2 check 提到循环外
+        let use_avx2 = avx2_q1_0_available();
+        // ★ P2-5: 阈值从 4096 降到 1024, 让 attn_k/v (1024 rows) 也走线程池
+        if n_threads <= 1 || n < 1024 {
+            // ★ P1-4: 用 batched kernel 复用 scale/LUT, tmp buffer 避免堆分配
+            let mut tmp = [0.0f32; 64];
+            debug_assert!(n_batch <= 64);
+            #[cfg(target_arch = "x86_64")]
+            if use_avx2 {
+                for i in 0..n {
+                    unsafe {
+                        dot_q1_0_row_batch_avx2(&self.bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                    }
+                    for t in 0..n_batch {
+                        y[t * n + i] = tmp[t];
+                    }
+                }
+                return;
+            }
             for i in 0..n {
+                dot_q1_0_row_batch(&self.bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
                 for t in 0..n_batch {
-                    y[t * n + i] = dot_q1_0_row(&self.bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
+                    y[t * n + i] = tmp[t];
                 }
             }
             return;
@@ -239,10 +295,24 @@ impl Q1_0Matrix {
                 let end = (start + chunk).min(n);
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, n_batch * n_cols) };
+                let mut tmp = [0.0f32; 64];
+                debug_assert!(n_batch <= 64);
+                #[cfg(target_arch = "x86_64")]
+                if use_avx2 {
+                    for i in start..end {
+                        unsafe {
+                            dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                        }
+                        for t in 0..n_batch {
+                            unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
+                        }
+                    }
+                    return;
+                }
                 for i in start..end {
+                    dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
                     for t in 0..n_batch {
-                        let val = dot_q1_0_row(bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
-                        unsafe { *((y_addr as *mut f32).add(t * n + i)) = val; }
+                        unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
                     }
                 }
             });
@@ -259,10 +329,24 @@ impl Q1_0Matrix {
                 let start = tid * chunk;
                 let end = (start + chunk).min(n);
                 let h = s.spawn(move || {
+                    let mut tmp = [0.0f32; 64];
+                    debug_assert!(n_batch <= 64);
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 {
+                        for i in start..end {
+                            unsafe {
+                                dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                            }
+                            for t in 0..n_batch {
+                                unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
+                            }
+                        }
+                        return;
+                    }
                     for i in start..end {
+                        dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
                         for t in 0..n_batch {
-                            let val = dot_q1_0_row(bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
-                            unsafe { *((y_addr as *mut f32).add(t * n + i)) = val; }
+                            unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
                         }
                     }
                 });
@@ -286,10 +370,29 @@ impl Q1_0Matrix {
         }
 
         let n_threads = crate::model::workspace::thread_count();
-        if n_threads <= 1 || n < 4096 {
+        // ★ P2-1: runtime AVX2 check 提到循环外
+        let use_avx2 = avx2_q1_0_available();
+        // ★ P2-5: 阈值从 4096 降到 1024, 让 attn_k/v (1024 rows) 也走线程池
+        if n_threads <= 1 || n < 1024 {
+            // ★ P1-4: batched kernel
+            let mut tmp = [0.0f32; 64];
+            debug_assert!(n_batch <= 64);
+            #[cfg(target_arch = "x86_64")]
+            if use_avx2 {
+                for i in 0..n {
+                    unsafe {
+                        dot_q1_0_row_batch_avx2(&self.bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                    }
+                    for t in 0..n_batch {
+                        y[t * n + i] += tmp[t];
+                    }
+                }
+                return;
+            }
             for i in 0..n {
+                dot_q1_0_row_batch(&self.bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
                 for t in 0..n_batch {
-                    y[t * n + i] += dot_q1_0_row(&self.bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
+                    y[t * n + i] += tmp[t];
                 }
             }
             return;
@@ -307,10 +410,24 @@ impl Q1_0Matrix {
                 let end = (start + chunk).min(n);
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, n_batch * n_cols) };
+                let mut tmp = [0.0f32; 64];
+                debug_assert!(n_batch <= 64);
+                #[cfg(target_arch = "x86_64")]
+                if use_avx2 {
+                    for i in start..end {
+                        unsafe {
+                            dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                        }
+                        for t in 0..n_batch {
+                            unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
+                        }
+                    }
+                    return;
+                }
                 for i in start..end {
+                    dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
                     for t in 0..n_batch {
-                        let val = dot_q1_0_row(bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
-                        unsafe { *((y_addr as *mut f32).add(t * n + i)) += val; }
+                        unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
                     }
                 }
             });
@@ -327,10 +444,24 @@ impl Q1_0Matrix {
                 let start = tid * chunk;
                 let end = (start + chunk).min(n);
                 let h = s.spawn(move || {
+                    let mut tmp = [0.0f32; 64];
+                    debug_assert!(n_batch <= 64);
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 {
+                        for i in start..end {
+                            unsafe {
+                                dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                            }
+                            for t in 0..n_batch {
+                                unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
+                            }
+                        }
+                        return;
+                    }
                     for i in start..end {
+                        dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
                         for t in 0..n_batch {
-                            let val = dot_q1_0_row(bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
-                            unsafe { *((y_addr as *mut f32).add(t * n + i)) += val; }
+                            unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
                         }
                     }
                 });
@@ -338,17 +469,6 @@ impl Q1_0Matrix {
             }
             for h in handles { h.join().unwrap(); }
         });
-    }
-
-    /// matvec 后加 bias
-    pub fn matvec_add_bias(&self, x: &[f32], bias: &[f32]) -> Vec<f32> {
-        let mut y = self.matvec(x);
-        for i in 0..y.len() {
-            if i < bias.len() {
-                y[i] += bias[i];
-            }
-        }
-        y
     }
 }
 
@@ -412,20 +532,6 @@ impl BlockWeights {
         match self {
             BlockWeights::Ssm(w) => w.ffn_gate.rows,
             BlockWeights::FullAttention(w) => w.ffn_gate.rows,
-        }
-    }
-
-    pub fn ssm_qkv_dim(&self) -> usize {
-        match self {
-            BlockWeights::Ssm(w) => w.attn_qkv.rows,
-            _ => 0,
-        }
-    }
-
-    pub fn ssm_out_dim(&self) -> usize {
-        match self {
-            BlockWeights::Ssm(w) => w.ssm_out.rows,
-            _ => 0,
         }
     }
 
@@ -571,35 +677,4 @@ impl LoadedWeights {
             println!("[weights] {k} tensors: {v}");
         }
     }
-}
-
-/// 兼容旧 API
-pub struct WeightLoader<'a> {
-    pub gguf: &'a GgufFile,
-}
-
-impl<'a> WeightLoader<'a> {
-    pub fn new(gguf: &'a GgufFile) -> Self {
-        Self { gguf }
-    }
-    pub fn print_dtype_summary(gguf: &GgufFile) {
-        LoadedWeights::print_dtype_summary(gguf);
-    }
-}
-
-pub fn expect_tensor(
-    gguf: &GgufFile,
-    name: &str,
-    expected_dtype: TensorType,
-) -> crate::Result<TensorInfo> {
-    let info = gguf
-        .find_tensor(name)
-        .ok_or_else(|| BonsaiError::Model(format!("missing tensor {name}")))?;
-    if info.dtype != expected_dtype {
-        return Err(BonsaiError::Model(format!(
-            "tensor {name}: expected dtype {:?} but got {:?}",
-            expected_dtype, info.dtype
-        )));
-    }
-    Ok(info.clone())
 }

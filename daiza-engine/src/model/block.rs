@@ -24,16 +24,13 @@ use crate::cache::{KvCache, SsmState};
 #[allow(clippy::too_many_arguments)]
 pub fn forward_single_inplace(
     h: &mut [f32],
-    block_idx: usize,
     block_w: &BlockWeights,
     cfg: &Config,
     kv_cache: Option<&mut KvCache>,
     ssm_state: Option<&mut SsmState>,
-    pos: usize,
     cos_sin: (&[f32], &[f32]),
     ws: &mut Workspace,
 ) {
-    let _ = block_idx;
     let hidden = cfg.hidden;
 
     // 1. attention / SSM block:
@@ -41,11 +38,11 @@ pub fn forward_single_inplace(
     match (block_w, kv_cache, ssm_state) {
         (BlockWeights::FullAttention(w), Some(kv), None) => {
             crate::model::attention::attention_forward_into(
-                h, w, cfg, kv, pos, cos_sin, ws,
+                h, w, cfg, kv, cos_sin, ws,
             );
         }
         (BlockWeights::Ssm(w), None, Some(ssm)) => {
-            crate::model::ssm::ssm_forward_into(h, w, cfg, ssm, pos, ws);
+            crate::model::ssm::ssm_forward_into(h, w, cfg, ssm, ws);
         }
         _ => {}
     }
@@ -74,6 +71,3 @@ pub fn forward_single_inplace(
         h,
     );
 }
-
-/// 兼容旧接口(只在测试/调试中可能用到)
-pub struct Block;

@@ -55,9 +55,4 @@ pub fn rmsnorm_into(src: &[f32], dst: &mut [f32], w: &[f32], eps: f32) {
     }
 }
 
-/// 非原地版本:返回归一化后的向量
-pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
-    let mut out = x.to_vec();
-    rmsnorm_inplace(&mut out, w, eps);
-    out
-}
+

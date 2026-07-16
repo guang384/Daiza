@@ -6,8 +6,6 @@
 //! > 真正生产引擎(如 llama.cpp fork)直接把 Q1_0 数据喂给融合 GEMM 内核,
 //! > 永不展开成 F32。本引擎 v0 先做正确性,优化留作后续练习
 //! > (见 `math::gemm` 中的位运算加速思路)。
-//!
-//! `TensorView` 是对 borrowed 切片的只读视图,用于零拷贝传递。
 
 use crate::tensor::TensorType;
 
@@ -32,38 +30,6 @@ impl Tensor {
 
     pub fn n_elements(&self) -> usize {
         self.data.len()
-    }
-
-    /// 行数(输出维度,外层维度) = dims[1] 或 dims[0](1D 时)
-    pub fn rows(&self) -> usize {
-        self.dims.get(1).copied().unwrap_or_else(|| self.dims.first().copied().unwrap_or(1))
-    }
-
-    /// 列数(输入维度,行内元素数,内层维度) = dims[0]
-    pub fn cols(&self) -> usize {
-        self.dims.first().copied().unwrap_or(1)
-    }
-
-    pub fn as_view(&self) -> TensorView<'_> {
-        TensorView {
-            data: &self.data,
-            dims: &self.dims,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct TensorView<'a> {
-    pub data: &'a [f32],
-    pub dims: &'a [usize],
-}
-
-impl<'a> TensorView<'a> {
-    pub fn rows(&self) -> usize {
-        self.dims.get(1).copied().unwrap_or_else(|| self.dims.first().copied().unwrap_or(1))
-    }
-    pub fn cols(&self) -> usize {
-        self.dims.first().copied().unwrap_or(1)
     }
 }
 

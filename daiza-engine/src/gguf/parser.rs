@@ -113,17 +113,4 @@ impl GgufFile {
         }
         Ok(&self.bytes[start..end])
     }
-
-    /// 按 dtype 统计张量数(用于核验解析正确性)
-    pub fn dtype_histogram(&self) -> Vec<(String, usize)> {
-        use std::collections::BTreeMap;
-        use crate::gguf::tensor_info::TensorType;
-        let mut h: BTreeMap<u32, usize> = BTreeMap::new();
-        for t in &self.tensors {
-            *h.entry(t.dtype.as_u32()).or_default() += 1;
-        }
-        h.into_iter()
-            .map(|(k, v)| (TensorType::from_u32(k).name().to_string(), v))
-            .collect()
-    }
 }
