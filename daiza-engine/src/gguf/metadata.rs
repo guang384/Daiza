@@ -28,25 +28,6 @@ pub enum MetaValue {
 }
 
 impl MetaValue {
-    /// 元素的 `value_type` 标识(用于解析 ARRAY)
-    fn type_tag(&self) -> u32 {
-        match self {
-            Self::Uint8(_) => 0,
-            Self::Int8(_) => 1,
-            Self::Uint16(_) => 2,
-            Self::Int16(_) => 3,
-            Self::Uint32(_) => 4,
-            Self::Int32(_) => 5,
-            Self::Float32(_) => 6,
-            Self::Bool(_) => 7,
-            Self::String(_) => 8,
-            Self::Array(_) => 9,
-            Self::Uint64(_) => 10,
-            Self::Int64(_) => 11,
-            Self::Float64(_) => 12,
-        }
-    }
-
     /// 从 reader 解析单个标量值(数组元素也走这条路径)
     fn read_scalar(reader: &mut ByteReader<'_>, type_tag: u32) -> Result<Self> {
         Ok(match type_tag {

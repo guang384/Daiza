@@ -1,4 +1,4 @@
-//! 跨 token 复用的工作区缓冲区(消除热路径堆分配)
+//! 跨 token 复用的工作区缓冲区与持久线程池
 //!
 //! ## 设计动机
 //!
@@ -11,13 +11,92 @@
 //! 主残差流 `h_buf` 不在本 Workspace 中,而在 `ForwardContext::h_buf`,
 //! 避免与 `&mut Workspace` 的借用冲突(两者需同时传给 `block::forward_single_inplace`)。
 //!
+//! ## 持久线程池
+//!
+//! 原实现每个 matvec 调用都创建 `std::thread::scope`,每 token 产生 ~369 次 scope 创建
+//! 和 ~2952 次 thread spawn (Windows CreateThread 开销 ~50μs/次)。
+//!
+//! `ThreadPool` 在引擎启动时一次性创建 N 个 worker 线程,通过 mpsc channel 分发任务,
+//! 消除热路径上的所有 thread spawn 和 scope 创建开销。
+//!
 //! ## Buffer 划分原则
 //!
 //! - 同一阶段不会同时使用的 buffer 可以共享(本实现保守,全部独立)
 //! - 大小固定(由 Config 决定),`attn_scores` 例外(随序列长度增长)
 //! - 最终输出仍返回 owned `Vec`(每 token 1 个 alloc,可接受),内部 buffer 全部复用
 
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+
 use crate::model::config::Config;
+
+// ---------------------------------------------------------------------------
+// 全局持久线程池(OnceLock, 引擎启动时初始化一次, 全局复用)
+// ---------------------------------------------------------------------------
+
+static GLOBAL_POOL: OnceLock<ThreadPool> = OnceLock::new();
+
+/// 初始化全局线程池(引擎启动时调用一次)
+pub fn init_thread_pool(n_threads: usize) {
+    GLOBAL_POOL.get_or_init(|| ThreadPool::new(n_threads));
+}
+
+/// 获取全局线程池引用(若已初始化)
+pub fn get_thread_pool() -> Option<&'static ThreadPool> {
+    GLOBAL_POOL.get()
+}
+
+/// 持久线程池: mpsc channel + N 个 worker 线程, 消除 std::thread::scope 的创建开销
+pub struct ThreadPool {
+    sender: mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl ThreadPool {
+    pub fn new(n_threads: usize) -> Self {
+        let (tx, rx) = mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..n_threads {
+            let rx = Arc::clone(&rx);
+            std::thread::spawn(move || {
+                loop {
+                    let job = match rx.lock().unwrap().recv() {
+                        Ok(job) => job,
+                        Err(_) => break, // channel closed, exit
+                    };
+                    job();
+                }
+            });
+        }
+        Self { sender: tx }
+    }
+
+    /// 提交 N 个任务并等待全部完成
+    ///
+    /// # Safety (调用方保证)
+    ///
+    /// 本函数阻塞直到所有任务完成, 因此调用方在调用期间持有的借用仍然有效。
+    /// 闭包应通过 raw pointer 访问外部数据, 避免生命周期冲突。
+    pub fn scatter_wait(&self, n: usize, f: impl Fn(usize) + Send + Sync + 'static) {
+        if n == 0 {
+            return;
+        }
+        let f = Arc::new(f);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        for i in 0..n {
+            let f = Arc::clone(&f);
+            let done_tx = done_tx.clone();
+            self.sender
+                .send(Box::new(move || {
+                    f(i);
+                    done_tx.send(()).unwrap();
+                }))
+                .expect("thread pool worker panicked");
+        }
+        drop(done_tx); // 确保 recv 不会永远阻塞
+        for _ in 0..n {
+            done_rx.recv().unwrap();
+        }
+    }
+}
 
 /// 工作线程数,由 `DAIZA_THREADS` env var 控制,默认物理核数
 ///
@@ -45,10 +124,10 @@ pub fn thread_count() -> usize {
 
 pub struct Workspace {
     // === block.rs 用 ===
-    /// `[hidden]` attn_norm 输入(norm 后的 h,送入 attention/ssm)
+    // ★ P0-3: block_normed 复用为 mlp 输入(attention/ssm 完成后即死,post_norm 可覆盖)
+    //   原 block_mlp_in 已删除,省 hidden × 4B = 20KB
+    /// `[hidden]` attn_norm 输出 / post_attention_norm 输出(分阶段复用)
     pub block_normed: Vec<f32>,
-    /// `[hidden]` post_attention_norm 输入(norm 后的 h,送入 mlp)
-    pub block_mlp_in: Vec<f32>,
 
     // === attention.rs 用 ===
     /// `[n_q_heads * head_dim * 2]` = 12288,attn_q matvec 输出(Q + gate 交错)
@@ -108,7 +187,6 @@ impl Workspace {
 
         Self {
             block_normed: vec![0.0; hidden],
-            block_mlp_in: vec![0.0; hidden],
 
             attn_q_total: vec![0.0; n_q_heads * head_dim * 2],
             attn_q: vec![0.0; n_q_heads * head_dim],

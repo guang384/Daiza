@@ -88,7 +88,7 @@ fn l2norm_inplace(x: &mut [f32], eps: f32) {
 /// - Pass 1: s *= decay 同时累加 kv_mem[i] = sum_j S[i,j] * k[j]
 /// - Pass 2: S += delta ⊗ k 同时计算 y[i] = sum_j S_new[i,j] * q[j]
 #[inline]
-fn ssm_scan_vhead(
+pub(crate) fn ssm_scan_vhead(
     s: &mut [f32],
     y: &mut [f32],
     q_head: &[f32],
@@ -269,6 +269,10 @@ pub fn ssm_forward_into(
     //    对每个 v_head (head_v_dim=128) 单独应用 RMSNorm + weight + silu(gate)
     w.attn_gate.matvec_into_slice(&ws.block_normed, &mut ws.ssm_z);
     let ssm_norm_w = &w.ssm_norm.data; // [128]
+    // ★ P1-2: 批量 silu(z) 一次(6144 元素 = 768 × 8-wide SIMD)
+    //   原标量 silu_fast 294912 次/token,每次 ~5c(broadcast+extract 浪费 7 lane)
+    //   批量后 768 次 SIMD,每次 ~10c 处理 8 元素 → ~1.25c/element
+    math::silu_inplace_simd(&mut ws.ssm_z[..num_v_heads * head_dim]);
     for vh in 0..num_v_heads {
         let y_off = vh * head_dim;
         // RMSNorm per v_head: variance = mean(x²)
@@ -277,11 +281,9 @@ pub fn ssm_forward_into(
             ss += ws.ssm_y[y_off + i] * ws.ssm_y[y_off + i];
         }
         let inv_rms = 1.0 / (ss / head_dim as f32 + SSM_EPS).sqrt();
-        // y = rmsnorm(y) * weight * silu(z)
-        // ★ SIMD silu(48 v_head × 128 = 6144 次/层 × 48 SSM 块 = 294912 次/token)
+        // y = rmsnorm(y) * weight * silu(z)  (z 已批量 silu,这里直接乘)
         for i in 0..head_dim {
-            let normed = ws.ssm_y[y_off + i] * inv_rms;
-            ws.ssm_y[y_off + i] = normed * ssm_norm_w[i] * crate::math::simd_exp::silu_fast(ws.ssm_z[y_off + i]);
+            ws.ssm_y[y_off + i] = ws.ssm_y[y_off + i] * inv_rms * ssm_norm_w[i] * ws.ssm_z[y_off + i];
         }
     }
 

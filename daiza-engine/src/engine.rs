@@ -16,7 +16,7 @@ use std::path::Path;
 use crate::gguf::parser::GgufFile;
 use crate::math::{sample_top_k_top_p_into, SamplingBuffers, SamplingParams};
 use crate::model::config::Config;
-use crate::model::forward::{forward_single_token, make_context};
+use crate::model::forward::{forward_batch, forward_single_token, make_context};
 use crate::model::weights::LoadedWeights;
 use crate::tokenizer::vocab::Vocab;
 use crate::tokenizer::BpeTokenizer;
@@ -139,6 +139,10 @@ impl Engine {
         if self.weights.is_none() {
             eprintln!("[engine] loading weights (one-shot, ~13GB)...");
             self.load_weights()?;
+            // 初始化持久线程池(消除每 token ~369 次 scope 创建 + ~2952 次 thread spawn)
+            let n_threads = crate::model::workspace::thread_count();
+            crate::model::workspace::init_thread_pool(n_threads);
+            eprintln!("[engine] thread pool ({n_threads} workers) initialized");
         }
         let load_ms = load_start.elapsed().as_millis();
 
@@ -147,18 +151,19 @@ impl Engine {
         let weights = self.weights.as_ref().unwrap();
         let mut ctx = make_context(weights, cfg);
 
-        // 4. prefill:逐 token 前向(只填充 KV/SSM 状态)
+        // 4. prefill: 批量前向(一次读权重, 13GB 只读一次而非 N 次)
         let n_input = input_ids.len();
-        let mut last_logits: Option<Vec<f32>> = None;
         let prefill_start = std::time::Instant::now();
-        for (i, &tid) in input_ids.iter().enumerate() {
-            last_logits = Some(forward_single_token(&mut ctx, tid)?);
-            if i % 4 == 0 {
-                eprint!("\r[prefill] {i}/{n_input}");
-            }
-        }
-        eprintln!("\r[prefill] {n_input}/{n_input} done");
+        let last_logits = if n_input == 0 {
+            None
+        } else if n_input == 1 {
+            // 单 token 直接用 forward_single_token(避免 batch 额外开销)
+            Some(forward_single_token(&mut ctx, input_ids[0])?)
+        } else {
+            Some(forward_batch(&mut ctx, &input_ids, 0)?)
+        };
         let prefill_ms = prefill_start.elapsed().as_millis();
+        eprintln!("\r[prefill] {n_input}/{n_input} done");
         eprintln!("[bench] load={load_ms}ms prefill({n_input}t)={prefill_ms}ms (~{}ms/tok)",
             if n_input > 0 { prefill_ms / n_input as u128 } else { 0 });
 

@@ -38,7 +38,6 @@ pub fn forward_single_inplace(
 
     // 1. attention / SSM block:
     //    子函数内部负责 attn_norm + forward + 残差累加(h += attn_out)
-    //    即:h_new = h_old + attn/ssm(norm(h_old))
     match (block_w, kv_cache, ssm_state) {
         (BlockWeights::FullAttention(w), Some(kv), None) => {
             crate::model::attention::attention_forward_into(
@@ -51,22 +50,22 @@ pub fn forward_single_inplace(
         _ => {}
     }
 
-    // 2. post_attention_norm: ws.block_mlp_in = norm(h)
-    //    ★ 用 rmsnorm_into 直接从 h 读、写入 block_mlp_in,消除 copy_from_slice
+    // 2. post_attention_norm: ws.block_normed = norm(h)
+    //    ★ P0-3: 复用 block_normed(attention/ssm 已完成,不再需要此 buffer)
+    //      原 block_mlp_in 已删除,省 20KB workspace
     let post_norm_w = match block_w {
         BlockWeights::Ssm(w) => &w.post_attention_norm,
         BlockWeights::FullAttention(w) => &w.post_attention_norm,
     };
-    math::rmsnorm_into(&h[..hidden], &mut ws.block_mlp_in, &post_norm_w.data, cfg.rms_eps);
+    math::rmsnorm_into(&h[..hidden], &mut ws.block_normed, &post_norm_w.data, cfg.rms_eps);
 
     // 3. MLP: h += W_down @ (silu(W_gate @ mlp_in) * (W_up @ mlp_in))
-    //    ★ Split borrow: 同时 &ws.block_mlp_in (不可变) 和 &mut ws.mlp_gate / mlp_up (可变)
     let (w_gate, w_up, w_down) = match block_w {
         BlockWeights::Ssm(w) => (&w.ffn_gate, &w.ffn_up, &w.ffn_down),
         BlockWeights::FullAttention(w) => (&w.ffn_gate, &w.ffn_up, &w.ffn_down),
     };
     crate::model::mlp::mlp_forward_into(
-        &ws.block_mlp_in,
+        &ws.block_normed,
         w_gate,
         w_up,
         w_down,

@@ -246,3 +246,60 @@ pub fn swiglu_inplace_simd(gate: &mut [f32], up: &[f32]) {
         *g = (*g / (1.0 + (-*g).exp())) * u;
     }
 }
+
+// ---------------------------------------------------------------------------
+// AVX2 dot product & saxpy(用于 attention scores 向量化)
+// ---------------------------------------------------------------------------
+
+/// AVX2 8-wide 点积: sum(a[i] * b[i])
+/// head_dim=256 是 8 的倍数,无需尾处理。
+#[allow(unsafe_code)]
+#[inline]
+pub fn dot_product_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
+    debug_assert!(len >= 8);
+    unsafe {
+        let mut sum0 = _mm256_setzero_ps();
+        let mut sum1 = _mm256_setzero_ps();
+        let mut i = 0;
+        // 2x unroll: 每次处理 16 个 f32, 隐藏 FMA 延迟
+        while i + 16 <= len {
+            let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
+            sum0 = _mm256_fmadd_ps(va0, vb0, sum0);
+            let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
+            let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
+            sum1 = _mm256_fmadd_ps(va1, vb1, sum1);
+            i += 16;
+        }
+        while i + 8 <= len {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+            sum0 = _mm256_fmadd_ps(va, vb, sum0);
+            i += 8;
+        }
+        sum0 = _mm256_add_ps(sum0, sum1);
+        // 水平求和: store → scalar reduce(8 个 f32)
+        let mut tmp: [f32; 8] = [0.0; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), sum0);
+        tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7]
+    }
+}
+
+/// AVX2 8-wide saxpy: y[i] += scale * x[i]
+/// head_dim=256 是 8 的倍数,无需尾处理。
+#[allow(unsafe_code)]
+#[inline]
+pub fn saxpy_avx2(scale: f32, x: &[f32], y: &mut [f32], len: usize) {
+    debug_assert!(len >= 8);
+    unsafe {
+        let sv = _mm256_set1_ps(scale);
+        let mut i = 0;
+        while i + 8 <= len {
+            let vx = _mm256_loadu_ps(x.as_ptr().add(i));
+            let vy = _mm256_loadu_ps(y.as_ptr().add(i));
+            let result = _mm256_fmadd_ps(sv, vx, vy);
+            _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
+            i += 8;
+        }
+    }
+}

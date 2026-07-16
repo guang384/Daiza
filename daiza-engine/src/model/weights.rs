@@ -67,9 +67,11 @@ impl Q1_0Matrix {
     /// `y[i] = dot_q1_0_row(W, i, k, x)`,覆盖写入 `y`(不是累加)。
     /// `y.len()` 必须等于 `self.rows`。
     ///
-    /// **多线程并行**:当 `self.rows >= 2 * n_threads` 时按行切分到 N 个 OS thread,
-    /// 每 thread 处理 rows/N 行,各自独立累加。对小矩阵(rows < 256)走串行路径
-    /// 避免 spawn 开销。threads 数由 `DAIZA_THREADS` env var 控制,默认物理核数。
+    /// **多线程并行**:当 `self.rows >= 4096` 时按行切分到 N 个 OS thread,
+    /// 每 thread 处理 rows/N 行,各自独立累加。threads 数由 `DAIZA_THREADS` env var 控制。
+    ///
+    /// 优先使用全局持久线程池(若已初始化),否则回退到 `std::thread::scope`。
+    #[allow(unsafe_code)]
     #[inline]
     pub fn matvec_into_slice(&self, x: &[f32], y: &mut [f32]) {
         let k = self.cols;
@@ -78,9 +80,6 @@ impl Q1_0Matrix {
         debug_assert_eq!(y.len(), n);
 
         let n_threads = crate::model::workspace::thread_count();
-        // 阈值:行数太少时 spawn 开销超过并行收益
-        // 4096 阈值:attn_k/attn_v(1024)、ssm_alpha/beta(48)等小矩阵走串行,
-        // 避免 400+ 次 spawn/join 开销(~10-40ms/token on Windows)
         if n_threads <= 1 || n < 4096 {
             for i in 0..n {
                 y[i] = dot_q1_0_row(&self.bytes, i, k, x);
@@ -88,9 +87,31 @@ impl Q1_0Matrix {
             return;
         }
 
+        // 优先使用全局持久线程池(消除 thread spawn 开销)
+        if let Some(pool) = crate::model::workspace::get_thread_pool() {
+            let bytes_addr = self.bytes.as_ptr() as usize;
+            let bytes_len = self.bytes.len();
+            let x_addr = x.as_ptr() as usize;
+            let y_addr = y.as_mut_ptr() as usize;
+            let chunk = (n + n_threads - 1) / n_threads;
+
+            pool.scatter_wait(n_threads, move |tid| {
+                let start = tid * chunk;
+                let end = (start + chunk).min(n);
+                let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
+                let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
+                for i in start..end {
+                    unsafe {
+                        *((y_addr as *mut f32).add(i)) = dot_q1_0_row(bytes, i, k, x);
+                    }
+                }
+            });
+            return;
+        }
+
+        // 回退: std::thread::scope
         let bytes = &self.bytes;
         std::thread::scope(|s| {
-            // 用 chunks_mut 自动拆分 y 为不重叠 mut slice(Sync + Send 都 OK)
             let chunk = (n + n_threads - 1) / n_threads;
             let mut handles = Vec::with_capacity(n_threads);
             let mut row_start = 0usize;
@@ -114,6 +135,9 @@ impl Q1_0Matrix {
     /// 流式 GEMM 累加到 caller-provided slice(用于残差合并)
     ///
     /// `y[i] += dot_q1_0_row(W, i, k, x)`,常用于 `h += W_down @ mlp_hidden`。
+    ///
+    /// 优先使用全局持久线程池(若已初始化),否则回退到 `std::thread::scope`。
+    #[allow(unsafe_code)]
     #[inline]
     pub fn matvec_add_into_slice(&self, x: &[f32], y: &mut [f32]) {
         let k = self.cols;
@@ -129,6 +153,29 @@ impl Q1_0Matrix {
             return;
         }
 
+        // 优先使用全局持久线程池
+        if let Some(pool) = crate::model::workspace::get_thread_pool() {
+            let bytes_addr = self.bytes.as_ptr() as usize;
+            let bytes_len = self.bytes.len();
+            let x_addr = x.as_ptr() as usize;
+            let y_addr = y.as_mut_ptr() as usize;
+            let chunk = (n + n_threads - 1) / n_threads;
+
+            pool.scatter_wait(n_threads, move |tid| {
+                let start = tid * chunk;
+                let end = (start + chunk).min(n);
+                let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
+                let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
+                for i in start..end {
+                    unsafe {
+                        *((y_addr as *mut f32).add(i)) += dot_q1_0_row(bytes, i, k, x);
+                    }
+                }
+            });
+            return;
+        }
+
+        // 回退: std::thread::scope
         let bytes = &self.bytes;
         std::thread::scope(|s| {
             let chunk = (n + n_threads - 1) / n_threads;
@@ -148,6 +195,148 @@ impl Q1_0Matrix {
             for h in handles {
                 h.join().unwrap();
             }
+        });
+    }
+
+    /// 批量 matvec: y[t][i] = dot(W_row_i, x[t])
+    ///
+    /// `x`: [n_batch * cols] 行优先
+    /// `y`: [n_batch * rows] 行优先, 覆盖写入
+    ///
+    /// **核心优化**: 每行权重只读一次, 对 batch 内所有 token 复用。
+    /// 原 prefill 每 token 读 13GB 权重 → batch 化后只读一次 13GB。
+    #[allow(unsafe_code)]
+    pub fn matvec_batch_into_slice(&self, x: &[f32], n_batch: usize, y: &mut [f32]) {
+        let n_cols = self.cols;
+        let n = self.rows;
+        debug_assert_eq!(x.len(), n_batch * n_cols);
+        debug_assert_eq!(y.len(), n_batch * n);
+
+        if n_batch <= 1 {
+            self.matvec_into_slice(x, &mut y[..n]);
+            return;
+        }
+
+        let n_threads = crate::model::workspace::thread_count();
+        if n_threads <= 1 || n < 4096 {
+            for i in 0..n {
+                for t in 0..n_batch {
+                    y[t * n + i] = dot_q1_0_row(&self.bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
+                }
+            }
+            return;
+        }
+
+        if let Some(pool) = crate::model::workspace::get_thread_pool() {
+            let bytes_addr = self.bytes.as_ptr() as usize;
+            let bytes_len = self.bytes.len();
+            let x_addr = x.as_ptr() as usize;
+            let y_addr = y.as_mut_ptr() as usize;
+            let chunk = (n + n_threads - 1) / n_threads;
+
+            pool.scatter_wait(n_threads, move |tid| {
+                let start = tid * chunk;
+                let end = (start + chunk).min(n);
+                let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
+                let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, n_batch * n_cols) };
+                for i in start..end {
+                    for t in 0..n_batch {
+                        let val = dot_q1_0_row(bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
+                        unsafe { *((y_addr as *mut f32).add(t * n + i)) = val; }
+                    }
+                }
+            });
+            return;
+        }
+
+        // 回退: std::thread::scope
+        let bytes = &self.bytes;
+        let y_addr = y.as_mut_ptr() as usize;
+        std::thread::scope(|s| {
+            let chunk = (n + n_threads - 1) / n_threads;
+            let mut handles = Vec::with_capacity(n_threads);
+            for tid in 0..n_threads {
+                let start = tid * chunk;
+                let end = (start + chunk).min(n);
+                let h = s.spawn(move || {
+                    for i in start..end {
+                        for t in 0..n_batch {
+                            let val = dot_q1_0_row(bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
+                            unsafe { *((y_addr as *mut f32).add(t * n + i)) = val; }
+                        }
+                    }
+                });
+                handles.push(h);
+            }
+            for h in handles { h.join().unwrap(); }
+        });
+    }
+
+    /// 批量 matvec 累加: y[t][i] += dot(W_row_i, x[t])
+    #[allow(unsafe_code)]
+    pub fn matvec_add_batch_into_slice(&self, x: &[f32], n_batch: usize, y: &mut [f32]) {
+        let n_cols = self.cols;
+        let n = self.rows;
+        debug_assert_eq!(x.len(), n_batch * n_cols);
+        debug_assert_eq!(y.len(), n_batch * n);
+
+        if n_batch <= 1 {
+            self.matvec_add_into_slice(x, &mut y[..n]);
+            return;
+        }
+
+        let n_threads = crate::model::workspace::thread_count();
+        if n_threads <= 1 || n < 4096 {
+            for i in 0..n {
+                for t in 0..n_batch {
+                    y[t * n + i] += dot_q1_0_row(&self.bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
+                }
+            }
+            return;
+        }
+
+        if let Some(pool) = crate::model::workspace::get_thread_pool() {
+            let bytes_addr = self.bytes.as_ptr() as usize;
+            let bytes_len = self.bytes.len();
+            let x_addr = x.as_ptr() as usize;
+            let y_addr = y.as_mut_ptr() as usize;
+            let chunk = (n + n_threads - 1) / n_threads;
+
+            pool.scatter_wait(n_threads, move |tid| {
+                let start = tid * chunk;
+                let end = (start + chunk).min(n);
+                let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
+                let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, n_batch * n_cols) };
+                for i in start..end {
+                    for t in 0..n_batch {
+                        let val = dot_q1_0_row(bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
+                        unsafe { *((y_addr as *mut f32).add(t * n + i)) += val; }
+                    }
+                }
+            });
+            return;
+        }
+
+        // 回退: std::thread::scope
+        let bytes = &self.bytes;
+        let y_addr = y.as_mut_ptr() as usize;
+        std::thread::scope(|s| {
+            let chunk = (n + n_threads - 1) / n_threads;
+            let mut handles = Vec::with_capacity(n_threads);
+            for tid in 0..n_threads {
+                let start = tid * chunk;
+                let end = (start + chunk).min(n);
+                let h = s.spawn(move || {
+                    for i in start..end {
+                        for t in 0..n_batch {
+                            let val = dot_q1_0_row(bytes, i, n_cols, &x[t * n_cols..(t + 1) * n_cols]);
+                            unsafe { *((y_addr as *mut f32).add(t * n + i)) += val; }
+                        }
+                    }
+                });
+                handles.push(h);
+            }
+            for h in handles { h.join().unwrap(); }
         });
     }
 
@@ -216,6 +405,62 @@ pub struct FullAttentionBlockWeights {
 pub enum BlockWeights {
     Ssm(SsmBlockWeights),
     FullAttention(FullAttentionBlockWeights),
+}
+
+impl BlockWeights {
+    pub fn ffn_dim(&self) -> usize {
+        match self {
+            BlockWeights::Ssm(w) => w.ffn_gate.rows,
+            BlockWeights::FullAttention(w) => w.ffn_gate.rows,
+        }
+    }
+
+    pub fn ssm_qkv_dim(&self) -> usize {
+        match self {
+            BlockWeights::Ssm(w) => w.attn_qkv.rows,
+            _ => 0,
+        }
+    }
+
+    pub fn ssm_out_dim(&self) -> usize {
+        match self {
+            BlockWeights::Ssm(w) => w.ssm_out.rows,
+            _ => 0,
+        }
+    }
+
+    pub fn as_full_attention(&self) -> &FullAttentionBlockWeights {
+        match self {
+            BlockWeights::FullAttention(w) => w,
+            _ => panic!("expected FullAttention block"),
+        }
+    }
+
+    pub fn as_ssm(&self) -> &SsmBlockWeights {
+        match self {
+            BlockWeights::Ssm(w) => w,
+            _ => panic!("expected SSM block"),
+        }
+    }
+
+    pub fn post_norm_and_ffn(
+        &self,
+    ) -> (&Tensor, &Q1_0Matrix, &Q1_0Matrix, &Q1_0Matrix) {
+        match self {
+            BlockWeights::Ssm(w) => (
+                &w.post_attention_norm,
+                &w.ffn_gate,
+                &w.ffn_up,
+                &w.ffn_down,
+            ),
+            BlockWeights::FullAttention(w) => (
+                &w.post_attention_norm,
+                &w.ffn_gate,
+                &w.ffn_up,
+                &w.ffn_down,
+            ),
+        }
+    }
 }
 
 /// 一次性加载所有 block(原始字节,~3.2GB)

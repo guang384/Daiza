@@ -314,27 +314,56 @@ unsafe fn dot_q1_0_row_avx2(
         ]);
 
         // ★ F16C 指令优化:用 _mm_cvtph_ps 一条指令转 4 个 f16→f32,取 lane 0
-        //   替代 f16_to_f32_fast 的 5-7 条标量位操作指令
-        //   F16C 自 Haswell (2013+) 默认支持,与 AVX2 同期
-        //   166M 次/token × 节省 ~4c = ~220ms/tok 理论收益
         let scale_xmm = _mm_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
         let scale_v = _mm256_broadcastss_ps(scale_xmm);
 
         let sign_ptr = data.as_ptr().add(block_start + 2);
         let x_ptr = x.as_ptr().add(g * Q1_0_GROUP_SIZE);
 
-        // 单 group 累加器:16 个 sign byte → 16 次 FMA
-        let mut group_acc = _mm256_setzero_ps();
+        // ★ 4 路独立累加器:打破 FMA 依赖链
+        //   原:16 次串行 FMA (每次依赖前一次结果) → 16c/group
+        //   新:4 路并行,每路 4 深 → 2 FMA units 同时执行 → ~4c/group (4x 加速)
+        //   Intel Haswell+ 有 2 个独立 FMA unit (port 0 + port 1)
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
 
-        for byte_idx in 0..16 {
-            // LUT 查表:一条 loadu_ps 替代 AND+CMPGT+BLENDV 三步链
-            let b = *sign_ptr.add(byte_idx) as usize;
-            let sign_f = _mm256_loadu_ps(SIGN_LUT[b].0.as_ptr());
-            let x_chunk = _mm256_loadu_ps(x_ptr.add(byte_idx * 8));
-            group_acc = _mm256_fmadd_ps(sign_f, x_chunk, group_acc);
+        for byte_idx in (0..16).step_by(4) {
+            let b0 = *sign_ptr.add(byte_idx) as usize;
+            let b1 = *sign_ptr.add(byte_idx + 1) as usize;
+            let b2 = *sign_ptr.add(byte_idx + 2) as usize;
+            let b3 = *sign_ptr.add(byte_idx + 3) as usize;
+
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[b0].0.as_ptr()),
+                _mm256_loadu_ps(x_ptr.add(byte_idx * 8)),
+                acc0,
+            );
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[b1].0.as_ptr()),
+                _mm256_loadu_ps(x_ptr.add((byte_idx + 1) * 8)),
+                acc1,
+            );
+            acc2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[b2].0.as_ptr()),
+                _mm256_loadu_ps(x_ptr.add((byte_idx + 2) * 8)),
+                acc2,
+            );
+            acc3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[b3].0.as_ptr()),
+                _mm256_loadu_ps(x_ptr.add((byte_idx + 3) * 8)),
+                acc3,
+            );
         }
 
-        // 向量 FMA 累加到全局 acc_vec(替代原横向求和 + 标量 FMA)
+        // 合并 4 路累加器
+        let group_acc = _mm256_add_ps(
+            _mm256_add_ps(acc0, acc1),
+            _mm256_add_ps(acc2, acc3),
+        );
+
+        // 向量 FMA 累加到全局 acc_vec
         acc_vec = _mm256_fmadd_ps(scale_v, group_acc, acc_vec);
     }
 

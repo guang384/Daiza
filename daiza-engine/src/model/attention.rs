@@ -91,37 +91,19 @@ pub fn attention_forward_into(
     w.attn_k.matvec_into_slice(&ws.block_normed, &mut ws.attn_k);
     w.attn_v.matvec_into_slice(&ws.block_normed, &mut ws.attn_v);
 
-    // 5. QK-norm(per-head 标准 RMSNorm: y = x * inv_rms * w)
+    // 5+6. QK-norm + RoPE 融合 (减少循环开销)
+    let (cos, sin) = cos_sin;
     for h_i in 0..n_q_heads {
         let hs = h_i * head_dim;
         let he = hs + head_dim;
         math::rmsnorm_inplace(&mut ws.attn_q[hs..he], &w.attn_q_norm.data, rms_eps);
+        math::apply_rope_partial(&mut ws.attn_q[hs..hs + head_dim], rope_dim, cos, sin);
     }
     for h_i in 0..n_kv_heads {
         let hs = h_i * head_dim;
         let he = hs + head_dim;
         math::rmsnorm_inplace(&mut ws.attn_k[hs..he], &w.attn_k_norm.data, rms_eps);
-    }
-
-    // 6. Partial RoPE:对每个 head 的前 rope_dim 维应用旋转
-    let (cos, sin) = cos_sin;
-    for h_i in 0..n_q_heads {
-        let hs = h_i * head_dim;
-        math::apply_rope_partial(
-            &mut ws.attn_q[hs..hs + head_dim],
-            rope_dim,
-            cos,
-            sin,
-        );
-    }
-    for h_i in 0..n_kv_heads {
-        let hs = h_i * head_dim;
-        math::apply_rope_partial(
-            &mut ws.attn_k[hs..hs + head_dim],
-            rope_dim,
-            cos,
-            sin,
-        );
+        math::apply_rope_partial(&mut ws.attn_k[hs..hs + head_dim], rope_dim, cos, sin);
     }
 
     // 7. 写入 KV cache
@@ -141,44 +123,28 @@ pub fn attention_forward_into(
         let q_head = &ws.attn_q[qh * head_dim..(qh + 1) * head_dim];
 
         // scores[t] = q · k_cache[t]
+        // ★ AVX2 向量化: dot_product_avx2, head_dim=256 = 32 × 8-wide FMA
         for t in 0..n_cached {
             let k_t = kv_cache.k_at(t);
             let k_head = &k_t[kvh * head_dim..(kvh + 1) * head_dim];
-            let mut s = 0.0f32;
-            for d in 0..head_dim {
-                s += q_head[d] * k_head[d];
-            }
-            scores[t] = s * scale;
+            scores[t] = crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * scale;
         }
 
         // softmax(全部可见,因为 decode 阶段只看历史 + 当前)
         math::softmax_inplace(scores);
 
-        // weighted sum of V
-        // ★ 循环顺序交换:外层 t(顺序读 V),内层 d(连续 head_dim)
-        // V cache 按 [seq, head_kv, head_dim] 存储,新顺序让 V 连续读取 head_dim 个 f32,
-        // 完美命中 cache line。
+        // ★ AVX2 向量化 V 加权: saxpy_avx2, 8-wide FMA
         let out_head = &mut ws.attn_out[qh * head_dim..(qh + 1) * head_dim];
         for t in 0..n_cached {
-            let s = scores[t];
             let v_head = &kv_cache.v_at(t)[kvh * head_dim..(kvh + 1) * head_dim];
-            for d in 0..head_dim {
-                out_head[d] += s * v_head[d];
-            }
+            crate::math::simd_exp::saxpy_avx2(scores[t], v_head, out_head, head_dim);
         }
     }
 
-    // 9. Gated:用 gate 调制 attn_out
-    //    attn_out[i] *= sigmoid(gate[i])
-    //    ★ 用 SIMD sigmoid(8-wide AVX2)替代标量 expf
-    //      6144 次/层 × 16 层 = 98304 次/token,标量 ~30c vs SIMD ~1.5c
-    {
-        // 先把 sigmoid(gate) 算到 attn_gate 原地(后续不再用 attn_gate)
-        math::sigmoid_inplace_simd(&mut ws.attn_gate);
-        // attn_out *= sigmoid(gate)
-        for i in 0..ws.attn_out.len() {
-            ws.attn_out[i] *= ws.attn_gate[i];
-        }
+    // 9. Gated: attn_out *= sigmoid(gate) — 融合 sigmoid + multiply
+    math::sigmoid_inplace_simd(&mut ws.attn_gate);
+    for i in 0..ws.attn_out.len() {
+        ws.attn_out[i] *= ws.attn_gate[i];
     }
 
     // 10. Output projection + residual: h += W_output @ attn_out
