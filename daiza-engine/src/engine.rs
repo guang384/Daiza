@@ -189,6 +189,11 @@ impl Engine {
         }
 
         let decode_start = std::time::Instant::now();
+        // ★ Benchmark 模式: DAIZA_STREAM=0 关闭每 token 的 eprint! 输出
+        //   Windows stderr 未缓冲, 每 token eprint! 触发 WriteFile syscall (~0.5-3ms)
+        //   benchmark 时设 DAIZA_STREAM=0 可消除 I/O 开销, 让 ms/tok 反映纯计算
+        let stream_output = !matches!(std::env::var("DAIZA_STREAM").as_deref(),
+            Ok("0") | Ok("false") | Ok("no"));
         // 预分配采样 buffer(复用 scaled[248320] + indices[248320] = ~3MB),
         // 避免每 token 重新分配
         let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
@@ -206,19 +211,46 @@ impl Engine {
             // 前向(覆盖 ctx.logits_buf,无 clone)
             forward_single_token(&mut ctx, next_id as u32)?;
 
-            eprint!("\r[decode] {step}/{max_tokens}");
-            // 流式输出当前生成的 token 文本
-            if let Some(s) = self.tokenizer.vocab.tokens.get(next_id as usize) {
-                eprint!(" -> {s}");
+            if stream_output {
+                eprint!("\r[decode] {step}/{max_tokens}");
+                // 流式输出当前生成的 token 文本
+                if let Some(s) = self.tokenizer.vocab.tokens.get(next_id as usize) {
+                    eprint!(" -> {s}");
+                }
             }
         }
-        eprintln!();
+        if stream_output {
+            eprintln!();
+        }
         let decode_ms = decode_start.elapsed().as_millis();
         let n_gen = generated_ids.len();
         if n_gen > 0 {
             eprintln!("[bench] decode({n_gen}t)={decode_ms}ms (~{}ms/tok ~{:.2} tok/s)",
                 decode_ms / n_gen as u128,
                 n_gen as f64 * 1000.0 / decode_ms as f64);
+        }
+
+        // 正确性验证: 把生成的 token IDs dump 到文件 (env DAIZA_DUMP_TOKENS=path)
+        // 用于 baseline vs optimized 的逐 token 对比 (FP 重排可能让 argmax 翻转)
+        if let Ok(path) = std::env::var("DAIZA_DUMP_TOKENS") {
+            let mut content = String::new();
+            // 第一行: prompt token IDs
+            content.push_str("prompt:");
+            for (i, &id) in input_ids.iter().enumerate() {
+                if i > 0 { content.push(','); }
+                content.push_str(&id.to_string());
+            }
+            content.push('\n');
+            // 第二行: generated token IDs
+            content.push_str("generated:");
+            for (i, &id) in generated_ids.iter().enumerate() {
+                if i > 0 { content.push(','); }
+                content.push_str(&id.to_string());
+            }
+            content.push('\n');
+            std::fs::write(&path, content)
+                .map_err(|e| crate::BonsaiError::Io(format!("dump_tokens write failed: {e}")))?;
+            eprintln!("[dump_tokens] wrote {n_gen} generated ids to {path}");
         }
 
         // 5. decode token ids 为字符串

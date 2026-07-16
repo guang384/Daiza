@@ -45,20 +45,22 @@ pub fn get_thread_pool() -> Option<&'static ThreadPool> {
     GLOBAL_POOL.get()
 }
 
-/// 持久线程池: per-worker channel + N 个 worker 线程, 消除 std::thread::scope 的创建开销
+/// 持久线程池: per-worker channel + N-1 个 worker 线程 + 主线程参与
 ///
-/// ★ P1-2 优化: per-worker channel 替代共享 Mutex<Receiver>
-///   原实现 N 个 worker 抢同一个 Mutex<Receiver>, 每次 scatter_wait 派发 n_threads
-///   个任务都产生 N-way 互斥争用 (Windows Mutex lock+unlock ~200-500ns)
-///   新实现每个 worker 有独立 channel, 主线程 round-robin dispatch 无争用
+/// ★ P1-2: per-worker channel 替代共享 Mutex<Receiver>
+/// ★ P0-D: 主线程参与计算 (不再自旋浪费 P-core)
+///   原实现 N 个 worker + 1 个自旋主线程 = N+1 线程争 N 核, 上下文切换开销
+///   新实现 N-1 个 worker + 主线程做最后一个 chunk = N 线程完美匹配 N 核
 pub struct ThreadPool {
     senders: Vec<mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
 impl ThreadPool {
+    /// 创建 n_threads-1 个 worker 线程 (主线程作为第 n_threads 个 worker)
     pub fn new(n_threads: usize) -> Self {
-        let mut senders = Vec::with_capacity(n_threads);
-        for _ in 0..n_threads {
+        let n_workers = n_threads.saturating_sub(1);
+        let mut senders = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
             let (tx, rx) = mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
             senders.push(tx);
             std::thread::spawn(move || {
@@ -72,33 +74,45 @@ impl ThreadPool {
 
     /// 提交 N 个任务并等待全部完成
     ///
-    /// # Safety (调用方保证)
+    /// 前 N-1 个任务分发给 worker 线程, 主线程执行第 N 个任务 (最后一个 chunk),
+    /// 然后自旋等待所有 worker 完成。
     ///
+    /// # Safety (调用方保证)
     /// 本函数阻塞直到所有任务完成, 因此调用方在调用期间持有的借用仍然有效。
     /// 闭包应通过 raw pointer 访问外部数据, 避免生命周期冲突。
     pub fn scatter_wait(&self, n: usize, f: impl Fn(usize) + Send + Sync + 'static) {
         if n == 0 {
             return;
         }
+        if n == 1 {
+            f(0);
+            return;
+        }
         let f = Arc::new(f);
-        let n_threads = self.senders.len();
-        // 用 Arc<AtomicUsize> 计数替代 done channel, 减少 alloc
+        let n_workers = self.senders.len();
+        // 前 n-1 个任务分发给 worker (最多 n_workers 个)
+        let n_dispatch = (n - 1).min(n_workers);
         let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for i in 0..n {
+        for i in 0..n_dispatch {
             let f = Arc::clone(&f);
             let done = Arc::clone(&done);
             let job = Box::new(move || {
                 f(i);
-                done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Release: 确保 f(i) 的内存写对 acquire 端可见
+                done.fetch_add(1, std::sync::atomic::Ordering::Release);
             });
-            // round-robin 分发到各 worker 的独立 channel
-            self.senders[i % n_threads]
+            self.senders[i]
                 .send(job)
                 .expect("thread pool worker panicked");
         }
-        // 自旋等待所有任务完成 (短任务场景比 condvar 更快)
-        while done.load(std::sync::atomic::Ordering::SeqCst) < n {
-            std::hint::spin_loop();
+        // 主线程执行最后一个任务 (tid = n-1, 通常是最小的尾部 chunk)
+        f(n - 1);
+        // 等待所有 worker 完成
+        if n_dispatch > 0 {
+            // Acquire: 看到 done 计数后, 读到 worker 的内存写
+            while done.load(std::sync::atomic::Ordering::Acquire) < n_dispatch {
+                std::hint::spin_loop();
+            }
         }
     }
 }

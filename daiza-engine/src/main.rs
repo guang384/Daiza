@@ -24,6 +24,8 @@ fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
     let raw_mode = args.iter().any(|a| a == "--raw");
+    // --greedy: 贪心解码 (temperature=0), 用于正确性验证 (确定性输出)
+    let greedy = args.iter().any(|a| a == "--greedy");
 
     println!("[daiza-cli] Loading: {}", gguf_path.display());
 
@@ -86,10 +88,19 @@ fn main() -> Result<()> {
     println!();
     println!("=== Generating ===");
 
-    let params = SamplingParams {
-        temperature: 0.7,
-        top_k: 20,
-        top_p: 0.95,
+    let params = if greedy {
+        // 贪心解码: temperature=0, 确定性 argmax 采样, 用于正确性验证
+        SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        }
+    } else {
+        SamplingParams {
+            temperature: 0.7,
+            top_k: 20,
+            top_p: 0.95,
+        }
     };
 
     let output = if raw_mode {
