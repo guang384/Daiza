@@ -1,0 +1,32 @@
+# ===== 模型权重与资料(外部资源,不入库)=====
+Bonsai-27B-gguf/
+*.gguf
+*.bin
+bonsai-27b-whitepaper.pdf
+
+# ===== 参考实现(将来删除,不入库)=====
+ref-llama.cpp/
+
+# ===== Rust 构建产物 =====
+**/target/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 调试输出与临时文件 =====
+*.log
+daiza-engine/test_*.txt
+daiza-engine/inspect_output.txt
+daiza-engine/gguf_inspect_output.txt
+
+# ===== 编辑器与系统文件 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
