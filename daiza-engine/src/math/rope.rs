@@ -66,15 +66,41 @@ pub fn rope_cos_sin_mrope_text(
     (cos, sin)
 }
 
+/// 给定 position,计算 cos/sin 写入预分配 buffer(避免每 token 分配 Vec)
+///
+/// `cos`/`sin` 长度必须 >= `freqs.len()`
+pub fn rope_cos_sin_mrope_text_into(
+    pos: usize,
+    freqs: &[f32],
+    sections: &[i32],
+    cos: &mut [f32],
+    sin: &mut [f32],
+) {
+    let n = freqs.len();
+    let half = n / 2;
+    // 默认: cos=1, sin=0
+    for c in cos[..n].iter_mut() { *c = 1.0; }
+    for s in sin[..n].iter_mut() { *s = 0.0; }
+
+    let sec_0_pairs = sections[0] as usize;
+    for i in 0..sec_0_pairs {
+        let theta = pos as f32 * freqs[i];
+        let c = theta.cos();
+        let s = theta.sin();
+        cos[i] = c;
+        sin[i] = s;
+        cos[i + half] = c;
+        sin[i + half] = s;
+    }
+}
+
 /// GPT-NeoX rotate_half:`[-x[d/2:], x[:d/2]]`
 #[inline]
-fn rotate_half(x: &[f32]) -> Vec<f32> {
+fn rotate_half_into(x: &[f32], out: &mut [f32]) {
     let n = x.len();
     let half = n / 2;
-    let mut out = Vec::with_capacity(n);
-    out.extend_from_slice(&x[half..]);
-    out.extend_from_slice(&x[..half]);
-    out
+    out[..half].copy_from_slice(&x[half..]);
+    out[half..].copy_from_slice(&x[..half]);
 }
 
 /// 对单个 head 的向量应用 partial RoPE(原地修改)
@@ -89,18 +115,34 @@ fn rotate_half(x: &[f32]) -> Vec<f32> {
 /// x_rot_new = x_rot * cos + rotate_half(x_rot) * sin
 /// x[:rope_dim] = x_rot_new
 /// ```
+///
+/// **优化**:使用栈上数组(`[f32; 64]`)避免堆分配。
+/// 旧实现在每 head 调用两次 `to_vec()` + `Vec::with_capacity`,
+/// 28 个 head × 2 次 = 56 次堆分配/token。
 pub fn apply_rope_partial(x: &mut [f32], rope_dim: usize, cos: &[f32], sin: &[f32]) {
     debug_assert!(x.len() >= rope_dim);
     debug_assert_eq!(cos.len(), rope_dim);
     debug_assert_eq!(sin.len(), rope_dim);
 
-    // 提取前 rope_dim 维
-    let x_rot = x[..rope_dim].to_vec();
-    let rotated = rotate_half(&x_rot);
-
-    // x_rot * cos + rotated * sin
-    for i in 0..rope_dim {
-        x[i] = x_rot[i] * cos[i] + rotated[i] * sin[i];
+    // Bonsai rope_dim = 64,用固定大小栈数组避免堆分配
+    // 若 rope_dim 超过 64(理论上不会发生),回退到 Vec
+    if rope_dim <= 64 {
+        let mut x_rot = [0.0f32; 64];
+        let mut rotated = [0.0f32; 64];
+        x_rot[..rope_dim].copy_from_slice(&x[..rope_dim]);
+        rotate_half_into(&x_rot[..rope_dim], &mut rotated[..rope_dim]);
+        for i in 0..rope_dim {
+            x[i] = x_rot[i] * cos[i] + rotated[i] * sin[i];
+        }
+    } else {
+        // 回退路径(超长 rope_dim,理论不会触发)
+        let mut x_rot = vec![0.0f32; rope_dim];
+        let mut rotated = vec![0.0f32; rope_dim];
+        x_rot[..].copy_from_slice(&x[..rope_dim]);
+        rotate_half_into(&x_rot, &mut rotated);
+        for i in 0..rope_dim {
+            x[i] = x_rot[i] * cos[i] + rotated[i] * sin[i];
+        }
     }
     // 后 (head_dim - rope_dim) 维保持不变
 }

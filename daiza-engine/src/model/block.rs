@@ -1,27 +1,29 @@
 //! 统一的 Block 调度器
 //!
 //! 根据 `block_idx % full_attention_interval` 选择 SSM 或全注意力分支,
-//! 然后调用对应的 `forward_single`。
+//! 然后调用对应的 `forward_into`。
 //!
-//! 残差结构:
+//! 残差结构(in-place 版本):
 //! ```text
-//! x -> attn_norm -> [SSM 或 full attention] -> + x
-//!   -> post_attention_norm -> MLP -> + x
+//! h → attn_norm → [SSM 或 full attention] → += h   (residual 1)
+//!   → post_attention_norm → MLP → += h             (residual 2)
 //! ```
+//! 主残差流 `h` 在整个 block 中 in-place 更新,避免任何 `to_vec()` / `clone()`。
 
 use crate::math;
 use crate::model::config::Config;
 use crate::model::weights::BlockWeights;
+use crate::model::workspace::Workspace;
 use crate::cache::{KvCache, SsmState};
 
-pub struct BlockOutput {
-    pub out: Vec<f32>,
-}
-
-/// 单 token 前向通过一个 block
+/// 单 token 前向通过一个 block(in-place,无堆分配)
+///
+/// - 输入:`h` = 上一 block 的输出(主残差流)
+/// - 输出:`h` = 本 block 的输出(原地更新)
+/// - 所有中间 buffer 复用 `ws` 中预分配的字段
 #[allow(clippy::too_many_arguments)]
-pub fn forward_single(
-    x: &[f32],
+pub fn forward_single_inplace(
+    h: &mut [f32],
     block_idx: usize,
     block_w: &BlockWeights,
     cfg: &Config,
@@ -29,62 +31,50 @@ pub fn forward_single(
     ssm_state: Option<&mut SsmState>,
     pos: usize,
     cos_sin: (&[f32], &[f32]),
-) -> BlockOutput {
+    ws: &mut Workspace,
+) {
+    let _ = block_idx;
     let hidden = cfg.hidden;
 
-    // 1. attn_norm (norm a COPY, keep original x for residual)
-    let norm_w = match block_w {
-        BlockWeights::Ssm(w) => &w.attn_norm,
-        BlockWeights::FullAttention(w) => &w.attn_norm,
-    };
-    let mut h = x.to_vec();
-    math::rmsnorm_inplace(&mut h, &norm_w.data, cfg.rms_eps);
-
-    // 2. attention / SSM (uses normed h)
-    let attn_out = match (block_w, kv_cache, ssm_state) {
+    // 1. attention / SSM block:
+    //    子函数内部负责 attn_norm + forward + 残差累加(h += attn_out)
+    //    即:h_new = h_old + attn/ssm(norm(h_old))
+    match (block_w, kv_cache, ssm_state) {
         (BlockWeights::FullAttention(w), Some(kv), None) => {
-            crate::model::attention::attention_forward_single(
-                &h, w, cfg, kv, pos, cos_sin,
-            ).out
+            crate::model::attention::attention_forward_into(
+                h, w, cfg, kv, pos, cos_sin, ws,
+            );
         }
         (BlockWeights::Ssm(w), None, Some(ssm)) => {
-            crate::model::ssm::ssm_forward_single(&h, w, cfg, ssm, pos).out
+            crate::model::ssm::ssm_forward_into(h, w, cfg, ssm, pos, ws);
         }
-        _ => Vec::new(),
-    };
-
-    // 3. residual add: out = x + attn_out (use ORIGINAL x, not normed h)
-    let mut h = x.to_vec();
-    for i in 0..hidden {
-        h[i] += if i < attn_out.len() { attn_out[i] } else { 0.0 };
+        _ => {}
     }
 
-    // 4. post_attention_norm (norm a COPY, keep residual stream h)
+    // 2. post_attention_norm: ws.block_mlp_in = norm(h)
+    //    ★ 用 rmsnorm_into 直接从 h 读、写入 block_mlp_in,消除 copy_from_slice
     let post_norm_w = match block_w {
         BlockWeights::Ssm(w) => &w.post_attention_norm,
         BlockWeights::FullAttention(w) => &w.post_attention_norm,
     };
-    let mut mlp_in = h.clone();
-    math::rmsnorm_inplace(&mut mlp_in, &post_norm_w.data, cfg.rms_eps);
+    math::rmsnorm_into(&h[..hidden], &mut ws.block_mlp_in, &post_norm_w.data, cfg.rms_eps);
 
-    // 5. MLP (uses normed input)
+    // 3. MLP: h += W_down @ (silu(W_gate @ mlp_in) * (W_up @ mlp_in))
+    //    ★ Split borrow: 同时 &ws.block_mlp_in (不可变) 和 &mut ws.mlp_gate / mlp_up (可变)
     let (w_gate, w_up, w_down) = match block_w {
         BlockWeights::Ssm(w) => (&w.ffn_gate, &w.ffn_up, &w.ffn_down),
         BlockWeights::FullAttention(w) => (&w.ffn_gate, &w.ffn_up, &w.ffn_down),
     };
-    let mlp_out = crate::model::mlp::mlp_forward_single(
-        &mlp_in,
+    crate::model::mlp::mlp_forward_into(
+        &ws.block_mlp_in,
         w_gate,
         w_up,
         w_down,
+        &mut ws.mlp_gate,
+        &mut ws.mlp_up,
+        h,
     );
-
-    // 6. residual add: out = h + mlp_out (residual stream preserved)
-    for i in 0..hidden {
-        h[i] += if i < mlp_out.out.len() { mlp_out.out[i] } else { 0.0 };
-    }
-
-    BlockOutput { out: h }
 }
 
+/// 兼容旧接口(只在测试/调试中可能用到)
 pub struct Block;

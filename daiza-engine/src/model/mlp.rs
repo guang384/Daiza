@@ -7,29 +7,39 @@
 //! y    = h @ W_down        # [d_ff, hidden]
 //! ```
 //!
-//! W_gate / W_up / W_down 都是 Q1_0,通过 `Q1_0Matrix::matvec` 流式反量化 + GEMM。
+//! W_gate / W_up / W_down 都是 Q1_0,通过 `Q1_0Matrix::matvec_into_slice` 流式反量化 + GEMM。
+//!
+//! ## v2 优化(in-place workspace 复用)
+//!
+//! - `gate` / `up` 写入预分配的 caller-provided slice,跨 token 复用
+//! - `W_down` 结果通过 `matvec_add_into_slice` 直接累加到主残差流 `h`,避免分配
+//! - 调用方(`block.rs`)负责把 `ws.mlp_gate` / `ws.mlp_up` 传进来,
+//!   这样可以在同一作用域内同时借用 `ws.block_mlp_in`(输入,不可变)
+//!   和 `ws.mlp_gate` / `ws.mlp_up`(中间 buffer,可变)—— Rust split borrow。
 
 use crate::math;
 use crate::model::weights::Q1_0Matrix;
 
-pub struct MlpOutput {
-    pub out: Vec<f32>,
-}
-
 /// 单 token 前向,W_gate / W_up / W_down 都是 Q1_0Matrix
-pub fn mlp_forward_single(
+///
+/// - `x`:输入(norm 后的 h,长度 = hidden)
+/// - `mlp_gate` / `mlp_up`:caller 提供的工作区(长度 = d_ff,跨 token 复用)
+/// - `h`:主残差流,输出累加到此: `h += W_down @ (silu(W_gate @ x) * (W_up @ x))`
+pub fn mlp_forward_into(
     x: &[f32],
     w_gate: &Q1_0Matrix,
     w_up: &Q1_0Matrix,
     w_down: &Q1_0Matrix,
-) -> MlpOutput {
-    // gate = x @ W_gate  (1×d_ff)
-    let mut gate = w_gate.matvec(x);
+    mlp_gate: &mut [f32],
+    mlp_up: &mut [f32],
+    h: &mut [f32],
+) {
+    // gate = x @ W_gate  (覆盖写入 mlp_gate)
+    w_gate.matvec_into_slice(x, mlp_gate);
     // up = x @ W_up
-    let up = w_up.matvec(x);
-    // silu(gate) * up
-    math::swiglu_inplace(&mut gate, &up);
-    // y = h @ W_down
-    let out = w_down.matvec(&gate);
-    MlpOutput { out }
+    w_up.matvec_into_slice(x, mlp_up);
+    // silu(gate) * up (in-place on mlp_gate)
+    math::swiglu_inplace(mlp_gate, mlp_up);
+    // h += W_down @ mlp_gate
+    w_down.matvec_add_into_slice(mlp_gate, h);
 }

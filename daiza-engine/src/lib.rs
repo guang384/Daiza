@@ -25,7 +25,9 @@
 //! | `tokenizer`| GPT-2 BPE + Qwen35 预分词(零依赖手写) |
 //! | `engine`   | 顶层 Engine,串联加载 → tokenize → 前向 → 采样 → 解码 |
 
-#![forbid(unsafe_code)]
+// unsafe 策略:全局 deny,只在 quant.rs 的 AVX2 SIMD 内核局部 allow。
+// 这样既限制了 unsafe 的扩散,又允许手写 SIMD 突破 rustc 自动向量化的瓶颈。
+#![deny(unsafe_code)]
 
 pub mod gguf;
 pub mod tensor;

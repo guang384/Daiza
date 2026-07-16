@@ -43,6 +43,12 @@ impl Q1_0Matrix {
         dequantize_q1_0_row(&self.bytes, row_idx, self.cols)
     }
 
+    /// 反量化单行,写入 caller 提供的 slice(避免堆分配)
+    #[inline]
+    pub fn row_into_slice(&self, row_idx: usize, y: &mut [f32]) {
+        crate::tensor::quant::dequantize_q1_0_row_into(&self.bytes, row_idx, self.cols, y);
+    }
+
     /// 流式 GEMM:`y[i] = sum_j W[i, j] * x[j]`
     ///
     /// 使用融合点积 `dot_q1_0_row`:直接在 Q1_0 原始字节上计算点积,
@@ -52,10 +58,97 @@ impl Q1_0Matrix {
         let n = self.rows;
         debug_assert_eq!(x.len(), k);
         let mut y = vec![0.0f32; n];
-        for i in 0..n {
-            y[i] = dot_q1_0_row(&self.bytes, i, k, x);
-        }
+        self.matvec_into_slice(x, &mut y);
         y
+    }
+
+    /// 流式 GEMM into caller-provided slice(避免堆分配)
+    ///
+    /// `y[i] = dot_q1_0_row(W, i, k, x)`,覆盖写入 `y`(不是累加)。
+    /// `y.len()` 必须等于 `self.rows`。
+    ///
+    /// **多线程并行**:当 `self.rows >= 2 * n_threads` 时按行切分到 N 个 OS thread,
+    /// 每 thread 处理 rows/N 行,各自独立累加。对小矩阵(rows < 256)走串行路径
+    /// 避免 spawn 开销。threads 数由 `DAIZA_THREADS` env var 控制,默认物理核数。
+    #[inline]
+    pub fn matvec_into_slice(&self, x: &[f32], y: &mut [f32]) {
+        let k = self.cols;
+        let n = self.rows;
+        debug_assert_eq!(x.len(), k);
+        debug_assert_eq!(y.len(), n);
+
+        let n_threads = crate::model::workspace::thread_count();
+        // 阈值:行数太少时 spawn 开销超过并行收益
+        // 4096 阈值:attn_k/attn_v(1024)、ssm_alpha/beta(48)等小矩阵走串行,
+        // 避免 400+ 次 spawn/join 开销(~10-40ms/token on Windows)
+        if n_threads <= 1 || n < 4096 {
+            for i in 0..n {
+                y[i] = dot_q1_0_row(&self.bytes, i, k, x);
+            }
+            return;
+        }
+
+        let bytes = &self.bytes;
+        std::thread::scope(|s| {
+            // 用 chunks_mut 自动拆分 y 为不重叠 mut slice(Sync + Send 都 OK)
+            let chunk = (n + n_threads - 1) / n_threads;
+            let mut handles = Vec::with_capacity(n_threads);
+            let mut row_start = 0usize;
+            for y_chunk in y.chunks_mut(chunk) {
+                let chunk_len = y_chunk.len();
+                let start = row_start;
+                row_start += chunk_len;
+                let h = s.spawn(move || {
+                    for (i, y_i) in y_chunk.iter_mut().enumerate() {
+                        *y_i = dot_q1_0_row(bytes, start + i, k, x);
+                    }
+                });
+                handles.push(h);
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+    }
+
+    /// 流式 GEMM 累加到 caller-provided slice(用于残差合并)
+    ///
+    /// `y[i] += dot_q1_0_row(W, i, k, x)`,常用于 `h += W_down @ mlp_hidden`。
+    #[inline]
+    pub fn matvec_add_into_slice(&self, x: &[f32], y: &mut [f32]) {
+        let k = self.cols;
+        let n = self.rows;
+        debug_assert_eq!(x.len(), k);
+        debug_assert_eq!(y.len(), n);
+
+        let n_threads = crate::model::workspace::thread_count();
+        if n_threads <= 1 || n < 4096 {
+            for i in 0..n {
+                y[i] += dot_q1_0_row(&self.bytes, i, k, x);
+            }
+            return;
+        }
+
+        let bytes = &self.bytes;
+        std::thread::scope(|s| {
+            let chunk = (n + n_threads - 1) / n_threads;
+            let mut handles = Vec::with_capacity(n_threads);
+            let mut row_start = 0usize;
+            for y_chunk in y.chunks_mut(chunk) {
+                let chunk_len = y_chunk.len();
+                let start = row_start;
+                row_start += chunk_len;
+                let h = s.spawn(move || {
+                    for (i, y_i) in y_chunk.iter_mut().enumerate() {
+                        *y_i += dot_q1_0_row(bytes, start + i, k, x);
+                    }
+                });
+                handles.push(h);
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
     }
 
     /// matvec 后加 bias

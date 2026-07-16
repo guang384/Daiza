@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use crate::gguf::parser::GgufFile;
-use crate::math::{sample_top_k_top_p, SamplingParams};
+use crate::math::{sample_top_k_top_p_into, SamplingBuffers, SamplingParams};
 use crate::model::config::Config;
 use crate::model::forward::{forward_single_token, make_context};
 use crate::model::weights::LoadedWeights;
@@ -135,10 +135,12 @@ impl Engine {
         }
 
         // 2. 加载权重(若未加载)
+        let load_start = std::time::Instant::now();
         if self.weights.is_none() {
             eprintln!("[engine] loading weights (one-shot, ~13GB)...");
             self.load_weights()?;
         }
+        let load_ms = load_start.elapsed().as_millis();
 
         // 3. 构造前向上下文
         let cfg = &self.config;
@@ -148,6 +150,7 @@ impl Engine {
         // 4. prefill:逐 token 前向(只填充 KV/SSM 状态)
         let n_input = input_ids.len();
         let mut last_logits: Option<Vec<f32>> = None;
+        let prefill_start = std::time::Instant::now();
         for (i, &tid) in input_ids.iter().enumerate() {
             last_logits = Some(forward_single_token(&mut ctx, tid)?);
             if i % 4 == 0 {
@@ -155,6 +158,9 @@ impl Engine {
             }
         }
         eprintln!("\r[prefill] {n_input}/{n_input} done");
+        let prefill_ms = prefill_start.elapsed().as_millis();
+        eprintln!("[bench] load={load_ms}ms prefill({n_input}t)={prefill_ms}ms (~{}ms/tok)",
+            if n_input > 0 { prefill_ms / n_input as u128 } else { 0 });
 
         // 4. decode:采样 → 前向 → 重复
         let mut rng = LcgRng::new(0xC0FFEE);
@@ -181,9 +187,13 @@ impl Engine {
             eprintln!("[debug] logit range: [{min_l:.4}, {max_l:.4}]");
         }
 
+        let decode_start = std::time::Instant::now();
+        // 预分配采样 buffer(复用 scaled[248320] + indices[248320] = ~3MB),
+        // 避免每 token 重新分配
+        let mut sampling_buf = SamplingBuffers::new(current_logits.len());
         for step in 0..max_tokens {
             // 采样一个 token
-            let next_id = sample_top_k_top_p(&current_logits, params, &mut || rng.next_f32());
+            let next_id = sample_top_k_top_p_into(&current_logits, params, &mut || rng.next_f32(), &mut sampling_buf);
             // 遇到 EOS 提前停止
             if next_id as u32 == self.config.eos_token_id {
                 break;
@@ -200,6 +210,13 @@ impl Engine {
             }
         }
         eprintln!();
+        let decode_ms = decode_start.elapsed().as_millis();
+        let n_gen = generated_ids.len();
+        if n_gen > 0 {
+            eprintln!("[bench] decode({n_gen}t)={decode_ms}ms (~{}ms/tok ~{:.2} tok/s)",
+                decode_ms / n_gen as u128,
+                n_gen as f64 * 1000.0 / decode_ms as f64);
+        }
 
         // 5. decode token ids 为字符串
         Ok(self.tokenizer.decode(&generated_ids))

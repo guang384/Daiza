@@ -15,18 +15,23 @@
 //!
 //! v0 先做正确,后续按上述方向逐步优化。
 
-pub mod gemm;
+// v0 占位模块已删除(gemm/conv1d/ssm_scan),实际实现见:
+//   - GEMM: weights.rs::Q1_0Matrix::matvec_into_slice + tensor/quant.rs::dot_q1_0_row_avx2
+//   - Conv1d: model/ssm.rs 内联实现(已做循环顺序交换优化)
+//   - SSM scan: model/ssm.rs::ssm_scan_vhead(Gated Delta Rule, 2-pass 融合)
 pub mod rmsnorm;
 pub mod rope;
 pub mod softmax;
 pub mod activation;
 pub mod sampling;
-pub mod conv1d;
-pub mod ssm_scan;
+pub mod simd_exp;
 
-pub use gemm::{matmul, matmul_add_into, matvec, matvec_with_bias};
-pub use rmsnorm::rmsnorm_inplace;
-pub use rope::{apply_rope_partial, rope_cos_sin_mrope_text, rope_freqs};
+pub use rmsnorm::{rmsnorm_inplace, rmsnorm_into};
+pub use rope::{apply_rope_partial, rope_cos_sin_mrope_text, rope_cos_sin_mrope_text_into, rope_freqs};
 pub use softmax::{softmax_inplace, softmax_masked_inplace};
 pub use activation::{silu, silu_inplace, swiglu_inplace};
-pub use sampling::{sample_top_k_top_p, SamplingParams};
+pub use sampling::{sample_top_k_top_p, sample_top_k_top_p_into, SamplingBuffers, SamplingParams};
+pub use simd_exp::{
+    exp_fast, exp_inplace_simd, sigmoid_fast, sigmoid_inplace_simd,
+    silu_fast, silu_inplace_simd, swiglu_inplace_simd,
+};
