@@ -233,6 +233,7 @@ pub fn forward_single_token(
 /// `start_pos`: batch 起始位置
 ///
 /// 最后一个 token 的 logits 写入 `ctx.logits_buf`(无 clone, 直接读)
+#[allow(unsafe_code)]
 pub fn forward_batch(
     ctx: &mut ForwardContext<'_>,
     token_ids: &[u32],
@@ -508,43 +509,103 @@ pub fn forward_batch(
                     *qi *= q_scale;
                 }
 
-                // Gated Delta Rule scan per v_head
+                // Gated Delta Rule scan + output gate per v_head
                 // ★ alpha/beta 直接读 batch buffer(省 2 × 48 × 4B = 384B copy/token)
                 // ★ P1-5: scan 直接写 attn_out_buf[t..], 省 ssm_y 末尾 copy
+                // ★ Parallel: 48 v_heads 独立, 跨 v_head 并行到线程池
                 let y_t = &mut attn_out_buf[t * inner..(t + 1) * inner];
-                // ssm_scan_vhead 内部完全覆盖 y (不是累加), 无需 fill(0)
-                for vh in 0..num_v_heads {
-                    let kh = vh / v_heads_per_group;
-                    let q_head = &ctx.workspace.ssm_q[kh * state_size..(kh + 1) * state_size];
-                    let k_head = &ctx.workspace.ssm_k[kh * state_size..(kh + 1) * state_size];
-                    let v_head = &ctx.workspace.ssm_v[vh * state_size..(vh + 1) * state_size];
-                    let s_off = vh * state_size * state_size;
-                    let s = &mut ssm.state[s_off..s_off + state_size * state_size];
-                    let y_off = vh * state_size;
-                    let y = &mut y_t[y_off..y_off + state_size];
-                    crate::model::ssm::ssm_scan_vhead(
-                        s, y, q_head, k_head, v_head,
-                        a[vh], alpha_t[vh], beta_t[vh], dt_bias[vh],
-                        state_size,
-                    );
-                }
-
-                // Output gate: y = rmsnorm(y) * ssm_norm_w * silu(z)
-                // ★ P2-9: 预先对 gate_t 做原地 SIMD silu (省 6144 次标量 silu_fast)
-                // ★ z 直接读 batch buffer 的 gate_t(省 6144 × 4B = 24KB copy/token)
-                // ★ P1-5: 直接 in-place 修改 y_t (省 ssm_y 末尾 copy)
+                // Output gate silu (单次 SIMD pass, 需在并行 gate 前完成)
                 crate::math::simd_exp::silu_inplace_simd(gate_t);
-                for vh in 0..num_v_heads {
-                    let y_off = vh * state_size;
-                    let mut ss = 0.0f32;
-                    for i in 0..state_size {
-                        ss += y_t[y_off + i] * y_t[y_off + i];
+
+                let pool = crate::model::workspace::get_thread_pool();
+                let n_threads = crate::model::workspace::thread_count().min(num_v_heads);
+
+                if n_threads <= 1 || pool.is_none() {
+                    // 串行 fallback (单线程或无线程池)
+                    for vh in 0..num_v_heads {
+                        let kh = vh / v_heads_per_group;
+                        let q_head = &ctx.workspace.ssm_q[kh * state_size..(kh + 1) * state_size];
+                        let k_head = &ctx.workspace.ssm_k[kh * state_size..(kh + 1) * state_size];
+                        let v_head = &ctx.workspace.ssm_v[vh * state_size..(vh + 1) * state_size];
+                        let s_off = vh * state_size * state_size;
+                        let s = &mut ssm.state[s_off..s_off + state_size * state_size];
+                        let y_off = vh * state_size;
+                        let y = &mut y_t[y_off..y_off + state_size];
+                        crate::model::ssm::ssm_scan_vhead(
+                            s, y, q_head, k_head, v_head,
+                            a[vh], alpha_t[vh], beta_t[vh], dt_bias[vh],
+                            state_size,
+                        );
+                        // output gate (fused)
+                        let mut ss = 0.0f32;
+                        for i in 0..state_size {
+                            ss += y[i] * y[i];
+                        }
+                        let inv_rms = 1.0 / (ss / state_size as f32 + l2norm_eps).sqrt();
+                        for i in 0..state_size {
+                            y[i] = y[i] * inv_rms * ssm_norm_w[i] * gate_t[y_off + i];
+                        }
                     }
-                    let inv_rms = 1.0 / (ss / state_size as f32 + l2norm_eps).sqrt();
-                    for i in 0..state_size {
-                        let normed = y_t[y_off + i] * inv_rms;
-                        y_t[y_off + i] = normed * ssm_norm_w[i] * gate_t[y_off + i];
-                    }
+                } else {
+                    let pool = pool.unwrap();
+                    // 捕获 raw 地址 (closure 是 Fn+Send+Sync, 需用 raw ptr 共享可变状态)
+                    let ssm_q_addr = ctx.workspace.ssm_q.as_ptr() as usize;
+                    let ssm_k_addr = ctx.workspace.ssm_k.as_ptr() as usize;
+                    let ssm_v_addr = ctx.workspace.ssm_v.as_ptr() as usize;
+                    let state_addr = ssm.state.as_mut_ptr() as usize;
+                    let y_addr = y_t.as_ptr() as usize;
+                    let a_addr = a.as_ptr() as usize;
+                    let alpha_addr = alpha_t.as_ptr() as usize;
+                    let beta_addr = beta_t.as_ptr() as usize;
+                    let dt_bias_addr = dt_bias.as_ptr() as usize;
+                    let norm_w_addr = ssm_norm_w.as_ptr() as usize;
+                    let gate_addr = gate_t.as_ptr() as usize;
+                    let ss = state_size;
+                    let vpg = v_heads_per_group;
+                    let nkh = num_k_heads;
+                    let nvh = num_v_heads;
+                    let eps = l2norm_eps;
+
+                    let chunk = (num_v_heads + n_threads - 1) / n_threads;
+                    pool.scatter_wait(n_threads, move |tid| {
+                        let start_vh = tid * chunk;
+                        let end_vh = (start_vh + chunk).min(nvh);
+                        let ssm_q = unsafe { std::slice::from_raw_parts(ssm_q_addr as *const f32, nkh * ss) };
+                        let ssm_k = unsafe { std::slice::from_raw_parts(ssm_k_addr as *const f32, nkh * ss) };
+                        let ssm_v = unsafe { std::slice::from_raw_parts(ssm_v_addr as *const f32, nvh * ss) };
+                        let norm_w = unsafe { std::slice::from_raw_parts(norm_w_addr as *const f32, ss) };
+                        let a_s = unsafe { std::slice::from_raw_parts(a_addr as *const f32, nvh) };
+                        let alpha_s = unsafe { std::slice::from_raw_parts(alpha_addr as *const f32, nvh) };
+                        let beta_s = unsafe { std::slice::from_raw_parts(beta_addr as *const f32, nvh) };
+                        let dt_s = unsafe { std::slice::from_raw_parts(dt_bias_addr as *const f32, nvh) };
+                        let gate_s = unsafe { std::slice::from_raw_parts(gate_addr as *const f32, nvh * ss) };
+
+                        for vh in start_vh..end_vh {
+                            let kh = vh / vpg;
+                            let q_head = &ssm_q[kh * ss..(kh + 1) * ss];
+                            let k_head = &ssm_k[kh * ss..(kh + 1) * ss];
+                            let v_head = &ssm_v[vh * ss..(vh + 1) * ss];
+                            let s_off = vh * ss * ss;
+                            let s = unsafe { std::slice::from_raw_parts_mut((state_addr as *mut f32).add(s_off), ss * ss) };
+                            let y_off = vh * ss;
+                            let y = unsafe { std::slice::from_raw_parts_mut((y_addr as *mut f32).add(y_off), ss) };
+                            crate::model::ssm::ssm_scan_vhead(
+                                s, y, q_head, k_head, v_head,
+                                a_s[vh], alpha_s[vh], beta_s[vh], dt_s[vh],
+                                ss,
+                            );
+                            // output gate (fused, per-v_head 独立)
+                            let mut sum_sq = 0.0f32;
+                            for i in 0..ss {
+                                sum_sq += y[i] * y[i];
+                            }
+                            let inv_rms = 1.0 / (sum_sq / ss as f32 + eps).sqrt();
+                            let gate_vh = &gate_s[y_off..y_off + ss];
+                            for i in 0..ss {
+                                y[i] = y[i] * inv_rms * norm_w[i] * gate_vh[i];
+                            }
+                        }
+                    });
                 }
             }
             if let Some(ts) = ts_ssm { p_ssm_serial += ts.elapsed(); }
