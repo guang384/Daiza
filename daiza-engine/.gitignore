@@ -1,0 +1,22 @@
+# Build artifacts
+/target/
+**/target/
+
+# Compiled binaries & debug symbols
+*.exe
+*.pdb
+*.dll
+*.lib
+
+# Benchmark baseline binaries (临时二进制, 不进 git)
+sota-baseline/daiza-cli-baseline.exe
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
