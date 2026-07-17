@@ -1,9 +1,9 @@
 Drop .gguf model files in this directory.
 
 Required / planned gguf weights (git-ignored, not tracked):
-  - Bonsai-27B-Q1_0.gguf         (3.9 GB, 主权重, 必需)
-  - Bonsai-27B-dspark-Q4_1.gguf  (1.8 GB, DSpark 投机解码 drafter, 计划支持)
-  - Bonsai-27B-mmproj-Q8_0.gguf  (0.63 GB, 视觉塔多模态, 计划支持)
+  - Bonsai-27B-Q1_0.gguf         (3.9 GB, main weights, required)
+  - Bonsai-27B-dspark-Q4_1.gguf  (1.8 GB, DSpark speculative-decoding drafter, planned)
+  - Bonsai-27B-mmproj-Q8_0.gguf  (0.63 GB, multimodal vision tower, planned)
 
 Download (example, via huggingface-cli):
   hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-Q1_0.gguf --local-dir ./Bonsai-27B-gguf
