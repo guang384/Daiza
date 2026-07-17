@@ -138,12 +138,10 @@ impl Engine {
             let n_threads = crate::model::workspace::thread_count();
             crate::model::workspace::init_thread_pool(n_threads);
             eprintln!("[engine] thread pool ({n_threads} workers) initialized");
-            // ★ 释放 GGUF 字节缓冲 (~3.9GB): LoadedWeights 已通过 to_vec() 持有所有
-            // Q1_0/F32 权重的独立拷贝, gguf.bytes 不再被访问。print_summary 在
-            // --inspect 模式下于 generate 之前调用, 不受影响。
-            let freed = self.gguf.bytes.len();
-            self.gguf.bytes = Vec::new();
-            eprintln!("[engine] released gguf byte buffer ({} MB)", freed / 1024 / 1024);
+            // GGUF 文件已通过 mmap 映射, 权重加载时 to_vec() 复制到独立缓冲,
+            // mmap 区域由内核按需 page-in, 物理内存占用远小于文件大小。
+            // 加载完成后 mmap 仍保留(用于 --inspect 等场景), 但未访问的 page
+            // 不占物理内存。
         }
         let load_ms = load_start.elapsed().as_millis();
 

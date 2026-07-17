@@ -1,12 +1,15 @@
 //! GGUF 文件顶层解析器
 //!
 //! 只读取头部(magic / metadata / tensor info),不加载权重数据。
-//! 引擎在需要某张量时再按 `offset` 随机读取(GGUF 数据段顺序与头部张量顺序无关)。
+//! 引擎在需要某张量时再按 `offset` 从 mmap 区域切片访问(GGUF 数据段顺序与头部张量顺序无关)。
+//!
+//! 内存策略: 整个文件通过 memmap2 映射为只读, 内核按需 page-in,
+//! 避免一次性 read_to_end 导致 ~3.9GB 内存峰值。tensor_data 返回
+//! &[u8] 切片到 mmap 区域, 零拷贝。
 
 use std::fs::File;
-use std::io::Read;
-use std::io::Seek;
 use std::path::Path;
+use std::path::PathBuf;
 
 use crate::gguf::err;
 use crate::gguf::metadata::Metadata;
@@ -14,7 +17,10 @@ use crate::gguf::reader::ByteReader;
 use crate::gguf::tensor_info::{TensorInfo, GGUF_MAGIC, GGUF_VERSION};
 use crate::Result;
 
-/// 解析后的 GGUF 文件结构(头部信息 + 整个文件的字节视图)
+/// 解析后的 GGUF 文件结构(头部信息 + mmap 映射的文件字节视图)
+///
+/// mmap 由内核按需 page-in, 不实际占用物理内存直到访问。tensor_data
+/// 返回切片到 mmap 区域的 &[u8], 零拷贝。
 pub struct GgufFile {
     pub version: u32,
     pub alignment: u64,
@@ -22,27 +28,31 @@ pub struct GgufFile {
     pub tensors: Vec<TensorInfo>,
     /// 张量数据段在文件中的绝对偏移(用于按 tensor.offset 随机读取)
     pub data_section_offset: u64,
-    /// 整个文件的字节缓冲(mmap 的替代方案;3.9GB 一次性读入对 64GB+ 内存是可接受的,
-    /// 真正部署时可换成 `memmap2`,但那违反"零依赖"。学习项目优先简单正确)
-    pub bytes: Vec<u8>,
+    /// 文件路径(保留用于错误信息)
+    #[allow(dead_code)]
+    pub path: PathBuf,
+    /// mmap 映射的整个文件字节
+    mmap: memmap2::Mmap,
 }
 
 impl GgufFile {
-    /// 打开并解析 GGUF 文件头部
+    /// 打开并解析 GGUF 文件( mmap 整个文件, 几乎 0 成本)
+    #[allow(unsafe_code)]
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut file = File::open(&path).map_err(|e| {
-            crate::BonsaiError::Io(format!("open {}: {e}", path.as_ref().display()))
+        let path_buf = path.as_ref().to_path_buf();
+        let file = File::open(&path_buf).map_err(|e| {
+            crate::BonsaiError::Io(format!("open {}: {e}", path_buf.display()))
         })?;
 
-        // 读头部预览(前 256 KB 足够覆盖全部 metadata + tensor info)
-        // 之后再决定是否读全文件
-        let mut header_buf = Vec::with_capacity(256 * 1024);
-        let n = file
-            .read_to_end(&mut header_buf)
-            .map_err(|e| crate::BonsaiError::Io(format!("read header: {e}")))?;
+        // mmap 整个文件为只读 (内核按需 page-in, 不实际占物理内存)
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .map(&file)
+                .map_err(|e| crate::BonsaiError::Io(format!("mmap {}: {e}", path_buf.display())))?
+        };
+        let bytes = &mmap[..];
 
-        // 判断是头部还是整文件
-        let mut reader = ByteReader::new(&header_buf);
+        let mut reader = ByteReader::new(bytes);
         let magic = reader.read_u32()?;
         if magic != GGUF_MAGIC {
             return Err(err(format!(
@@ -69,29 +79,14 @@ impl GgufFile {
         let mask = alignment - 1;
         let aligned = (data_section_offset + mask) & !mask;
 
-        // 如果 header_buf 包含整文件,直接复用;否则再读一次整文件
-        // 简单路径:对于学习项目,直接读全文件
-        let bytes = if n == file.metadata().map(|m| m.len() as usize).unwrap_or(0) {
-            // 已经把整文件读进来了
-            header_buf
-        } else {
-            // 重新读整个文件
-            let _ = aligned; // 对齐后的偏移在 bytes 切片中同样适用
-            let mut all = Vec::new();
-            file.seek(std::io::SeekFrom::Start(0))
-                .map_err(|e| crate::BonsaiError::Io(format!("seek: {e}")))?;
-            file.read_to_end(&mut all)
-                .map_err(|e| crate::BonsaiError::Io(format!("read full: {e}")))?;
-            all
-        };
-
         Ok(Self {
             version,
             alignment,
             metadata,
             tensors,
             data_section_offset: aligned,
-            bytes,
+            path: path_buf,
+            mmap,
         })
     }
 
@@ -100,17 +95,18 @@ impl GgufFile {
         self.tensors.iter().find(|t| t.name == name)
     }
 
-    /// 取某个张量的数据切片(只读视图)
+    /// 取某个张量的数据切片(零拷贝, 直接切片到 mmap 区域)
     pub fn tensor_data(&self, info: &TensorInfo) -> Result<&[u8]> {
         let start = self.data_section_offset as usize + info.offset as usize;
         let nbytes = crate::tensor::dtype::byte_size(info.dtype, info.n_elements());
         let end = start + nbytes;
-        if end > self.bytes.len() {
+        let bytes = &self.mmap[..];
+        if end > bytes.len() {
             return Err(err(format!(
                 "tensor '{}' data out of range: {}..{} > {}",
-                info.name, start, end, self.bytes.len()
+                info.name, start, end, bytes.len()
             )));
         }
-        Ok(&self.bytes[start..end])
+        Ok(&bytes[start..end])
     }
 }

@@ -24,5 +24,6 @@ panic = "abort"
 opt-level = 1   # 开发时也启用 O1,避免 GEMM 慢到无法验证
 
 [dependencies]
-# 零外部依赖。所有功能(含 FP16/BF16、BPE、GEMM、SSM)从零实现。
-# 设计依据见 README.md 与 Bonsai-27B-gguf/ 白皮书。
+# 跨平台 mmap: 用于 GGUF 权重文件按需 page-in, 避免一次性 read_to_end 导致 ~3.9GB 内存峰值。
+# memmap2 是 memmap crate 的维护分支, Rust 生态事实标准。
+memmap2 = "0.9"
