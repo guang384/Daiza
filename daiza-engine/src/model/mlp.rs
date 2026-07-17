@@ -34,10 +34,12 @@ pub fn mlp_forward_into(
     mlp_up: &mut [f32],
     h: &mut [f32],
 ) {
-    // gate = x @ W_gate  (覆盖写入 mlp_gate)
-    w_gate.matvec_into_slice(x, mlp_gate);
-    // up = x @ W_up
-    w_up.matvec_into_slice(x, mlp_up);
+    // ★ P0-B: gate + up 合并为单次线程池 barrier (共享输入 x, 20KB 驻留 L2)
+    //   原: 2 次 scatter_wait (各 17408 rows → 2 barriers)
+    //   新: 1 次 scatter_wait (34816 rows → 1 barrier, -1 barrier/block × 64 blocks)
+    let matrices: &[&Q1_0Matrix] = &[w_gate, w_up];
+    let outputs: &mut [&mut [f32]] = &mut [mlp_gate, mlp_up];
+    Q1_0Matrix::matvec_multi_into_slice(x, matrices, outputs);
     // silu(gate) * up (in-place on mlp_gate)
     math::swiglu_inplace(mlp_gate, mlp_up);
     // h += W_down @ mlp_gate

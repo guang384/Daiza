@@ -392,6 +392,144 @@ impl Q1_0Matrix {
         });
     }
 
+    /// ★ P0-B: 多矩阵合并 matvec — 多个共享同一输入 x 的矩阵在单次线程池 barrier 内完成
+    ///
+    /// **动机**: 原 attention Q/K/V、MLP gate/up、SSM qkv/gate 各自独立调用 matvec_into_slice,
+    ///   每次 trigger 一次 scatter_wait barrier (Arc alloc + N×Box alloc + N×channel send + spin)。
+    ///   合并后 N 个矩阵的 total_rows 一次性分发, barrier 数从 3 降到 1。
+    ///
+    /// **额外收益**:
+    ///   - x 向量 (20KB) 在多个矩阵间自然驻留 L2, 消除跨 dispatch 的 L2 eviction
+    ///   - total_rows 更大 → chunk 更大 → 相对 dispatch 开销更低, load balancing 更好
+    ///
+    /// `matrices[i].cols` 必须全等于 `x.len()`; `outputs[i].len()` 必须等于 `matrices[i].rows`。
+    #[allow(unsafe_code)]
+    pub fn matvec_multi_into_slice(
+        x: &[f32],
+        matrices: &[&Q1_0Matrix],
+        outputs: &mut [&mut [f32]],
+    ) {
+        let n_entries = matrices.len();
+        debug_assert_eq!(n_entries, outputs.len());
+        if n_entries == 0 {
+            return;
+        }
+        let k = matrices[0].cols;
+        debug_assert_eq!(x.len(), k);
+        for i in 0..n_entries {
+            debug_assert_eq!(matrices[i].cols, k);
+            debug_assert_eq!(outputs[i].len(), matrices[i].rows);
+        }
+
+        // 单矩阵直接走原路径 (避免 entry table 开销)
+        if n_entries == 1 {
+            matrices[0].matvec_into_slice(x, outputs[0]);
+            return;
+        }
+
+        let n_threads = crate::model::workspace::thread_count();
+        let use_avx2 = avx2_q1_0_available();
+
+        // 构建 entry table: 每个 entry 记录矩阵的 raw 指针 + 全局行偏移
+        // ★ 栈分配 [Entry; 8] 避免 Vec heap alloc (每 token 128 次调用)
+        //   (闭包需 'static, 不能持有借用; 用 raw pointer 绕过生命周期)
+        #[derive(Clone, Copy)]
+        struct Entry {
+            bytes_addr: usize,
+            bytes_len: usize,
+            rows: usize,
+            y_addr: usize,
+            row_start: usize, // 在全局虚拟行空间中的起点
+        }
+        let mut entries: [Entry; 8] = [Entry {
+            bytes_addr: 0, bytes_len: 0, rows: 0, y_addr: 0, row_start: 0,
+        }; 8];
+        debug_assert!(n_entries <= 8);
+        let mut total_rows = 0usize;
+        for i in 0..n_entries {
+            entries[i] = Entry {
+                bytes_addr: matrices[i].bytes.as_ptr() as usize,
+                bytes_len: matrices[i].bytes.len(),
+                rows: matrices[i].rows,
+                y_addr: outputs[i].as_mut_ptr() as usize,
+                row_start: total_rows,
+            };
+            total_rows += matrices[i].rows;
+        }
+
+        // 小矩阵或单线程: 顺序调用各矩阵 (仍用 dual-row AVX2 kernel)
+        if n_threads <= 1 || total_rows < 1024 {
+            for i in 0..n_entries {
+                matrices[i].matvec_into_slice(x, outputs[i]);
+            }
+            return;
+        }
+
+        // 持久线程池: 单次 barrier 分发所有矩阵的行
+        if let Some(pool) = crate::model::workspace::get_thread_pool() {
+            let x_addr = x.as_ptr() as usize;
+            let chunk = (total_rows + n_threads - 1) / n_threads;
+
+            pool.scatter_wait(n_threads, move |tid| {
+                let start = tid * chunk;
+                let end = (start + chunk).min(total_rows);
+                if start >= end {
+                    return;
+                }
+                let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
+
+                // 在虚拟行空间中迭代, 找到每个 entry 的连续行段
+                let mut virt = start;
+                let mut entry_idx = 0;
+                while virt < end {
+                    // 找到 virt 所属的 entry (entries 按 row_start 升序, 线性扫描即可)
+                    while entry_idx + 1 < n_entries && virt >= entries[entry_idx + 1].row_start {
+                        entry_idx += 1;
+                    }
+                    let e = &entries[entry_idx];
+                    let local_start = virt - e.row_start;
+                    let local_end = (end - e.row_start).min(e.rows);
+                    if local_start >= local_end {
+                        break;
+                    }
+                    let bytes = unsafe { std::slice::from_raw_parts(e.bytes_addr as *const u8, e.bytes_len) };
+
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 {
+                        let mut i = local_start;
+                        while i + 1 < local_end {
+                            let (y0, y1) = unsafe { dot_q1_0_row_dual_avx2(bytes, i, i + 1, k, x) };
+                            unsafe {
+                                *((e.y_addr as *mut f32).add(i)) = y0;
+                                *((e.y_addr as *mut f32).add(i + 1)) = y1;
+                            }
+                            i += 2;
+                        }
+                        if i < local_end {
+                            unsafe {
+                                *((e.y_addr as *mut f32).add(i)) = dot_q1_0_row_avx2(bytes, i, k, x);
+                            }
+                        }
+                    } else {
+                        for i in local_start..local_end {
+                            unsafe {
+                                *((e.y_addr as *mut f32).add(i)) = dot_q1_0_row_scalar(bytes, i, k, x);
+                            }
+                        }
+                    }
+                    virt = e.row_start + local_end;
+                    entry_idx += 1;
+                }
+            });
+            return;
+        }
+
+        // 回退: 顺序调用
+        for i in 0..n_entries {
+            matrices[i].matvec_into_slice(x, outputs[i]);
+        }
+    }
+
     /// 批量 matvec 累加: y[t][i] += dot(W_row_i, x[t])
     #[allow(unsafe_code)]
     pub fn matvec_add_batch_into_slice(&self, x: &[f32], n_batch: usize, y: &mut [f32]) {

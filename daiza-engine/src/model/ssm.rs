@@ -44,7 +44,7 @@
 //! 跨 token 复用。最终输出通过 `matvec_add_into_slice` 直接累加到主残差流 h。
 
 use crate::math;
-use crate::model::weights::SsmBlockWeights;
+use crate::model::weights::{Q1_0Matrix, SsmBlockWeights};
 use crate::model::workspace::Workspace;
 use crate::cache::SsmState;
 
@@ -265,9 +265,26 @@ pub fn ssm_forward_into(
     //    ★ 用 rmsnorm_into 直接从 h 读、写入 block_normed,消除 copy_from_slice
     math::rmsnorm_into(&h[..cfg.hidden], &mut ws.block_normed, &w.attn_norm.data, cfg.rms_eps);
 
-    // 2. attn_qkv 投影: ws.ssm_qkv = W_qkv @ ws.block_normed
-    //    [q(2048), k(2048), v(6144)] = 10240
-    w.attn_qkv.matvec_into_slice(&ws.block_normed, &mut ws.ssm_qkv);
+    // 2. ★ P0-B: qkv + alpha + beta + gate 合并为单次线程池 barrier (共享输入 ws.block_normed)
+    //    原: qkv(10240 rows, barrier) + alpha(48 rows, single-thread) + beta(48, single-thread)
+    //        + gate(6144 rows, barrier) = 2 barriers
+    //    新: 1 次 scatter_wait (16480 rows → 1 barrier, -1 barrier/block × 48 blocks)
+    //    alpha/beta/gate 的值提前计算但延后使用 (均只依赖 ws.block_normed, 无数据依赖)
+    {
+        let matrices: &[&Q1_0Matrix] = &[
+            &w.attn_qkv,
+            &w.ssm_alpha,
+            &w.ssm_beta,
+            &w.attn_gate,
+        ];
+        let outputs: &mut [&mut [f32]] = &mut [
+            &mut ws.ssm_qkv,
+            &mut ws.ssm_alpha,
+            &mut ws.ssm_beta,
+            &mut ws.ssm_z,
+        ];
+        Q1_0Matrix::matvec_multi_into_slice(&ws.block_normed, matrices, outputs);
+    }
 
     // 3. Conv1d (depthwise, causal, kernel=4) + silu on cat(q,k,v)
     if state.conv_history.is_empty() {
@@ -319,9 +336,8 @@ pub fn ssm_forward_into(
         *qi *= q_scale;
     }
 
-    // 6. Alpha / Beta / dt / A 投影 (per v_head, [48])
-    w.ssm_alpha.matvec_into_slice(&ws.block_normed, &mut ws.ssm_alpha);
-    w.ssm_beta.matvec_into_slice(&ws.block_normed, &mut ws.ssm_beta);
+    // 6. Alpha / Beta / dt / A (per v_head, [48])
+    //    ★ P0-B: alpha/beta 已在步骤 2 与 qkv/gate 一起计算, 这里直接读取
     let dt_bias = &w.ssm_dt_bias.data;   // [48]
     // 注意: ssm_a 张量存储的是 A = -exp(A_log) (已取负号和 exp), 不是 A_log 本身
     // 参考实现 qwen35.cpp: gate = alpha_softplus * ssm_a  (注释: -A_log.exp() * softplus)
@@ -360,9 +376,8 @@ pub fn ssm_forward_into(
 
     // 8. Output gate: Qwen3NextRMSNormGated
     //    y = rmsnorm(y) * ssm_norm_weight * silu(z)
-    //    其中 z = attn_gate @ x (输出门)
+    //    其中 z = attn_gate @ x (输出门, 已在步骤 2 计算)
     //    对每个 v_head (head_v_dim=128) 单独应用 RMSNorm + weight + silu(gate)
-    w.attn_gate.matvec_into_slice(&ws.block_normed, &mut ws.ssm_z);
     let ssm_norm_w = &w.ssm_norm.data; // [128]
     // ★ P1-2: 批量 silu(z) 一次(6144 元素 = 768 × 8-wide SIMD)
     //   原标量 silu_fast 294912 次/token,每次 ~5c(broadcast+extract 浪费 7 lane)

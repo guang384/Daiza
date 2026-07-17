@@ -43,7 +43,7 @@
 //! 跨 token 复用。最终输出通过 `matvec_add_into_slice` 直接累加到主残差流 h。
 
 use crate::math;
-use crate::model::weights::FullAttentionBlockWeights;
+use crate::model::weights::{FullAttentionBlockWeights, Q1_0Matrix};
 use crate::model::workspace::Workspace;
 use crate::cache::KvCache;
 
@@ -73,9 +73,19 @@ pub fn attention_forward_into(
     //    ★ 用 rmsnorm_into 直接从 h 读、写入 block_normed,消除 copy_from_slice
     math::rmsnorm_into(&h[..hidden], &mut ws.block_normed, &w.attn_norm.data, rms_eps);
 
-    // 2. Q projection: ws.attn_q_total = W_q @ ws.block_normed
-    //    ★ Split borrow: 同时 &ws.block_normed (不可变) 和 &mut ws.attn_q_total (可变)
-    w.attn_q.matvec_into_slice(&ws.block_normed, &mut ws.attn_q_total);
+    // 2. ★ P0-B: Q + K + V 合并为单次线程池 barrier (共享输入 ws.block_normed)
+    //    原: 3 次 scatter_wait (Q 12288 rows + K 1024 rows + V 1024 rows = 3 barriers)
+    //    新: 1 次 scatter_wait (14336 rows → 1 barrier, -2 barriers/block × 16 blocks)
+    //    额外收益: ws.block_normed (20KB) 在 Q/K/V 间自然驻留 L2
+    {
+        let matrices: &[&Q1_0Matrix] = &[&w.attn_q, &w.attn_k, &w.attn_v];
+        let outputs: &mut [&mut [f32]] = &mut [
+            &mut ws.attn_q_total,
+            &mut ws.attn_k,
+            &mut ws.attn_v,
+        ];
+        Q1_0Matrix::matvec_multi_into_slice(&ws.block_normed, matrices, outputs);
+    }
 
     // 3. 解交错 Q 和 gate
     //    [Q_head0(256) | gate_head0(256) | Q_head1(256) | gate_head1(256) | ...]
@@ -85,10 +95,6 @@ pub fn attention_forward_into(
         ws.attn_q[dst..dst + head_dim].copy_from_slice(&ws.attn_q_total[src..src + head_dim]);
         ws.attn_gate[dst..dst + head_dim].copy_from_slice(&ws.attn_q_total[src + head_dim..src + 2 * head_dim]);
     }
-
-    // 4. K / V projection
-    w.attn_k.matvec_into_slice(&ws.block_normed, &mut ws.attn_k);
-    w.attn_v.matvec_into_slice(&ws.block_normed, &mut ws.attn_v);
 
     // 5+6. QK-norm + RoPE 融合 (减少循环开销)
     let (cos, sin) = cos_sin;
