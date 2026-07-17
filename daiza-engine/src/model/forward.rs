@@ -245,12 +245,24 @@ pub fn forward_batch(
         return Ok(());
     }
 
+    let profile = profile_enabled();
+    let mut p_emb = std::time::Duration::ZERO;
+    let mut p_cos_sin = std::time::Duration::ZERO;
+    let mut p_batch_rmsnorm = std::time::Duration::ZERO;
+    let mut p_batch_matvec = std::time::Duration::ZERO;
+    let mut p_attn_serial = std::time::Duration::ZERO;
+    let mut p_ssm_serial = std::time::Duration::ZERO;
+    let mut p_swiglu = std::time::Duration::ZERO;
+    let mut p_final = std::time::Duration::ZERO;
+
     // 1. embedding lookup: ctx.h_buf 需要扩展为 batch 大小
+    let t0 = if profile { Some(std::time::Instant::now()) } else { None };
     ctx.h_buf.resize(n_batch * hidden, 0.0);
     for t in 0..n_batch {
         ctx.weights.global.token_embd
             .row_into_slice(token_ids[t] as usize, &mut ctx.h_buf[t * hidden..(t + 1) * hidden]);
     }
+    if let Some(t) = t0 { p_emb = t.elapsed(); }
 
     // 2. 预分配 batch 临时 buffer(跨 block 复用)
     // 所有维度均从 cfg 直接派生,避免通过 block[1] 间接访问(脆弱依赖)
@@ -284,9 +296,11 @@ pub fn forward_batch(
     let block_start_ts = std::time::Instant::now();
 
     // 预计算所有 batch token 的 cos/sin(避免与 kv cache 的 borrow 冲突)
+    let t0 = if profile { Some(std::time::Instant::now()) } else { None };
     let cos_sin_batch: Vec<_> = (0..n_batch)
         .map(|t| ctx.state.cos_sin_at(start_pos + t))
         .collect();
+    if let Some(t) = t0 { p_cos_sin = t.elapsed(); }
 
     for blk_idx in 0..cfg.block_count {
         let is_full = cfg.is_full_attention_block(blk_idx);
@@ -299,20 +313,24 @@ pub fn forward_batch(
             let w = block_w.as_full_attention();
 
             // 3a. Batch rmsnorm
+            let ts = if profile { Some(std::time::Instant::now()) } else { None };
             for t in 0..n_batch {
                 let src = &ctx.h_buf[t * hidden..(t + 1) * hidden];
                 let dst = &mut normed_batch[t * hidden..(t + 1) * hidden];
                 math::rmsnorm_into(src, dst, &w.attn_norm.data, cfg.rms_eps);
             }
+            if let Some(ts) = ts { p_batch_rmsnorm += ts.elapsed(); }
 
             // 3b. Batch Q matvec: qkv_buf[t] = W_q @ normed[t]
-            w.attn_q.matvec_batch_into_slice(&normed_batch, n_batch, &mut qkv_buf[..n_batch * qkv_total_dim]);
-
             // 3c. Batch K and V matvecs
+            let ts = if profile { Some(std::time::Instant::now()) } else { None };
+            w.attn_q.matvec_batch_into_slice(&normed_batch, n_batch, &mut qkv_buf[..n_batch * qkv_total_dim]);
             w.attn_k.matvec_batch_into_slice(&normed_batch, n_batch, &mut k_buf);
             w.attn_v.matvec_batch_into_slice(&normed_batch, n_batch, &mut v_buf);
+            if let Some(ts) = ts { p_batch_matvec += ts.elapsed(); }
 
             // 3d. Per-token attention (sequential)
+            let ts_attn = if profile { Some(std::time::Instant::now()) } else { None };
             for t in 0..n_batch {
                 let qkv_t = &qkv_buf[t * qkv_total_dim..(t + 1) * qkv_total_dim];
 
@@ -381,26 +399,33 @@ pub fn forward_batch(
                 math::sigmoid_inplace_simd(&mut ctx.workspace.attn_gate);
                 math::mul_inplace_simd(&mut out_t[..attn_out_dim], &ctx.workspace.attn_gate[..attn_out_dim]);
             }
+            if let Some(ts) = ts_attn { p_attn_serial += ts.elapsed(); }
 
             // 3e. Batch output projection: h += W_out @ attn_out
+            let ts = if profile { Some(std::time::Instant::now()) } else { None };
             w.attn_output.matvec_add_batch_into_slice(&attn_out_buf[..n_batch * attn_out_dim], n_batch, &mut ctx.h_buf);
+            if let Some(ts) = ts { p_batch_matvec += ts.elapsed(); }
         } else {
             let ssm = ctx.state.ssm_states[blk_idx].as_mut().unwrap();
             let w = block_w.as_ssm();
             let ssm_qkv_dim = w.attn_qkv.rows;
 
             // 3a. Batch rmsnorm
+            let ts = if profile { Some(std::time::Instant::now()) } else { None };
             for t in 0..n_batch {
                 let src = &ctx.h_buf[t * hidden..(t + 1) * hidden];
                 let dst = &mut normed_batch[t * hidden..(t + 1) * hidden];
                 math::rmsnorm_into(src, dst, &w.attn_norm.data, cfg.rms_eps);
             }
+            if let Some(ts) = ts { p_batch_rmsnorm += ts.elapsed(); }
 
             // 3b. Batch SSM matvecs
+            let ts = if profile { Some(std::time::Instant::now()) } else { None };
             w.attn_qkv.matvec_batch_into_slice(&normed_batch, n_batch, &mut qkv_buf[..n_batch * ssm_qkv_dim]);
             w.ssm_alpha.matvec_batch_into_slice(&normed_batch, n_batch, &mut ssm_alpha_buf);
             w.ssm_beta.matvec_batch_into_slice(&normed_batch, n_batch, &mut ssm_beta_buf);
             w.attn_gate.matvec_batch_into_slice(&normed_batch, n_batch, &mut ssm_gate_buf);
+            if let Some(ts) = ts { p_batch_matvec += ts.elapsed(); }
 
             // 3c. Per-token SSM (conv1d + silu + L2 norm + q_scale + scan + output gate)
             //   所有 cfg 派生常量在外层已计算,这里只取本 block 权重引用
@@ -420,6 +445,7 @@ pub fn forward_batch(
             //   - alpha/beta 只标量访问,直接读 batch buffer
             //   - z (gate) 在 output gate 里读,直接读 batch buffer
             //   - qkv 在 conv1d 里只用于 copy 进 conv_history,直接用 batch buffer
+            let ts_ssm = if profile { Some(std::time::Instant::now()) } else { None };
             for t in 0..n_batch {
                 let qkv_t = &qkv_buf[t * ssm_qkv_dim..(t + 1) * ssm_qkv_dim];
                 let alpha_t = &ssm_alpha_buf[t * ssm_alpha_dim..(t + 1) * ssm_alpha_dim];
@@ -521,36 +547,47 @@ pub fn forward_batch(
                     }
                 }
             }
+            if let Some(ts) = ts_ssm { p_ssm_serial += ts.elapsed(); }
 
             // 3d. Batch output projection: h += W_out @ ssm_y_batch
+            let ts = if profile { Some(std::time::Instant::now()) } else { None };
             w.ssm_out.matvec_add_batch_into_slice(&attn_out_buf[..n_batch * inner], n_batch, &mut ctx.h_buf);
+            if let Some(ts) = ts { p_batch_matvec += ts.elapsed(); }
         }
 
         // 4. Post-attention norm + MLP (batch)
         let (post_norm, w_gate, w_up, w_down) = block_w.post_norm_and_ffn();
 
         // 4a. Batch post-attention norm
+        let ts = if profile { Some(std::time::Instant::now()) } else { None };
         for t in 0..n_batch {
             let src = &ctx.h_buf[t * hidden..(t + 1) * hidden];
             let dst = &mut normed_batch[t * hidden..(t + 1) * hidden];
             math::rmsnorm_into(src, dst, &post_norm.data, cfg.rms_eps);
         }
+        if let Some(ts) = ts { p_batch_rmsnorm += ts.elapsed(); }
 
         // 4b. Batch MLP matvecs (gate → qkv_buf, up → tmp_buf, 直接复用无需 take)
+        let ts = if profile { Some(std::time::Instant::now()) } else { None };
         w_gate.matvec_batch_into_slice(&normed_batch, n_batch, &mut qkv_buf[..n_batch * ffn_dim]);
         w_up.matvec_batch_into_slice(&normed_batch, n_batch, &mut tmp_buf[..n_batch * ffn_dim]);
+        if let Some(ts) = ts { p_batch_matvec += ts.elapsed(); }
 
         // 4c. Per-token SwiGLU: gate = silu(gate) * up (in-place on qkv_buf, 读 tmp_buf)
         //    qkv_buf 和 tmp_buf 是不同 Vec,可同时 &mut qkv_buf[..] 和 &tmp_buf[..]
+        let ts = if profile { Some(std::time::Instant::now()) } else { None };
         for t in 0..n_batch {
             math::swiglu_inplace(
                 &mut qkv_buf[t * ffn_dim..(t + 1) * ffn_dim],
                 &tmp_buf[t * ffn_dim..(t + 1) * ffn_dim],
             );
         }
+        if let Some(ts) = ts { p_swiglu += ts.elapsed(); }
 
         // 4d. Batch down projection: h += W_down @ gate
+        let ts = if profile { Some(std::time::Instant::now()) } else { None };
         w_down.matvec_add_batch_into_slice(&qkv_buf[..n_batch * ffn_dim], n_batch, &mut ctx.h_buf);
+        if let Some(ts) = ts { p_batch_matvec += ts.elapsed(); }
 
         if let Some(ts) = block_ts {
             eprint!("\r[block {blk_idx:>2}] {}ms", ts.elapsed().as_millis());
@@ -563,18 +600,55 @@ pub fn forward_batch(
 
     // 5. Final norm + LM head — 只算最后一个 token (省 (n_batch-1) × 179MB 权重读取)
     //    logits 写入 ctx.logits_buf,decode 阶段直接读
+    let t0 = if profile { Some(std::time::Instant::now()) } else { None };
     let last_h = &mut ctx.h_buf[(n_batch - 1) * hidden..n_batch * hidden];
     math::rmsnorm_inplace(last_h, &ctx.weights.global.output_norm.data, cfg.rms_eps);
     if ctx.logits_buf.len() != cfg.vocab_size {
         ctx.logits_buf = vec![0.0; cfg.vocab_size];
     }
     ctx.weights.global.output.matvec_into_slice(last_h, &mut ctx.logits_buf);
+    if let Some(t) = t0 { p_final = t.elapsed(); }
 
     // 6. Restore h_buf to single-token size for decode phase
     ctx.h_buf.truncate(hidden);
 
     // 7. Advance position
     ctx.state.pos = start_pos + n_batch;
+
+    if profile {
+        let blocks_ms = block_start_ts.elapsed().as_secs_f64() * 1000.0;
+        let serial_ms = p_attn_serial.as_secs_f64() * 1000.0
+            + p_ssm_serial.as_secs_f64() * 1000.0
+            + p_swiglu.as_secs_f64() * 1000.0;
+        let parallel_ms = p_batch_matvec.as_secs_f64() * 1000.0
+            + p_batch_rmsnorm.as_secs_f64() * 1000.0;
+        let total_ms = p_emb.as_secs_f64() * 1000.0
+            + p_cos_sin.as_secs_f64() * 1000.0
+            + blocks_ms
+            + p_final.as_secs_f64() * 1000.0;
+        let ratio = if total_ms > 0.0 { serial_ms / total_ms * 100.0 } else { 0.0 };
+        eprintln!(
+            "[prefill-profile] n_batch={n_batch} blocks={block_count} | total={total_ms:.1}ms",
+            block_count = cfg.block_count,
+        );
+        eprintln!(
+            "  emb={emb_ms:.2}ms cos_sin={cos_ms:.2}ms final={final_ms:.2}ms",
+            emb_ms = p_emb.as_secs_f64() * 1000.0,
+            cos_ms = p_cos_sin.as_secs_f64() * 1000.0,
+            final_ms = p_final.as_secs_f64() * 1000.0,
+        );
+        eprintln!(
+            "  blocks={blocks_ms:.1}ms | batch_parallel={parallel_ms:.1}ms [matvec={matvec_ms:.1} rmsnorm={rmsnorm_ms:.1}]",
+            matvec_ms = p_batch_matvec.as_secs_f64() * 1000.0,
+            rmsnorm_ms = p_batch_rmsnorm.as_secs_f64() * 1000.0,
+        );
+        eprintln!(
+            "  per_token_serial={serial_ms:.1}ms [attn={attn_ms:.1} ssm={ssm_ms:.1} swiglu={swiglu_ms:.1}] serial_ratio={ratio:.1}%",
+            attn_ms = p_attn_serial.as_secs_f64() * 1000.0,
+            ssm_ms = p_ssm_serial.as_secs_f64() * 1000.0,
+            swiglu_ms = p_swiglu.as_secs_f64() * 1000.0,
+        );
+    }
 
     Ok(())
 }
