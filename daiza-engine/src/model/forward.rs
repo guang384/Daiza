@@ -120,10 +120,19 @@ pub fn forward_single_token(
     //   改为只在外层测量一次,通过 env 变量控制是否打印明细
     let debug_blocks = std::env::var("DAIZA_DEBUG_BLOCKS").is_ok();
     let block_start_ts = std::time::Instant::now();
+    let mut attn_total = std::time::Duration::ZERO;
+    let mut ssm_total = std::time::Duration::ZERO;
+    if profile {
+        crate::model::block::reset_timings();
+    }
     for blk_idx in 0..cfg.block_count {
         let is_full = cfg.is_full_attention_block(blk_idx);
 
-        let block_ts = if debug_blocks { Some(std::time::Instant::now()) } else { None };
+        let block_ts = if debug_blocks || profile {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         if is_full {
             // 全注意力块:借用 ctx.h_buf / ctx.workspace / ctx.state.kv_caches[blk_idx]
@@ -152,7 +161,15 @@ pub fn forward_single_token(
         }
 
         if let Some(ts) = block_ts {
-            eprint!("\r[block {blk_idx:>2}] {}ms", ts.elapsed().as_millis());
+            let elapsed = ts.elapsed();
+            if is_full {
+                attn_total += elapsed;
+            } else {
+                ssm_total += elapsed;
+            }
+            if debug_blocks {
+                eprint!("\r[block {blk_idx:>2}] {}ms", elapsed.as_millis());
+            }
         }
     }
     if debug_blocks {
@@ -178,11 +195,24 @@ pub fn forward_single_token(
 
     if profile {
         let blocks_ms = block_start_ts.elapsed().as_secs_f64() * 1000.0;
+        let attn_ms = attn_total.as_secs_f64() * 1000.0;
+        let ssm_ms = ssm_total.as_secs_f64() * 1000.0;
+        let bt = crate::model::block::get_timings();
+        let bt_attn = bt.attn_fwd.as_secs_f64() * 1000.0;
+        let bt_ssm = bt.ssm_fwd.as_secs_f64() * 1000.0;
+        let bt_mlp = bt.mlp.as_secs_f64() * 1000.0;
+        let bt_pn = bt.post_norm.as_secs_f64() * 1000.0;
         eprintln!(
-            "[profile] emb={:.3}ms rope={:.3}ms blocks={:.3}ms final_norm={:.3}ms lm_head={:.3}ms total_excl_overhead={:.3}ms",
+            "[profile] emb={:.2}ms rope={:.2}ms blocks={:.2}ms [attn(16)={:.2} ssm(48)={:.2}] | block_detail: attn_fwd={:.2} ssm_fwd={:.2} mlp(64)={:.2} post_norm={:.2} | final_norm={:.2}ms lm_head={:.2}ms total={:.2}ms",
             t_emb.as_secs_f64() * 1000.0,
             t_rope.as_secs_f64() * 1000.0,
             blocks_ms,
+            attn_ms,
+            ssm_ms,
+            bt_attn,
+            bt_ssm,
+            bt_mlp,
+            bt_pn,
             t_final_norm.as_secs_f64() * 1000.0,
             t_lm_head.as_secs_f64() * 1000.0,
             t_emb.as_secs_f64() * 1000.0 + t_rope.as_secs_f64() * 1000.0 + blocks_ms

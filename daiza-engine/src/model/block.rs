@@ -16,6 +16,34 @@ use crate::model::weights::BlockWeights;
 use crate::model::workspace::Workspace;
 use crate::cache::{KvCache, SsmState};
 
+/// ★ Decode profiling: block 内部分解计时 (thread_local, 避免改函数签名)
+/// 当 DAIZA_PROFILE 启用时, forward_single_token 会在每 token 结束后读取并打印
+#[derive(Default, Clone, Copy)]
+pub struct BlockTimings {
+    pub attn_fwd: std::time::Duration,   // attention forward (16 blocks): norm+matvec+serial
+    pub ssm_fwd: std::time::Duration,    // SSM forward (48 blocks): norm+matvec+serial
+    pub mlp: std::time::Duration,         // MLP (64 blocks): pure matvec (gate+up+down)
+    pub post_norm: std::time::Duration,   // post_attention_norm (64 blocks)
+}
+
+thread_local! {
+    static TIMINGS: std::cell::RefCell<BlockTimings> = std::cell::RefCell::new(BlockTimings::default());
+}
+
+pub fn reset_timings() {
+    TIMINGS.with(|t| *t.borrow_mut() = BlockTimings::default());
+}
+
+pub fn get_timings() -> BlockTimings {
+    TIMINGS.with(|t| *t.borrow())
+}
+
+fn profile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("DAIZA_PROFILE").is_ok())
+}
+
 /// 单 token 前向通过一个 block(in-place,无堆分配)
 ///
 /// - 输入:`h` = 上一 block 的输出(主残差流)
@@ -32,9 +60,12 @@ pub fn forward_single_inplace(
     ws: &mut Workspace,
 ) {
     let hidden = cfg.hidden;
+    let prof = profile_enabled();
 
     // 1. attention / SSM block:
     //    子函数内部负责 attn_norm + forward + 残差累加(h += attn_out)
+    let t0 = if prof { Some(std::time::Instant::now()) } else { None };
+    let is_attn = matches!(block_w, BlockWeights::FullAttention(_));
     match (block_w, kv_cache, ssm_state) {
         (BlockWeights::FullAttention(w), Some(kv), None) => {
             crate::model::attention::attention_forward_into(
@@ -46,17 +77,32 @@ pub fn forward_single_inplace(
         }
         _ => {}
     }
+    if let Some(t0) = t0 {
+        let elapsed = t0.elapsed();
+        TIMINGS.with(|tt| {
+            if is_attn {
+                tt.borrow_mut().attn_fwd += elapsed;
+            } else {
+                tt.borrow_mut().ssm_fwd += elapsed;
+            }
+        });
+    }
 
     // 2. post_attention_norm: ws.block_normed = norm(h)
     //    ★ P0-3: 复用 block_normed(attention/ssm 已完成,不再需要此 buffer)
     //      原 block_mlp_in 已删除,省 20KB workspace
+    let t1 = if prof { Some(std::time::Instant::now()) } else { None };
     let post_norm_w = match block_w {
         BlockWeights::Ssm(w) => &w.post_attention_norm,
         BlockWeights::FullAttention(w) => &w.post_attention_norm,
     };
     math::rmsnorm_into(&h[..hidden], &mut ws.block_normed, &post_norm_w.data, cfg.rms_eps);
+    if let Some(t1) = t1 {
+        TIMINGS.with(|tt| { tt.borrow_mut().post_norm += t1.elapsed(); });
+    }
 
     // 3. MLP: h += W_down @ (silu(W_gate @ mlp_in) * (W_up @ mlp_in))
+    let t2 = if prof { Some(std::time::Instant::now()) } else { None };
     let (w_gate, w_up, w_down) = match block_w {
         BlockWeights::Ssm(w) => (&w.ffn_gate, &w.ffn_up, &w.ffn_down),
         BlockWeights::FullAttention(w) => (&w.ffn_gate, &w.ffn_up, &w.ffn_down),
@@ -70,4 +116,7 @@ pub fn forward_single_inplace(
         &mut ws.mlp_up,
         h,
     );
+    if let Some(t2) = t2 {
+        TIMINGS.with(|tt| { tt.borrow_mut().mlp += t2.elapsed(); });
+    }
 }
