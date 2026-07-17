@@ -25,7 +25,8 @@
 //! - 大小固定(由 Config 决定),`attn_scores` 例外(随序列长度增长)
 //! - 最终输出仍返回 owned `Vec`(每 token 1 个 alloc,可接受),内部 buffer 全部复用
 
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::model::config::Config;
 
@@ -45,42 +46,138 @@ pub fn get_thread_pool() -> Option<&'static ThreadPool> {
     GLOBAL_POOL.get()
 }
 
-/// 持久线程池: per-worker channel + N-1 个 worker 线程 + 主线程参与
+// ===========================================================================
+// P0-C: park/unpark 零分配线程池
+// ===========================================================================
+//
+// 原实现 (mpsc channel) 每次 scatter_wait 产生:
+//   - 2 个 Arc 分配 (闭包 + AtomicUsize done 计数器)
+//   - N 个 Box 分配 (per-worker job 闭包, N=13)
+//   - N 次 channel send + N 次 channel recv
+//   - N 次 Arc::clone + N 次 Arc drop
+//   每 token ~257 barriers × (2 Arc + 13 Box + 13 channel) = ~514 Arc + ~3341 Box
+//   dispatch 开销 ~0.5-1.8ms/token, 是 14 线程效率仅 40% 的主因。
+//
+// 新实现 (park/unpark + atomic generation):
+//   - 零堆分配 (所有状态预分配在 Shared 中)
+//   - worker 空闲时 park (不消耗 CPU), 主线程 unpark 唤醒
+//   - main thread 设置 func/ctx/n_dispatch 后 fetch_add(Release) generation
+//   - worker 被 unpark 唤醒后读 func/ctx, 调用 trampoline(ctx, tid)
+//   - worker 完成后 fetch_add(Release) done 计数器
+//   - main spin on done (Acquire) 等待完成
+//
+// park/unpark 语义: unpark 是 "sticky" 的 — 若在 park 之前调用,
+// 下一次 park 立即返回。因此 main 可以安全地在 worker park 之前调用 unpark。
+//
+// 类型擦除: trampoline<F> 把 *const () 转回 &F 并调用, F 在 scatter_wait 栈上
+// (调用方保证 scatter_wait 阻塞至所有 worker 完成, 故 F 生命周期安全)
+
+/// 共享状态 (Arc 包裹, worker 和 main 共享)
+struct Shared {
+    /// 任务函数指针 (trampoline<F> as usize, worker transmute 回 fn)
+    func: AtomicUsize,
+    /// 闭包上下文 (raw pointer to F on caller's stack)
+    ctx: AtomicPtr<()>,
+    /// 本轮激活的 worker 数 (worker tid < n_dispatch 时执行)
+    n_dispatch: AtomicUsize,
+    /// 代际计数器 (每次 scatter_wait 递增, Release/Acquire 同步)
+    generation: AtomicU64,
+    /// worker 完成计数 (worker fetch_add Release, main load Acquire)
+    done: AtomicUsize,
+    /// 关闭标志 (Drop 时设为 true)
+    shutdown: AtomicBool,
+}
+
+/// 类型擦除 trampoline: 把 *const () 转回 &F 并调用 F(i)
 ///
-/// ★ P1-2: per-worker channel 替代共享 Mutex<Receiver>
-/// ★ P0-D: 主线程参与计算 (不再自旋浪费 P-core)
-///   原实现 N 个 worker + 1 个自旋主线程 = N+1 线程争 N 核, 上下文切换开销
-///   新实现 N-1 个 worker + 主线程做最后一个 chunk = N 线程完美匹配 N 核
+/// # Safety
+/// ctx 必须指向有效的 F 实例, 且在调用期间保持存活
+#[allow(unsafe_code)]
+unsafe fn trampoline<F: Fn(usize)>(ctx: *const (), i: usize) {
+    (&*(ctx as *const F))(i)
+}
+
+/// Worker 主循环: 检查 generation, 有任务则执行, 无任务则 park 睡眠
+#[allow(unsafe_code)]
+fn worker_loop(shared: Arc<Shared>, tid: usize) {
+    let mut last_gen: u64 = 0;
+    loop {
+        if shared.shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        // Acquire: 看到 generation 变化后, 读到 main 的 func/ctx/n_dispatch 写入
+        let gen = shared.generation.load(Ordering::Acquire);
+        if gen != last_gen {
+            last_gen = gen;
+            let n_dispatch = shared.n_dispatch.load(Ordering::Relaxed);
+            if tid < n_dispatch {
+                // Relaxed: generation 的 Acquire 已保证可见性
+                let ctx = shared.ctx.load(Ordering::Relaxed);
+                let func_ptr = shared.func.load(Ordering::Relaxed);
+                let f: unsafe fn(*const (), usize) =
+                    unsafe { std::mem::transmute(func_ptr) };
+                unsafe { f(ctx, tid); }
+                // Release: 确保 f(tid) 的内存写对 main 的 Acquire 可见
+                shared.done.fetch_add(1, Ordering::Release);
+            }
+        } else {
+            // 无新任务, park 等待唤醒 (不消耗 CPU)
+            // park 语义: 若 main 已先 unpark, park 立即返回, 不会错过任务
+            std::thread::park();
+        }
+    }
+}
+
+/// 持久线程池: park/unpark 零分配 dispatch
+///
+/// ★ P0-C: 替代 mpsc channel, 消除每 barrier 的 Arc/Box/channel 开销
+/// ★ P0-D: 主线程参与计算 (N-1 worker + main = N 线程匹配 N 核)
 pub struct ThreadPool {
-    senders: Vec<mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>>,
+    shared: Arc<Shared>,
+    threads: Vec<std::thread::Thread>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    n_workers: usize,
 }
 
 impl ThreadPool {
     /// 创建 n_threads-1 个 worker 线程 (主线程作为第 n_threads 个 worker)
     pub fn new(n_threads: usize) -> Self {
         let n_workers = n_threads.saturating_sub(1);
-        let mut senders = Vec::with_capacity(n_workers);
-        for _ in 0..n_workers {
-            let (tx, rx) = mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
-            senders.push(tx);
-            std::thread::spawn(move || {
-                for job in rx {
-                    job();
-                }
+        let shared = Arc::new(Shared {
+            func: AtomicUsize::new(0),
+            ctx: AtomicPtr::new(std::ptr::null_mut()),
+            n_dispatch: AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
+            done: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+        });
+
+        let mut threads = Vec::with_capacity(n_workers);
+        let mut handles = Vec::with_capacity(n_workers);
+        for tid in 0..n_workers {
+            let shared = Arc::clone(&shared);
+            let handle = std::thread::spawn(move || {
+                worker_loop(shared, tid);
             });
+            threads.push(handle.thread().clone());
+            handles.push(handle);
         }
-        Self { senders }
+
+        Self { shared, threads, handles, n_workers }
     }
 
-    /// 提交 N 个任务并等待全部完成
+    /// 提交 N 个任务并等待全部完成 (零堆分配)
     ///
     /// 前 N-1 个任务分发给 worker 线程, 主线程执行第 N 个任务 (最后一个 chunk),
     /// 然后自旋等待所有 worker 完成。
     ///
-    /// # Safety (调用方保证)
+    /// # Safety
     /// 本函数阻塞直到所有任务完成, 因此调用方在调用期间持有的借用仍然有效。
     /// 闭包应通过 raw pointer 访问外部数据, 避免生命周期冲突。
-    pub fn scatter_wait(&self, n: usize, f: impl Fn(usize) + Send + Sync + 'static) {
+    pub fn scatter_wait<F>(&self, n: usize, f: F)
+    where
+        F: Fn(usize) + Send + Sync,
+    {
         if n == 0 {
             return;
         }
@@ -88,31 +185,47 @@ impl ThreadPool {
             f(0);
             return;
         }
-        let f = Arc::new(f);
-        let n_workers = self.senders.len();
-        // 前 n-1 个任务分发给 worker (最多 n_workers 个)
-        let n_dispatch = (n - 1).min(n_workers);
-        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let n_dispatch = (n - 1).min(self.n_workers);
+
+        // 重置完成计数 (上一轮 worker 已全部完成, 无竞争)
+        self.shared.done.store(0, Ordering::Relaxed);
+
+        // 设置任务 (Relaxed: generation 的 Release 会保证可见性)
+        let f_ptr = &f as *const F as *const ();
+        let tramp = trampoline::<F> as *const () as usize;
+        self.shared.ctx.store(f_ptr as *mut (), Ordering::Relaxed);
+        self.shared.func.store(tramp, Ordering::Relaxed);
+        self.shared.n_dispatch.store(n_dispatch, Ordering::Relaxed);
+
+        // 递增 generation (Release: 让 worker 看到 ctx/func/n_dispatch 写入)
+        self.shared.generation.fetch_add(1, Ordering::Release);
+
+        // 唤醒 worker (unpark 是 sticky 的, 即使 worker 尚未 park 也不会丢失)
         for i in 0..n_dispatch {
-            let f = Arc::clone(&f);
-            let done = Arc::clone(&done);
-            let job = Box::new(move || {
-                f(i);
-                // Release: 确保 f(i) 的内存写对 acquire 端可见
-                done.fetch_add(1, std::sync::atomic::Ordering::Release);
-            });
-            self.senders[i]
-                .send(job)
-                .expect("thread pool worker panicked");
+            self.threads[i].unpark();
         }
-        // 主线程执行最后一个任务 (tid = n-1, 通常是最小的尾部 chunk)
+
+        // 主线程执行最后一个 chunk (tid = n-1)
         f(n - 1);
-        // 等待所有 worker 完成
+
+        // 等待所有 worker 完成 (Acquire: 看到 done 后, 读到 worker 的内存写)
         if n_dispatch > 0 {
-            // Acquire: 看到 done 计数后, 读到 worker 的内存写
-            while done.load(std::sync::atomic::Ordering::Acquire) < n_dispatch {
+            while self.shared.done.load(Ordering::Acquire) < n_dispatch {
                 std::hint::spin_loop();
             }
+        }
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        for thread in &self.threads {
+            thread.unpark();
+        }
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
         }
     }
 }
