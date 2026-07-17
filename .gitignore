@@ -1,5 +1,4 @@
 # ===== 模型权重与资料(外部资源,不入库)=====
-Bonsai-27B-gguf/
 *.gguf
 *.bin
 bonsai-27b-whitepaper.pdf
