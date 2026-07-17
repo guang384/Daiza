@@ -110,7 +110,7 @@ hf download prism-ml/Bonsai-27B-gguf `
 Get-ChildItem .\Bonsai-27B-gguf\*.gguf | Select-Object Name, @{N='Size(GB)';E={[math]::Round($_.Length/1GB,2)}}
 
 # 使用引擎 inspect 模式验证 GGUF 完整性
-cd daiza-engine
+cd Daiza-engine
 .\target\release\daiza-cli.exe "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
 ```
 
@@ -127,7 +127,7 @@ cd daiza-engine
 ### 构建与运行
 
 ```powershell
-cd daiza-engine
+cd Daiza-engine
 
 # Release 构建(推荐,启用 LTO + 自动向量化)
 cargo build --release --bin daiza-cli

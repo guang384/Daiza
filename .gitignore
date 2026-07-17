@@ -16,9 +16,9 @@ __pycache__/
 
 # ===== 调试输出与临时文件 =====
 *.log
-daiza-engine/test_*.txt
-daiza-engine/inspect_output.txt
-daiza-engine/gguf_inspect_output.txt
+Daiza-engine/test_*.txt
+Daiza-engine/inspect_output.txt
+Daiza-engine/gguf_inspect_output.txt
 
 # ===== 编辑器与系统文件 =====
 .vscode/
