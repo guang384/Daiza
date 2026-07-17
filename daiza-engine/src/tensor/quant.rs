@@ -565,6 +565,143 @@ pub unsafe fn dot_q1_0_row_triple_avx2(
     (r0, r1, r2)
 }
 
+/// ★ P0-H: Quad-row kernel — 4 行共享 x load, load/FMA 比 1.25 (vs triple 1.33)
+///
+/// **瓶颈分析**: Triple-row 每 3 FMA 需 4 loads (3 LUT + 1 x), load port (2 ports) 限制吞吐。
+///
+/// **优化**: 4 行共享同一 x 向量, 每 4 FMA 需 5 loads (4 LUT + 1 x):
+///   - Triple: 1.33 loads/FMA → 1.50 FMA/cycle
+///   - Quad:   1.25 loads/FMA → 1.60 FMA/cycle (+6.7%)
+///
+/// **寄存器**: 8 group_acc (2/row × 4) + 4 row_acc + 4 scale = 16/16 YMM (满)
+/// 内层循环: 2 sign bytes/iter (8 iter/group), 10 loads + 8 FMAs per iter
+/// load port: 10 loads / 2 ports = 5 cycles, 8 FMAs / 2 ports = 4 cycles → load-bound 5c/8 FMA
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+#[allow(unsafe_code)]
+#[inline]
+pub unsafe fn dot_q1_0_row_quad_avx2(
+    data: &[u8],
+    row_idx0: usize,
+    row_idx1: usize,
+    row_idx2: usize,
+    row_idx3: usize,
+    n_cols: usize,
+    x: &[f32],
+) -> (f32, f32, f32, f32) {
+    use std::arch::x86_64::*;
+
+    let groups_per_row = n_cols / Q1_0_GROUP_SIZE;
+    let row_off0 = row_idx0 * (groups_per_row * Q1_0_BLOCK_BYTES);
+    let row_off1 = row_idx1 * (groups_per_row * Q1_0_BLOCK_BYTES);
+    let row_off2 = row_idx2 * (groups_per_row * Q1_0_BLOCK_BYTES);
+    let row_off3 = row_idx3 * (groups_per_row * Q1_0_BLOCK_BYTES);
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    for g in 0..groups_per_row {
+        let bs0 = row_off0 + g * Q1_0_BLOCK_BYTES;
+        let bs1 = row_off1 + g * Q1_0_BLOCK_BYTES;
+        let bs2 = row_off2 + g * Q1_0_BLOCK_BYTES;
+        let bs3 = row_off3 + g * Q1_0_BLOCK_BYTES;
+
+        let scale0 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+            u16::from_le_bytes([*data.get_unchecked(bs0), *data.get_unchecked(bs0 + 1)]) as i16,
+        )));
+        let scale1 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+            u16::from_le_bytes([*data.get_unchecked(bs1), *data.get_unchecked(bs1 + 1)]) as i16,
+        )));
+        let scale2 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+            u16::from_le_bytes([*data.get_unchecked(bs2), *data.get_unchecked(bs2 + 1)]) as i16,
+        )));
+        let scale3 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+            u16::from_le_bytes([*data.get_unchecked(bs3), *data.get_unchecked(bs3 + 1)]) as i16,
+        )));
+
+        let sp0 = data.as_ptr().add(bs0 + 2);
+        let sp1 = data.as_ptr().add(bs1 + 2);
+        let sp2 = data.as_ptr().add(bs2 + 2);
+        let sp3 = data.as_ptr().add(bs3 + 2);
+        let xp = x.as_ptr().add(g * Q1_0_GROUP_SIZE);
+
+        // 2 路/行 × 4 行 = 8 路独立 FMA 链
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut b0 = _mm256_setzero_ps();
+        let mut b1 = _mm256_setzero_ps();
+        let mut c0 = _mm256_setzero_ps();
+        let mut c1 = _mm256_setzero_ps();
+        let mut d0 = _mm256_setzero_ps();
+        let mut d1 = _mm256_setzero_ps();
+
+        for byte_idx in (0..16).step_by(2) {
+            // ★ x 只 load 一次, 4 行共享
+            let x0 = _mm256_loadu_ps(xp.add(byte_idx * 8));
+            let x1 = _mm256_loadu_ps(xp.add((byte_idx + 1) * 8));
+
+            // row 0
+            a0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[*sp0.add(byte_idx) as usize].0.as_ptr()),
+                x0, a0,
+            );
+            a1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[*sp0.add(byte_idx + 1) as usize].0.as_ptr()),
+                x1, a1,
+            );
+
+            // row 1 (复用 x0, x1)
+            b0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[*sp1.add(byte_idx) as usize].0.as_ptr()),
+                x0, b0,
+            );
+            b1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[*sp1.add(byte_idx + 1) as usize].0.as_ptr()),
+                x1, b1,
+            );
+
+            // row 2 (复用 x0, x1)
+            c0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[*sp2.add(byte_idx) as usize].0.as_ptr()),
+                x0, c0,
+            );
+            c1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[*sp2.add(byte_idx + 1) as usize].0.as_ptr()),
+                x1, c1,
+            );
+
+            // row 3 (复用 x0, x1)
+            d0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[*sp3.add(byte_idx) as usize].0.as_ptr()),
+                x0, d0,
+            );
+            d1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(SIGN_LUT[*sp3.add(byte_idx + 1) as usize].0.as_ptr()),
+                x1, d1,
+            );
+        }
+
+        // Merge 2-way → group_acc, then FMA scale → row_acc
+        let g0 = _mm256_add_ps(a0, a1);
+        let g1 = _mm256_add_ps(b0, b1);
+        let g2 = _mm256_add_ps(c0, c1);
+        let g3 = _mm256_add_ps(d0, d1);
+        acc0 = _mm256_fmadd_ps(scale0, g0, acc0);
+        acc1 = _mm256_fmadd_ps(scale1, g1, acc1);
+        acc2 = _mm256_fmadd_ps(scale2, g2, acc2);
+        acc3 = _mm256_fmadd_ps(scale3, g3, acc3);
+    }
+
+    let r0 = horizontal_sum_avx2(acc0);
+    let r1 = horizontal_sum_avx2(acc1);
+    let r2 = horizontal_sum_avx2(acc2);
+    let r3 = horizontal_sum_avx2(acc3);
+
+    (r0, r1, r2, r3)
+}
+
 /// scalar fallback(非 AVX2 平台用,逻辑与 v3 一致)
 pub fn dot_q1_0_row_scalar(data: &[u8], row_idx: usize, n_cols: usize, x: &[f32]) -> f32 {
     debug_assert!(x.len() >= n_cols);

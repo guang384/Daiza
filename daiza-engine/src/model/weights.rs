@@ -18,6 +18,7 @@ use crate::tensor::quant::{
 #[cfg(target_arch = "x86_64")]
 use crate::tensor::quant::{
     dot_q1_0_row_avx2, dot_q1_0_row_batch_avx2, dot_q1_0_row_dual_avx2, dot_q1_0_row_triple_avx2,
+    dot_q1_0_row_quad_avx2,
 };
 use crate::BonsaiError;
 
@@ -73,17 +74,23 @@ impl Q1_0Matrix {
         if n_threads <= 1 || n < 1024 {
             #[cfg(target_arch = "x86_64")]
             if use_avx2 {
-                // ★ P0-E: 三行并行, 共享 x load (load/FMA 比 1.33 vs dual 1.50)
+                // ★ P0-H: 四行并行, 共享 x load (load/FMA 比 1.25 vs triple 1.33)
                 let mut i = 0;
-                while i + 2 < n {
+                while i + 3 < n {
+                    let (y0, y1, y2, y3) = unsafe { dot_q1_0_row_quad_avx2(&self.bytes, i, i + 1, i + 2, i + 3, k, x) };
+                    y[i] = y0;
+                    y[i + 1] = y1;
+                    y[i + 2] = y2;
+                    y[i + 3] = y3;
+                    i += 4;
+                }
+                // 余数: 3 行用 triple, 2 行用 dual, 1 行用 single
+                if i + 2 < n {
                     let (y0, y1, y2) = unsafe { dot_q1_0_row_triple_avx2(&self.bytes, i, i + 1, i + 2, k, x) };
                     y[i] = y0;
                     y[i + 1] = y1;
                     y[i + 2] = y2;
-                    i += 3;
-                }
-                // 余数: 2 行用 dual, 1 行用 single
-                if i + 1 < n {
+                } else if i + 1 < n {
                     let (y0, y1) = unsafe { dot_q1_0_row_dual_avx2(&self.bytes, i, i + 1, k, x) };
                     y[i] = y0;
                     y[i + 1] = y1;
@@ -113,18 +120,26 @@ impl Q1_0Matrix {
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
                 #[cfg(target_arch = "x86_64")]
                 if use_avx2 {
-                    // ★ P0-E: 三行并行
+                    // ★ P0-H: 四行并行
                     let mut i = start;
-                    while i + 2 < end {
+                    while i + 3 < end {
+                        let (y0, y1, y2, y3) = unsafe { dot_q1_0_row_quad_avx2(bytes, i, i + 1, i + 2, i + 3, k, x) };
+                        unsafe {
+                            *((y_addr as *mut f32).add(i)) = y0;
+                            *((y_addr as *mut f32).add(i + 1)) = y1;
+                            *((y_addr as *mut f32).add(i + 2)) = y2;
+                            *((y_addr as *mut f32).add(i + 3)) = y3;
+                        }
+                        i += 4;
+                    }
+                    if i + 2 < end {
                         let (y0, y1, y2) = unsafe { dot_q1_0_row_triple_avx2(bytes, i, i + 1, i + 2, k, x) };
                         unsafe {
                             *((y_addr as *mut f32).add(i)) = y0;
                             *((y_addr as *mut f32).add(i + 1)) = y1;
                             *((y_addr as *mut f32).add(i + 2)) = y2;
                         }
-                        i += 3;
-                    }
-                    if i + 1 < end {
+                    } else if i + 1 < end {
                         let (y0, y1) = unsafe { dot_q1_0_row_dual_avx2(bytes, i, i + 1, k, x) };
                         unsafe {
                             *((y_addr as *mut f32).add(i)) = y0;
@@ -196,16 +211,22 @@ impl Q1_0Matrix {
         if n_threads <= 1 || n < 1024 {
             #[cfg(target_arch = "x86_64")]
             if use_avx2 {
-                // ★ P0-E: 三行并行
+                // ★ P0-H: 四行并行
                 let mut i = 0;
-                while i + 2 < n {
+                while i + 3 < n {
+                    let (y0, y1, y2, y3) = unsafe { dot_q1_0_row_quad_avx2(&self.bytes, i, i + 1, i + 2, i + 3, k, x) };
+                    y[i] += y0;
+                    y[i + 1] += y1;
+                    y[i + 2] += y2;
+                    y[i + 3] += y3;
+                    i += 4;
+                }
+                if i + 2 < n {
                     let (y0, y1, y2) = unsafe { dot_q1_0_row_triple_avx2(&self.bytes, i, i + 1, i + 2, k, x) };
                     y[i] += y0;
                     y[i + 1] += y1;
                     y[i + 2] += y2;
-                    i += 3;
-                }
-                if i + 1 < n {
+                } else if i + 1 < n {
                     let (y0, y1) = unsafe { dot_q1_0_row_dual_avx2(&self.bytes, i, i + 1, k, x) };
                     y[i] += y0;
                     y[i + 1] += y1;
@@ -235,18 +256,26 @@ impl Q1_0Matrix {
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
                 #[cfg(target_arch = "x86_64")]
                 if use_avx2 {
-                    // ★ P0-E: 三行并行
+                    // ★ P0-H: 四行并行
                     let mut i = start;
-                    while i + 2 < end {
+                    while i + 3 < end {
+                        let (y0, y1, y2, y3) = unsafe { dot_q1_0_row_quad_avx2(bytes, i, i + 1, i + 2, i + 3, k, x) };
+                        unsafe {
+                            *((y_addr as *mut f32).add(i)) += y0;
+                            *((y_addr as *mut f32).add(i + 1)) += y1;
+                            *((y_addr as *mut f32).add(i + 2)) += y2;
+                            *((y_addr as *mut f32).add(i + 3)) += y3;
+                        }
+                        i += 4;
+                    }
+                    if i + 2 < end {
                         let (y0, y1, y2) = unsafe { dot_q1_0_row_triple_avx2(bytes, i, i + 1, i + 2, k, x) };
                         unsafe {
                             *((y_addr as *mut f32).add(i)) += y0;
                             *((y_addr as *mut f32).add(i + 1)) += y1;
                             *((y_addr as *mut f32).add(i + 2)) += y2;
                         }
-                        i += 3;
-                    }
-                    if i + 1 < end {
+                    } else if i + 1 < end {
                         let (y0, y1) = unsafe { dot_q1_0_row_dual_avx2(bytes, i, i + 1, k, x) };
                         unsafe {
                             *((y_addr as *mut f32).add(i)) += y0;
@@ -523,18 +552,26 @@ impl Q1_0Matrix {
 
                     #[cfg(target_arch = "x86_64")]
                     if use_avx2 {
-                        // ★ P0-E: 三行并行
+                        // ★ P0-H: 四行并行
                         let mut i = local_start;
-                        while i + 2 < local_end {
+                        while i + 3 < local_end {
+                            let (y0, y1, y2, y3) = unsafe { dot_q1_0_row_quad_avx2(bytes, i, i + 1, i + 2, i + 3, k, x) };
+                            unsafe {
+                                *((e.y_addr as *mut f32).add(i)) = y0;
+                                *((e.y_addr as *mut f32).add(i + 1)) = y1;
+                                *((e.y_addr as *mut f32).add(i + 2)) = y2;
+                                *((e.y_addr as *mut f32).add(i + 3)) = y3;
+                            }
+                            i += 4;
+                        }
+                        if i + 2 < local_end {
                             let (y0, y1, y2) = unsafe { dot_q1_0_row_triple_avx2(bytes, i, i + 1, i + 2, k, x) };
                             unsafe {
                                 *((e.y_addr as *mut f32).add(i)) = y0;
                                 *((e.y_addr as *mut f32).add(i + 1)) = y1;
                                 *((e.y_addr as *mut f32).add(i + 2)) = y2;
                             }
-                            i += 3;
-                        }
-                        if i + 1 < local_end {
+                        } else if i + 1 < local_end {
                             let (y0, y1) = unsafe { dot_q1_0_row_dual_avx2(bytes, i, i + 1, k, x) };
                             unsafe {
                                 *((e.y_addr as *mut f32).add(i)) = y0;
