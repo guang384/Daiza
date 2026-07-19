@@ -30,20 +30,24 @@ Daiza/
 ├── README.md
 ├── Bonsai-27B-gguf/          # 模型权重(外部,不入库)
 │   ├── Bonsai-27B-Q1_0.gguf       # 主权重(必需)
-│   ├── Bonsai-27B-dspark-Q4_1.gguf  # DSpark 投机解码(计划支持)
+│   ├── Bonsai-27B-dspark-Q4_1.gguf  # DSpark 投机解码 drafter
 │   ├── Bonsai-27B-mmproj-Q8_0.gguf  # 视觉塔(计划支持)
 │   └── bonsai-27b-whitepaper.pdf
-└── daiza-engine/             # Rust 推理引擎
+└── Daiza-engine/             # Rust 推理引擎
     ├── Cargo.toml
     ├── .cargo/config.toml    # target-cpu=native
     └── src/
         ├── lib.rs            # 模块入口 + BonsaiError
         ├── main.rs           # CLI 入口
-        ├── engine.rs         # 顶层 Engine:加载→前向→采样→解码
-        ├── gguf/             # GGUF v3 二进制格式解析
-        ├── tensor/           # 张量类型 + Q1_0/F32/F16/BF16 反量化
-        ├── math/             # GEMV/RMSNorm/RoPE/Softmax/Conv1d/SSM/采样
-        ├── model/            # Bonsai 27B 架构(config/weights/block/attention/ssm/mlp)
+        ├── engine.rs         # 顶层 Engine:加载→前向→采样→解码 + DSpark 调度
+        ├── gguf/             # GGUF v3 二进制格式解析(parser/metadata/tensor_info)
+        ├── tensor/           # 张量类型 + Q1_0/Q4_1/Iq1M/F32/F16/BF16 反量化 + AVX2 GEMM 内核
+        ├── math/             # RMSNorm/RoPE/Softmax/SIMD 超越函数(exp/silu/sigmoid)/采样
+        ├── model/            # Bonsai 27B 架构
+        │   ├── config.rs / weights.rs / block.rs / attention.rs / ssm.rs / mlp.rs
+        │   ├── forward.rs    # 单 token 前向 + prefill batch + DSpark tap 特征
+        │   ├── workspace.rs  # 持久线程池(park/unpark 零分配)+ Workspace 复用
+        │   └── dspark/       # DSpark 推测解码(drafter/markov/speculative/weights/config)
         ├── cache/            # KV cache(16 层)+ SSM state(48 层)
         └── tokenizer/        # GPT-2 BPE + Qwen35 预分词
 ```
