@@ -249,30 +249,27 @@ mind
 | Raw | `The capital of China is` | ` Beijing` | ✅ top-1 logit 12.58 |
 | Raw | `The capital of France is` (16t) | ` the capital of France is Paris. The capital of France is Paris...` | ✅ 答案正确,但有重复倾向 |
 | Raw | `1, 2, 3, 4,` (16t) | ` 5, 6, 7, 8, 9,` | ✅ 序列补全完美 |
-| Raw | `1+1=` (greedy/sampling × 5) | `1+1=1+1=1+1=...` | ❌ Daiza 实现缺陷导致重复 collapse (非量化问题, 见下方对比) |
-| Raw | `2+3=` (16t) | `5+3=8+3=8+3=11+3` | ⚠️ 首字 `5` 正确, 随后陷入重复 |
-| Raw | `10+20=` (16t) | `30=50=70=100=100` | ⚠️ 首字 `30` 正确, 随后退化 |
+| Raw | `1+1=` (greedy 50t) | `2, 1+2=3, 1+3=4, 1+4=5, 1+5=6, 1+6=7, 1+7=8, 1+8=9` | ✅ 正确答案 + 加法序列补全 |
+| Raw | `2+3=` (16t) | `5` | ✅ 正确 |
+| Raw | `10+20=` (16t) | `30` | ✅ 正确 |
+| Raw | `12+7=` / `5*6=` / `100-23=` (30t) | `19` / `30` / `77` | ✅ 全部正确 |
 | Raw | `What is 2 plus 2?` (16t) | (空白) | ❌ 模型为 chat 模式训练, raw 模式缺思考标记无法回答 |
 | Chat | `你好` (32 tok) | `Here's a thinking process: 1. **Analyze the user's input:** User says: "你好" (Hello)` | ✅ 正确进入思考 |
-| Chat (T=0.7) | `1+1=` (200t) | `Here's a thinking process: 1. **Analyze the user's input:** * The user's input is just "1+1=1=1=1=1=1=1=...` | ❌ Daiza thinking 步骤 1 重复 collapse |
-| Chat (T=0.7) | `1+1等于几` / `2+3等于多少` / `计算 10+20` (300t) | 同上,均在 thinking 步骤 1 重复 collapse | ❌ Daiza 官方推荐参数无法改善 |
+| Chat (greedy) | `1+1等于几` / `池塘鱼` | 正确进入 thinking 步骤, 完成 arithmetic/interpretation 分析 | ✅ thinking 推理正常 |
 
-### ⚠️ 与官方 llama.cpp (PrismML-Eng 分支) 对比 — 已确认是 Daiza 实现 bug
+### ✅ 与官方 llama.cpp (PrismML-Eng 分支) 对比 — Daiza 实现 bug 已定位并修复
 
-相同 prompt `1+1=`, 相同 200 tokens, 相同 T=0.7/top_k=20/top_p=0.95 (官方推荐参数), 相同 Q1_0 模型:
+相同 prompt `1+1=`, 相同 Q1_0 模型, 官方推荐参数 T=0.7/top_k=20/top_p=0.95:
 
 | 实现 | 输出 | 结果 |
 |------|------|------|
-| **官方 llama.cpp** (prism 分支, build b1-79697f2) | `[Start thinking] Here's a thinking process: 1. Analyze User Input: The user wrote "1+1=" 2. Identify Core Task: basic arithmetic... 3. Determine Expected Answer: 1+1=2 4. Formulate Response: "2" 5. Output Generation: "2" 6. Self-Correction: "2" is perfect.✅ [End thinking] 2` | ✅ 完整 6 步 thinking + 正确答案 `2` |
-| **Daiza** | `Here's a thinking process: 1. **Analyze the user's input: * The user's input is just "1+1=1=1=1=1=1=1=1=1=...` | ❌ thinking 步骤 1 重复 collapse |
+| **官方 llama.cpp** (prism 分支, build b1-79697f2) | `[Start thinking] Here's a thinking process: 1. Analyze User Input... 6. Self-Correction: "2" is perfect.✅ [End thinking] 2` | ✅ 完整 6 步 thinking + 正确答案 `2` |
+| **Daiza** (修复前) | `Here's a thinking process: 1. **Analyze the user's input:** * The user's input is just "1+1=1=1=1=1=1=1=...` | ❌ thinking 步骤 1 重复 collapse |
+| **Daiza** (修复后) | `2, 1+2=3, 1+3=4, ...` (raw greedy) / thinking 推理正常 (chat) | ✅ 正确 |
 
-**结论**: 数学推理退化是 **Daiza 实现的 bug**, 不是 1-bit 量化本身的问题。官方实现用相同模型/参数能正确完成 thinking 流程并给出答案。
+**根因**: SSM (Gated DeltaNet) 块的 GQA v_head→k_head 映射错误。Bonsai-27B GGUF 由 llama.cpp prism 分支转换工具生成, V heads 经 `conversion/qwen.py` 的 `_LinearAttentionVReorderBase` 重排为 **tiled 布局** (k_head i 对应 v_head `[i, i+num_k_heads, i+2*num_k_heads]`)。原实现误用 **div 映射** (`kh = vh / 3`, grouped 布局), 与 GGUF 实际布局不匹配, 导致 SSM scan 中 q/k 与错误的 v_head 配对, 累积后输出 collapse。
 
-**疑似 bug 位置** (待定位):
-- thinking 特殊 token (`<mind>` / `</mind>` 字节序列 `3c 6d 69 6e 64 3e`) 处理
-- chat template 构造 (官方自动加 `[Start thinking]` 标记, Daiza 未加)
-- log_snr conditioning 实现
-- 特殊 token embedding 加载
+**修复**: 改为 **mod 映射** (`kh = vh % num_k_heads`), 与 llama.cpp `ggml_repeat` 一致。修改 3 处: `ssm.rs` (decode path) + `forward.rs` (batch path 串行 + 并行)。commit `234c956`。
 
 ## 📊 性能参考(纯 CPU,单 token decode)
 
