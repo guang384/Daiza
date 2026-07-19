@@ -247,8 +247,18 @@ mind
 | 模式 | 输入 | 输出 | 备注 |
 |------|------|------|------|
 | Raw | `The capital of China is` | ` Beijing` | ✅ top-1 logit 12.58 |
-| Raw | `1+1=` | `1+1=1+1=` | ⚠️ 1-bit 量化退化数学推理 |
+| Raw | `The capital of France is` (16t) | ` the capital of France is Paris. The capital of France is Paris...` | ✅ 答案正确,但有重复倾向 |
+| Raw | `1, 2, 3, 4,` (16t) | ` 5, 6, 7, 8, 9,` | ✅ 序列补全完美 |
+| Raw | `1+1=` (greedy/sampling × 5) | `1+1=1+1=1+1=...` | ❌ 1-bit 量化退化为重复 collapse, top-1 logit 太强采样无法逃逸 |
+| Raw | `2+3=` (16t) | `5+3=8+3=8+3=11+3` | ⚠️ 首字 `5` 正确, 随后陷入重复 |
+| Raw | `10+20=` (16t) | `30=50=70=100=100` | ⚠️ 首字 `30` 正确, 随后退化 |
+| Raw | `What is 2 plus 2?` (16t) | (空白) | ❌ 模型为 chat 模式训练, raw 模式缺思考标记无法回答 |
 | Chat | `你好` (32 tok) | `Here's a thinking process: 1. **Analyze the user's input:** User says: "你好" (Hello)` | ✅ 正确进入思考 |
+
+**模式总结**:
+- 知识检索 / 序列补全类 prompt 工作良好 (北京 / Paris / 1,2,3,4 → 5,6,7,8,9)
+- 数学计算退化严重: 第一个数字常正确 (2+3→5, 10+20→30), 但无法稳定多步计算, 陷入重复
+- 自然语言问句在 raw 模式下不工作 (模型为 chat + thinking 模式训练, 需要 `<|im_start|>` 模板)
 
 ## 📊 性能参考(纯 CPU,单 token decode)
 
