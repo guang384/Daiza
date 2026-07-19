@@ -254,11 +254,14 @@ mind
 | Raw | `10+20=` (16t) | `30=50=70=100=100` | ⚠️ 首字 `30` 正确, 随后退化 |
 | Raw | `What is 2 plus 2?` (16t) | (空白) | ❌ 模型为 chat 模式训练, raw 模式缺思考标记无法回答 |
 | Chat | `你好` (32 tok) | `Here's a thinking process: 1. **Analyze the user's input:** User says: "你好" (Hello)` | ✅ 正确进入思考 |
+| Chat | `1+1等于几` (300t) | `Here's a thinking process: 1. **Analyze the user's input:** - The user wrote: "1+1等于几" - The user is asking "1+1等于几" - The user is asking "1+1等于几" ...` | ❌ 进入 thinking 后立刻陷入重复 collapse, 无法到达 `</mind>` 给出答案 |
+| Chat | `2+3等于多少` / `计算 10+20` / `What is 2 plus 2?` (300t) | 同上,均在 thinking 步骤 1 重复 collapse | ❌ Chat 模式无法改善数学推理 |
 
 **模式总结**:
 - 知识检索 / 序列补全类 prompt 工作良好 (北京 / Paris / 1,2,3,4 → 5,6,7,8,9)
-- 数学计算退化严重: 第一个数字常正确 (2+3→5, 10+20→30), 但无法稳定多步计算, 陷入重复
+- 数学计算退化严重: raw 模式下首字常正确 (2+3→5, 10+20→30) 但无法稳定多步计算; chat 模式下进入 thinking 后立刻陷入重复 collapse, 无法到达答案
 - 自然语言问句在 raw 模式下不工作 (模型为 chat + thinking 模式训练, 需要 `<|im_start|>` 模板)
+- 1-bit 量化对需要精确符号操作的数学推理破坏严重 (即使简单如 1+1), 但对知识记忆 / 模式匹配影响较小
 
 ## 📊 性能参考(纯 CPU,单 token decode)
 
