@@ -463,7 +463,6 @@ pub fn forward_batch(
             let state_size = ssm_state_size;
             let num_v_heads = ssm_num_v_heads;
             let num_k_heads = ssm_num_k_heads;
-            let v_heads_per_group = num_v_heads / num_k_heads;
             let conv_k = cfg.ssm_conv_kernel;
             let qkv_dim = num_k_heads * state_size;
             let inner = num_v_heads * state_size;
@@ -551,9 +550,10 @@ pub fn forward_batch(
                 let n_threads = crate::model::workspace::thread_count().min(num_v_heads);
 
                 if n_threads <= 1 || pool.is_none() {
-                    // 串行 fallback (单线程或无线程池)
+                    // 串行 fallback(单线程或无线程池)
                     for vh in 0..num_v_heads {
-                        let kh = vh / v_heads_per_group;
+                        // ★ GQA 映射: kh = vh % num_k_heads (tiled 布局, 与 llama.cpp ggml_repeat 一致)
+                        let kh = vh % num_k_heads;
                         let q_head = &ctx.workspace.ssm_q[kh * state_size..(kh + 1) * state_size];
                         let k_head = &ctx.workspace.ssm_k[kh * state_size..(kh + 1) * state_size];
                         let v_head = &ctx.workspace.ssm_v[vh * state_size..(vh + 1) * state_size];
@@ -591,7 +591,6 @@ pub fn forward_batch(
                     let norm_w_addr = ssm_norm_w.as_ptr() as usize;
                     let gate_addr = gate_t.as_ptr() as usize;
                     let ss = state_size;
-                    let vpg = v_heads_per_group;
                     let nkh = num_k_heads;
                     let nvh = num_v_heads;
                     let eps = l2norm_eps;
@@ -611,7 +610,8 @@ pub fn forward_batch(
                         let gate_s = unsafe { std::slice::from_raw_parts(gate_addr as *const f32, nvh * ss) };
 
                         for vh in start_vh..end_vh {
-                            let kh = vh / vpg;
+                            // ★ GQA 映射: kh = vh % num_k_heads (tiled 布局, 与 llama.cpp ggml_repeat 一致)
+                            let kh = vh % nkh;
                             let q_head = &ssm_q[kh * ss..(kh + 1) * ss];
                             let k_head = &ssm_k[kh * ss..(kh + 1) * ss];
                             let v_head = &ssm_v[vh * ss..(vh + 1) * ss];

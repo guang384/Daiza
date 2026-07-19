@@ -257,7 +257,6 @@ pub fn ssm_forward_into(
     let num_v_heads = cfg.ssm_time_step_rank;     // 48  (GGUF 命名误导, 实际 num_v_heads)
     let conv_k = cfg.ssm_conv_kernel;             // 4
     let head_dim = state_size;                    // 128
-    let v_heads_per_group = num_v_heads / num_k_heads; // 3
     let qkv_dim = num_k_heads * head_dim;         // 2048 (q/k 维度)
     let qkv_full_len = 2 * qkv_dim + inner;       // 10240
 
@@ -359,7 +358,10 @@ pub fn ssm_forward_into(
     let state_buf = &mut state.state;
 
     for vh in 0..num_v_heads {
-        let kh = vh / v_heads_per_group;
+        // ★ GQA 映射: llama.cpp 用 ggml_repeat (mod/tiled 布局), 非 repeat_interleave (div/grouped)
+        //   conversion/qwen.py _LinearAttentionVReorderBase 将 V heads 重排为 tiled 布局
+        //   k_head i 对应 v_head [i, i+num_k_heads, i+2*num_k_heads]
+        let kh = vh % num_k_heads;
         let q_head = &ws.ssm_q[kh * head_dim..(kh + 1) * head_dim];
         let k_head = &ws.ssm_k[kh * head_dim..(kh + 1) * head_dim];
         let v_head = &ws.ssm_v[vh * head_dim..(vh + 1) * head_dim];
