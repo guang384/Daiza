@@ -1,18 +1,18 @@
-# Daiza: A Pure-CPU, Zero-Dependency Rust Inference Engine for 1-bit Bonsai 27B
+# Daiza: A Pure-CPU Rust Inference Engine for 1-bit Bonsai 27B
 
 > **Daiza**(台座) cradles **Bonsai**(盆栽) — a from-scratch Rust engine running the [1-bit Bonsai 27B](https://huggingface.co/prism-ml/Bonsai-27B-gguf) model.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![Dependencies](https://img.shields.io/badge/dependencies-0-green.svg)](#)
+[![Dependencies](https://img.shields.io/badge/dependencies-1-green.svg)](#)
 
-一个学习项目:从零实现 GGUF 解析、Q1_0 反量化、混合注意力(SSM + Full Attention)、GPT-2 BPE 分词,最终在纯 CPU 上完成 Bonsai 27B 的完整推理。
+一个学习项目:从零实现 GGUF 解析、Q1_0 反量化、混合注意力(SSM + Full Attention)、GPT-2 BPE 分词,最终在纯 CPU 上完成 Bonsai 27B 的完整推理。仅依赖 `memmap2` 用于权重文件按需 page-in,其余全部从零实现。
 
 ---
 
 ## ✨ 特性
 
-- **零依赖**:所有功能(GGUF 解析、FP16/BF16、BPE、GEMV、SSM、RoPE)从零实现
+- **最小依赖**:仅依赖 `memmap2`(用于 GGUF 权重按需 page-in),其余全部(GGUF 解析、FP16/BF16、BPE、GEMV、SSM、RoPE、AVX2 内核)从零实现
 - **纯 CPU**:AVX2 + FMA 手写向量化内核(`target-cpu=native`)
 - **Q1_0 反量化**:1.125 bits/weight 二值化格式,每 128 权重共享一个 FP16 scale
 - **混合注意力架构**:64 层 = 48 SSM 块 + 16 全注意力块(节拍 `(i+1) % 4 == 0`)

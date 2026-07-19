@@ -2,7 +2,7 @@
 name = "daiza-engine"
 version = "0.1.0"
 edition = "2021"
-description = "Pure-CPU, zero-dependency inference engine for 1-bit Bonsai 27B"
+description = "Pure-CPU Rust inference engine for 1-bit Bonsai 27B (minimal-dep, only memmap2)"
 license = "Apache-2.0"
 
 [lib]

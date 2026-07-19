@@ -1,0 +1,7 @@
+Daiza: 修正"零依赖"措辞为"最小依赖 (仅 memmap2)"
+
+memmap2 用于 GGUF 权重按需 page-in, 不再适合称"零依赖"。
+- README 标题去掉 Zero-Dependency
+- dependencies badge 0 → 1
+- 特性列表首条改为"最小依赖"并说明 memmap2 用途
+- Cargo.toml description 同步更新
