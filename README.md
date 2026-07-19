@@ -249,19 +249,30 @@ mind
 | Raw | `The capital of China is` | ` Beijing` | ✅ top-1 logit 12.58 |
 | Raw | `The capital of France is` (16t) | ` the capital of France is Paris. The capital of France is Paris...` | ✅ 答案正确,但有重复倾向 |
 | Raw | `1, 2, 3, 4,` (16t) | ` 5, 6, 7, 8, 9,` | ✅ 序列补全完美 |
-| Raw | `1+1=` (greedy/sampling × 5) | `1+1=1+1=1+1=...` | ❌ 1-bit 量化退化为重复 collapse, top-1 logit 太强采样无法逃逸 |
+| Raw | `1+1=` (greedy/sampling × 5) | `1+1=1+1=1+1=...` | ❌ Daiza 实现缺陷导致重复 collapse (非量化问题, 见下方对比) |
 | Raw | `2+3=` (16t) | `5+3=8+3=8+3=11+3` | ⚠️ 首字 `5` 正确, 随后陷入重复 |
 | Raw | `10+20=` (16t) | `30=50=70=100=100` | ⚠️ 首字 `30` 正确, 随后退化 |
 | Raw | `What is 2 plus 2?` (16t) | (空白) | ❌ 模型为 chat 模式训练, raw 模式缺思考标记无法回答 |
 | Chat | `你好` (32 tok) | `Here's a thinking process: 1. **Analyze the user's input:** User says: "你好" (Hello)` | ✅ 正确进入思考 |
-| Chat (T=0.7) | `1+1等于几` (300t) | `Here's a thinking process: 1. **Analyze the user's input:** - The user wrote: "1+1=几" - The user is asking for the meaning of "1+1=几" - The user is asking for the meaning of "1+1=几" ...` | ❌ T=0.7/top_k=20/top_p=0.95 (官方推荐参数) 仍退化, thinking 步骤 1 重复 collapse |
-| Chat (T=0.7) | `2+3等于多少` / `计算 10+20` / `What is 2 plus 2?` (300t) | 同上,均在 thinking 步骤 1 重复 collapse | ❌ 官方推荐参数无法改善数学推理 |
+| Chat (T=0.7) | `1+1=` (200t) | `Here's a thinking process: 1. **Analyze the user's input:** * The user's input is just "1+1=1=1=1=1=1=1=...` | ❌ Daiza thinking 步骤 1 重复 collapse |
+| Chat (T=0.7) | `1+1等于几` / `2+3等于多少` / `计算 10+20` (300t) | 同上,均在 thinking 步骤 1 重复 collapse | ❌ Daiza 官方推荐参数无法改善 |
 
-**模式总结**:
-- 知识检索 / 序列补全类 prompt 工作良好 (北京 / Paris / 1,2,3,4 → 5,6,7,8,9)
-- 数学计算退化严重: raw 模式下首字常正确 (2+3→5, 10+20→30) 但无法稳定多步计算; chat 模式下进入 thinking 后立刻陷入重复 collapse, 无法到达答案
-- 自然语言问句在 raw 模式下不工作 (模型为 chat + thinking 模式训练, 需要 `<|im_start|>` 模板)
-- 1-bit 量化对需要精确符号操作的数学推理破坏严重 (即使简单如 1+1), 但对知识记忆 / 模式匹配影响较小
+### ⚠️ 与官方 llama.cpp (PrismML-Eng 分支) 对比 — 已确认是 Daiza 实现 bug
+
+相同 prompt `1+1=`, 相同 200 tokens, 相同 T=0.7/top_k=20/top_p=0.95 (官方推荐参数), 相同 Q1_0 模型:
+
+| 实现 | 输出 | 结果 |
+|------|------|------|
+| **官方 llama.cpp** (prism 分支, build b1-79697f2) | `[Start thinking] Here's a thinking process: 1. Analyze User Input: The user wrote "1+1=" 2. Identify Core Task: basic arithmetic... 3. Determine Expected Answer: 1+1=2 4. Formulate Response: "2" 5. Output Generation: "2" 6. Self-Correction: "2" is perfect.✅ [End thinking] 2` | ✅ 完整 6 步 thinking + 正确答案 `2` |
+| **Daiza** | `Here's a thinking process: 1. **Analyze the user's input: * The user's input is just "1+1=1=1=1=1=1=1=1=1=...` | ❌ thinking 步骤 1 重复 collapse |
+
+**结论**: 数学推理退化是 **Daiza 实现的 bug**, 不是 1-bit 量化本身的问题。官方实现用相同模型/参数能正确完成 thinking 流程并给出答案。
+
+**疑似 bug 位置** (待定位):
+- thinking 特殊 token (`<mind>` / `</mind>` 字节序列 `3c 6d 69 6e 64 3e`) 处理
+- chat template 构造 (官方自动加 `[Start thinking]` 标记, Daiza 未加)
+- log_snr conditioning 实现
+- 特殊 token embedding 加载
 
 ## 📊 性能参考(纯 CPU,单 token decode)
 
