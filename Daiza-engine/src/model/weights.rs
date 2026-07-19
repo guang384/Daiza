@@ -17,8 +17,8 @@ use crate::tensor::quant::{
 };
 #[cfg(target_arch = "x86_64")]
 use crate::tensor::quant::{
-    dot_q1_0_row_avx2, dot_q1_0_row_batch_avx2, dot_q1_0_row_dual_avx2, dot_q1_0_row_triple_avx2,
-    dot_q1_0_row_quad_avx2,
+    dot_q1_0_row_avx2, dot_q1_0_row_batch4_avx2, dot_q1_0_row_batch_avx2,
+    dot_q1_0_row_dual_avx2, dot_q1_0_row_triple_avx2, dot_q1_0_row_quad_avx2,
 };
 use crate::BonsaiError;
 
@@ -351,6 +351,21 @@ impl Q1_0Matrix {
         let use_avx2 = avx2_q1_0_available();
         // ★ P2-5: 阈值从 4096 降到 1024, 让 attn_k/v (1024 rows) 也走线程池
         if n_threads <= 1 || n < 1024 {
+            // ★ batch4 专用 kernel: 4 x 单次 pass, 权重只读 1 次 (vs batch_avx2 的 2×)
+            #[cfg(target_arch = "x86_64")]
+            if use_avx2 && n_batch == 4 {
+                let mut tmp = [0.0f32; 4];
+                for i in 0..n {
+                    unsafe {
+                        dot_q1_0_row_batch4_avx2(&self.bytes, i, n_cols, x, &mut tmp);
+                    }
+                    y[i] = tmp[0];
+                    y[n + i] = tmp[1];
+                    y[2 * n + i] = tmp[2];
+                    y[3 * n + i] = tmp[3];
+                }
+                return;
+            }
             // ★ P1-4: 用 batched kernel 复用 scale/LUT, tmp buffer 避免堆分配
             let mut tmp = [0.0f32; 64];
             debug_assert!(n_batch <= 64);
@@ -387,6 +402,23 @@ impl Q1_0Matrix {
                 let end = (start + chunk).min(n);
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, n_batch * n_cols) };
+                // ★ batch4 专用 kernel (线程池路径)
+                #[cfg(target_arch = "x86_64")]
+                if use_avx2 && n_batch == 4 {
+                    let mut tmp = [0.0f32; 4];
+                    for i in start..end {
+                        unsafe {
+                            dot_q1_0_row_batch4_avx2(bytes, i, n_cols, x, &mut tmp);
+                        }
+                        unsafe {
+                            *((y_addr as *mut f32).add(i)) = tmp[0];
+                            *((y_addr as *mut f32).add(n + i)) = tmp[1];
+                            *((y_addr as *mut f32).add(2 * n + i)) = tmp[2];
+                            *((y_addr as *mut f32).add(3 * n + i)) = tmp[3];
+                        }
+                    }
+                    return;
+                }
                 let mut tmp = [0.0f32; 64];
                 debug_assert!(n_batch <= 64);
                 #[cfg(target_arch = "x86_64")]
@@ -421,6 +453,23 @@ impl Q1_0Matrix {
                 let start = tid * chunk;
                 let end = (start + chunk).min(n);
                 let h = s.spawn(move || {
+                    // ★ batch4 专用 kernel (scope 路径)
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 && n_batch == 4 {
+                        let mut tmp = [0.0f32; 4];
+                        for i in start..end {
+                            unsafe {
+                                dot_q1_0_row_batch4_avx2(bytes, i, n_cols, x, &mut tmp);
+                            }
+                            unsafe {
+                                *((y_addr as *mut f32).add(i)) = tmp[0];
+                                *((y_addr as *mut f32).add(n + i)) = tmp[1];
+                                *((y_addr as *mut f32).add(2 * n + i)) = tmp[2];
+                                *((y_addr as *mut f32).add(3 * n + i)) = tmp[3];
+                            }
+                        }
+                        return;
+                    }
                     let mut tmp = [0.0f32; 64];
                     debug_assert!(n_batch <= 64);
                     #[cfg(target_arch = "x86_64")]
@@ -620,6 +669,21 @@ impl Q1_0Matrix {
         let use_avx2 = avx2_q1_0_available();
         // ★ P2-5: 阈值从 4096 降到 1024, 让 attn_k/v (1024 rows) 也走线程池
         if n_threads <= 1 || n < 1024 {
+            // ★ batch4 专用 kernel: 4 x 单次 pass, 权重只读 1 次
+            #[cfg(target_arch = "x86_64")]
+            if use_avx2 && n_batch == 4 {
+                let mut tmp = [0.0f32; 4];
+                for i in 0..n {
+                    unsafe {
+                        dot_q1_0_row_batch4_avx2(&self.bytes, i, n_cols, x, &mut tmp);
+                    }
+                    y[i] += tmp[0];
+                    y[n + i] += tmp[1];
+                    y[2 * n + i] += tmp[2];
+                    y[3 * n + i] += tmp[3];
+                }
+                return;
+            }
             // ★ P1-4: batched kernel
             let mut tmp = [0.0f32; 64];
             debug_assert!(n_batch <= 64);
@@ -656,6 +720,23 @@ impl Q1_0Matrix {
                 let end = (start + chunk).min(n);
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, n_batch * n_cols) };
+                // ★ batch4 专用 kernel (线程池路径)
+                #[cfg(target_arch = "x86_64")]
+                if use_avx2 && n_batch == 4 {
+                    let mut tmp = [0.0f32; 4];
+                    for i in start..end {
+                        unsafe {
+                            dot_q1_0_row_batch4_avx2(bytes, i, n_cols, x, &mut tmp);
+                        }
+                        unsafe {
+                            *((y_addr as *mut f32).add(i)) += tmp[0];
+                            *((y_addr as *mut f32).add(n + i)) += tmp[1];
+                            *((y_addr as *mut f32).add(2 * n + i)) += tmp[2];
+                            *((y_addr as *mut f32).add(3 * n + i)) += tmp[3];
+                        }
+                    }
+                    return;
+                }
                 let mut tmp = [0.0f32; 64];
                 debug_assert!(n_batch <= 64);
                 #[cfg(target_arch = "x86_64")]
@@ -690,6 +771,23 @@ impl Q1_0Matrix {
                 let start = tid * chunk;
                 let end = (start + chunk).min(n);
                 let h = s.spawn(move || {
+                    // ★ batch4 专用 kernel (scope 路径)
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 && n_batch == 4 {
+                        let mut tmp = [0.0f32; 4];
+                        for i in start..end {
+                            unsafe {
+                                dot_q1_0_row_batch4_avx2(bytes, i, n_cols, x, &mut tmp);
+                            }
+                            unsafe {
+                                *((y_addr as *mut f32).add(i)) += tmp[0];
+                                *((y_addr as *mut f32).add(n + i)) += tmp[1];
+                                *((y_addr as *mut f32).add(2 * n + i)) += tmp[2];
+                                *((y_addr as *mut f32).add(3 * n + i)) += tmp[3];
+                            }
+                        }
+                        return;
+                    }
                     let mut tmp = [0.0f32; 64];
                     debug_assert!(n_batch <= 64);
                     #[cfg(target_arch = "x86_64")]

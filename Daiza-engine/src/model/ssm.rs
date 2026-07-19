@@ -385,13 +385,11 @@ pub fn ssm_forward_into(
     math::silu_inplace_simd(&mut ws.ssm_z[..num_v_heads * head_dim]);
     for vh in 0..num_v_heads {
         let y_off = vh * head_dim;
-        // RMSNorm per v_head: variance = mean(x²)
         let mut ss = 0.0f32;
         for i in 0..head_dim {
             ss += ws.ssm_y[y_off + i] * ws.ssm_y[y_off + i];
         }
         let inv_rms = 1.0 / (ss / head_dim as f32 + SSM_EPS).sqrt();
-        // y = rmsnorm(y) * weight * silu(z)  (z 已批量 silu,这里直接乘)
         for i in 0..head_dim {
             ws.ssm_y[y_off + i] = ws.ssm_y[y_off + i] * inv_rms * ssm_norm_w[i] * ws.ssm_z[y_off + i];
         }

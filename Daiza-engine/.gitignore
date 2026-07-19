@@ -10,6 +10,15 @@
 
 # Benchmark baseline binaries (临时二进制, 不进 git)
 sota-baseline/daiza-cli-baseline.exe
+target/release_baseline*/
+target/release_*/
+
+# 临时调试脚本与 token dump (实验残留, 不入 git)
+bench_*.ps1
+*_tokens.txt
+*_dump.txt
+debug_*.txt
+src/bin/
 
 # IDE / editor
 .vscode/

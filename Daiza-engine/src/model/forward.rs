@@ -71,6 +71,16 @@ pub struct ForwardContext<'a> {
     pub logits_buf: Vec<f32>,    // [vocab_size] LM head 输出,跨 token 复用避免 vec!
     pub cos_buf: Vec<f32>,       // [rope_dim] RoPE cos,跨 token 复用
     pub sin_buf: Vec<f32>,       // [rope_dim] RoPE sin,跨 token 复用
+    /// DSpark hidden state tap: 当非空时, forward 会在指定 block 层捕获 h_buf
+    /// 布局: [n_tap_layers * hidden] flat (拼接 cfg.target_layers 指定层, 默认 [1,16,31,46,61] 的 hidden)
+    /// 每次前向后, 由 engine 读出供 drafter 下一次 draft 用
+    pub hidden_tap_buf: Vec<f32>,
+    /// 捕获 tap 的 block 索引 (空 = 不捕获, DSpark 关闭)
+    pub hidden_tap_layers: Vec<usize>,
+    /// DSpark batch tap: forward_batch 中为每个 token 捕获 hidden_tap
+    /// 布局: [n_batch * n_tap_layers * hidden] flat (行优先: token-major)
+    /// 由 engine 在 prefill 后读出, 累积到 target_tap_history
+    pub hidden_tap_batch_buf: Vec<f32>,
 }
 
 /// 剖析开关:DAIZA_PROFILE env var,OnceLock 缓存避免热路径 env::var 开销
@@ -125,6 +135,15 @@ pub fn forward_single_token(
     if profile {
         crate::model::block::reset_timings();
     }
+    // DSpark hidden tap: 当前 token 在指定 block 层捕获 h_buf 快照
+    let tap_enabled = !ctx.hidden_tap_layers.is_empty();
+    if tap_enabled {
+        let tap_bytes = ctx.hidden_tap_layers.len() * hidden;
+        if ctx.hidden_tap_buf.len() != tap_bytes {
+            ctx.hidden_tap_buf = vec![0.0; tap_bytes];
+        }
+    }
+    let mut tap_idx = 0usize;
     for blk_idx in 0..cfg.block_count {
         let is_full = cfg.is_full_attention_block(blk_idx);
 
@@ -158,6 +177,14 @@ pub fn forward_single_token(
                 (&cos, &sin),
                 &mut ctx.workspace,
             );
+        }
+
+        // DSpark tap: 在指定 block 层捕获 h_buf (block forward 完成后)
+        if tap_enabled && tap_idx < ctx.hidden_tap_layers.len()
+            && blk_idx == ctx.hidden_tap_layers[tap_idx] {
+            let off = tap_idx * hidden;
+            ctx.hidden_tap_buf[off..off + hidden].copy_from_slice(&ctx.h_buf[..hidden]);
+            tap_idx += 1;
         }
 
         if let Some(ts) = block_ts {
@@ -231,13 +258,16 @@ pub fn forward_single_token(
 /// `h_batch`: [n_batch, hidden] 行优先, 原地更新
 /// `token_ids`: [n_batch] 输入 token IDs
 /// `start_pos`: batch 起始位置
+/// `per_pos_logits`: 若 Some, 计算所有 n_batch 个位置的 logits (batched LM head, W 只读一次),
+///   写入 `[n_batch * vocab_size]` (行优先); 否则只算最后一个 token (省 (n_batch-1) × 179MB)。
 ///
-/// 最后一个 token 的 logits 写入 `ctx.logits_buf`(无 clone, 直接读)
+/// 最后一个 token 的 logits 始终写入 `ctx.logits_buf`(无 clone, 直接读)
 #[allow(unsafe_code)]
 pub fn forward_batch(
     ctx: &mut ForwardContext<'_>,
     token_ids: &[u32],
     start_pos: usize,
+    per_pos_logits: Option<&mut [f32]>,
 ) -> crate::Result<()> {
     let cfg = ctx.cfg;
     let hidden = cfg.hidden;
@@ -650,6 +680,23 @@ pub fn forward_batch(
         w_down.matvec_add_batch_into_slice(&qkv_buf[..n_batch * ffn_dim], n_batch, &mut ctx.h_buf);
         if let Some(ts) = ts { p_batch_matvec += ts.elapsed(); }
 
+        // DSpark batch tap: 在 tap layer 完成后捕获所有 token 的 h_buf (post-FFN residual)
+        // 布局: [n_batch, n_tap_layers, hidden] (token-major, 每 token 拼接 n_tap_layers 个 hidden)
+        if !ctx.hidden_tap_layers.is_empty() {
+            if let Some(tap_idx) = ctx.hidden_tap_layers.iter().position(|&l| l == blk_idx) {
+                let n_tap = ctx.hidden_tap_layers.len();
+                let need = n_batch * n_tap * hidden;
+                if ctx.hidden_tap_batch_buf.len() != need {
+                    ctx.hidden_tap_batch_buf = vec![0.0; need];
+                }
+                for t in 0..n_batch {
+                    let src = &ctx.h_buf[t * hidden..(t + 1) * hidden];
+                    let dst_off = (t * n_tap + tap_idx) * hidden;
+                    ctx.hidden_tap_batch_buf[dst_off..dst_off + hidden].copy_from_slice(src);
+                }
+            }
+        }
+
         if let Some(ts) = block_ts {
             eprint!("\r[block {blk_idx:>2}] {}ms", ts.elapsed().as_millis());
         }
@@ -659,15 +706,36 @@ pub fn forward_batch(
         eprintln!("\r[batch forward] {} blocks in {}ms", cfg.block_count, block_start_ts.elapsed().as_millis());
     }
 
-    // 5. Final norm + LM head — 只算最后一个 token (省 (n_batch-1) × 179MB 权重读取)
-    //    logits 写入 ctx.logits_buf,decode 阶段直接读
+    // 5. Final norm + LM head
+    //    per_pos_logits=Some: 对所有 n_batch 位置做 batched LM head (W 只读一次, 用于 DSpark verify)
+    //    per_pos_logits=None: 只算最后一个 token (省 (n_batch-1) × 179MB 权重读取)
     let t0 = if profile { Some(std::time::Instant::now()) } else { None };
-    let last_h = &mut ctx.h_buf[(n_batch - 1) * hidden..n_batch * hidden];
-    math::rmsnorm_inplace(last_h, &ctx.weights.global.output_norm.data, cfg.rms_eps);
-    if ctx.logits_buf.len() != cfg.vocab_size {
-        ctx.logits_buf = vec![0.0; cfg.vocab_size];
+    if let Some(logits_out) = per_pos_logits {
+        debug_assert_eq!(logits_out.len(), n_batch * cfg.vocab_size);
+        // 对所有位置做 output_norm (in-place on h_buf)
+        let output_norm = &ctx.weights.global.output_norm.data;
+        for t in 0..n_batch {
+            let h = &mut ctx.h_buf[t * hidden..(t + 1) * hidden];
+            math::rmsnorm_inplace(h, output_norm, cfg.rms_eps);
+        }
+        // Batched LM head: output @ h_buf → logits_out (W 只读一次)
+        if ctx.logits_buf.len() != cfg.vocab_size {
+            ctx.logits_buf = vec![0.0; cfg.vocab_size];
+        }
+        ctx.weights.global.output.matvec_batch_into_slice(
+            &ctx.h_buf[..n_batch * hidden], n_batch, logits_out,
+        );
+        // 拷贝最后一个位置的 logits 到 ctx.logits_buf (供后续 decode 直接读)
+        let last_off = (n_batch - 1) * cfg.vocab_size;
+        ctx.logits_buf.copy_from_slice(&logits_out[last_off..last_off + cfg.vocab_size]);
+    } else {
+        let last_h = &mut ctx.h_buf[(n_batch - 1) * hidden..n_batch * hidden];
+        math::rmsnorm_inplace(last_h, &ctx.weights.global.output_norm.data, cfg.rms_eps);
+        if ctx.logits_buf.len() != cfg.vocab_size {
+            ctx.logits_buf = vec![0.0; cfg.vocab_size];
+        }
+        ctx.weights.global.output.matvec_into_slice(last_h, &mut ctx.logits_buf);
     }
-    ctx.weights.global.output.matvec_into_slice(last_h, &mut ctx.logits_buf);
     if let Some(t) = t0 { p_final = t.elapsed(); }
 
     // 6. Restore h_buf to single-token size for decode phase
@@ -726,5 +794,8 @@ pub fn make_context<'a>(
         logits_buf: Vec::with_capacity(cfg.vocab_size),
         cos_buf: vec![0.0; cfg.rope_dim],
         sin_buf: vec![0.0; cfg.rope_dim],
+        hidden_tap_buf: Vec::new(),
+        hidden_tap_layers: Vec::new(),
+        hidden_tap_batch_buf: Vec::new(),
     }
 }

@@ -31,6 +31,7 @@ pub mod mlp;
 pub mod block;
 pub mod forward;
 pub mod workspace;
+pub mod dspark;
 
 pub use config::Config;
 pub use forward::{ForwardContext, ModelState};

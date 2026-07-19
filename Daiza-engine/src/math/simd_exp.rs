@@ -264,7 +264,7 @@ pub fn swiglu_inplace_simd(gate: &mut [f32], up: &[f32]) {
 // ---------------------------------------------------------------------------
 
 /// AVX2 8-wide 点积: sum(a[i] * b[i])
-/// head_dim=256 是 8 的倍数,无需尾处理。
+/// head_dim=128 是 8 的倍数,无需尾处理。
 #[allow(unsafe_code)]
 #[inline]
 pub fn dot_product_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
@@ -304,7 +304,7 @@ pub fn dot_product_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
 }
 
 /// AVX2 8-wide saxpy: y[i] += scale * x[i]
-/// head_dim=256 是 8 的倍数,无需尾处理。
+/// head_dim=128 是 8 的倍数,无需尾处理。
 #[allow(unsafe_code)]
 #[inline]
 pub fn saxpy_avx2(scale: f32, x: &[f32], y: &mut [f32], len: usize) {
@@ -319,5 +319,39 @@ pub fn saxpy_avx2(scale: f32, x: &[f32], y: &mut [f32], len: usize) {
             _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
             i += 8;
         }
+    }
+}
+
+/// AVX2 8-wide add: dst[i] = a[i] + b[i]
+///
+/// ★ 单 pass 替代 `copy_from_slice + saxpy_avx2(1.0, ...)` 两 pass。
+///   markov Step 3: step_logit = base + bias (vocab=248320, 4 位置/cycle)
+///   原 2 pass: copy (1MB read+write) + saxpy (1MB read bias + 1MB RW step) = 4MB traffic
+///   新 1 pass: 1MB read a + 1MB read b + 1MB write dst = 3MB traffic, 节省 25%
+pub fn add_avx2(a: &[f32], b: &[f32], dst: &mut [f32], len: usize) {
+    debug_assert!(len >= 8);
+    debug_assert_eq!(a.len(), len);
+    debug_assert_eq!(b.len(), len);
+    debug_assert_eq!(dst.len(), len);
+    #[cfg(target_arch = "x86_64")]
+    if simd_available() {
+        #[allow(unsafe_code)]
+        unsafe {
+            let mut i = 0;
+            let n8 = (len / 8) * 8;
+            while i < n8 {
+                let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_add_ps(va, vb));
+                i += 8;
+            }
+            for j in i..len {
+                dst[j] = a[j] + b[j];
+            }
+            return;
+        }
+    }
+    for i in 0..len {
+        dst[i] = a[i] + b[i];
     }
 }

@@ -16,6 +16,10 @@ use std::path::Path;
 use crate::gguf::parser::GgufFile;
 use crate::math::{sample_top_k_top_p_into, SamplingBuffers, SamplingParams};
 use crate::model::config::Config;
+use crate::model::dspark::{
+    weights::DrafterWeights,
+    speculative::SpeculativeContext,
+};
 use crate::model::forward::{forward_batch, forward_single_token, make_context};
 use crate::model::weights::LoadedWeights;
 use crate::tokenizer::vocab::Vocab;
@@ -41,11 +45,23 @@ impl LcgRng {
     }
 }
 
+/// DSpark 性能分析 helper
+#[inline]
+fn pct(part: u128, total: u128) -> f64 {
+    if total == 0 { 0.0 } else { part as f64 * 100.0 / total as f64 }
+}
+#[inline]
+fn ms_per(total_ms: u128, n: usize) -> u128 {
+    if n == 0 { 0 } else { total_ms / n as u128 }
+}
+
 pub struct Engine {
     pub gguf: GgufFile,
     pub config: Config,
     pub tokenizer: BpeTokenizer,
     pub weights: Option<LoadedWeights>,
+    /// DSpark drafter (可选, 由 load_drafter 加载)
+    pub spec_ctx: Option<SpeculativeContext>,
 }
 
 impl Engine {
@@ -60,7 +76,20 @@ impl Engine {
             config,
             tokenizer,
             weights: None,
+            spec_ctx: None,
         })
+    }
+
+    /// 加载 DSpark drafter (独立 GGUF 文件)
+    pub fn load_drafter(&mut self, path: &Path) -> Result<()> {
+        eprintln!("[dspark] Loading drafter GGUF: {}", path.display());
+        let drafter_gguf = GgufFile::open(path)?;
+        let weights = DrafterWeights::load(&drafter_gguf)?;
+        let cfg = weights.cfg.clone();
+        eprintln!("[dspark] Drafter config: {} blocks, hidden={}, block_size={}, markov_rank={}",
+            cfg.block_count, cfg.embedding_length, cfg.block_size, cfg.markov_rank);
+        self.spec_ctx = Some(SpeculativeContext::new(weights));
+        Ok(())
     }
 
     /// 一次性加载所有 block 权重到内存(约 13GB)
@@ -157,7 +186,7 @@ impl Engine {
         if n_input == 1 {
             forward_single_token(&mut ctx, input_ids[0])?;
         } else if n_input > 1 {
-            forward_batch(&mut ctx, &input_ids, 0)?;
+            forward_batch(&mut ctx, &input_ids, 0, None)?;
         }
         let prefill_ms = prefill_start.elapsed().as_millis();
         eprintln!("\r[prefill] {n_input}/{n_input} done");
@@ -258,6 +287,327 @@ impl Engine {
         }
 
         // 5. decode token ids 为字符串
+        Ok(self.tokenizer.decode(&generated_ids))
+    }
+
+    /// DSpark 推测解码生成循环
+    ///
+    /// 流程: prefill → 循环 { draft k 个 → batched verify (forward_batch 一次) →
+    ///   逐 token Leviathan check → KV truncate + bonus forward }
+    ///
+    /// **Batched verify**: 一次 forward_batch(k) 读完 13GB 权重 (batch4 AVX2 kernel),
+    /// 逐 token 用 per_pos_logits 做 Leviathan rejection sampling。reject 时 KV cache
+    /// truncate 到 pos_before + n_accepted (attention 层正确), SSM state 保持
+    /// pos_before + k (no rollback, Gated DeltaNet gate 衰减 rejected tokens)。
+    pub fn generate_with_dspark(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        params: SamplingParams,
+        system_prompt: Option<&str>,
+        confidence_threshold: f32,
+    ) -> Result<String> {
+        if self.spec_ctx.is_none() {
+            return Err(crate::BonsaiError::Unsupported(
+                "DSpark not loaded; call load_drafter() first".into(),
+            ));
+        }
+
+        // 1. 构造输入
+        let chat_text = build_chat_input(prompt, system_prompt);
+        eprintln!("[debug] input text: {chat_text:?}");
+        let input_ids = self.tokenizer.encode(&chat_text);
+        eprintln!("[debug] input_ids count: {}", input_ids.len());
+        if input_ids.is_empty() {
+            return Err(crate::BonsaiError::Tokenizer("encode returned empty".into()));
+        }
+
+        // 2. 加载 target 权重 + 初始化线程池
+        if self.weights.is_none() {
+            eprintln!("[engine] loading target weights...");
+            self.load_weights()?;
+            let n_threads = crate::model::workspace::thread_count();
+            crate::model::workspace::init_thread_pool(n_threads);
+            eprintln!("[engine] thread pool ({n_threads} workers) initialized");
+        }
+
+        // 3. 构造前向上下文 + 启用 hidden tap
+        let cfg = &self.config;
+        let weights = self.weights.as_ref().unwrap();
+        let mut ctx = make_context(weights, cfg);
+        // 启用 hidden tap: 从 spec_ctx 读 target_layers
+        {
+            let spec = self.spec_ctx.as_ref().unwrap();
+            ctx.hidden_tap_layers = spec.cfg().target_layers.clone();
+            eprintln!("[dspark] target tap layers: {:?}", ctx.hidden_tap_layers);
+        }
+
+        // 4. prefill
+        let n_input = input_ids.len();
+        let prefill_start = std::time::Instant::now();
+        if n_input == 1 {
+            forward_single_token(&mut ctx, input_ids[0])?;
+        } else if n_input > 1 {
+            forward_batch(&mut ctx, &input_ids, 0, None)?;
+        }
+        let prefill_ms = prefill_start.elapsed().as_millis();
+        eprintln!("\r[prefill] {n_input}/{n_input} done in {prefill_ms}ms");
+
+        // 5. DSpark decode 循环
+        let mut rng = LcgRng::new(0xC0FFEE);
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
+        let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
+
+        // 累积 target tap history: 每个已 forward token 一行 [n_embd_cap]
+        // draft 时传整个 history 作为 drafter context (对齐 llama.cpp ctx_feat 累积语义)
+        let n_tap_layers = ctx.hidden_tap_layers.len();
+        let hidden = cfg.hidden;
+        let n_embd_cap = n_tap_layers * hidden;
+        let mut target_tap_history: Vec<f32> = Vec::new();
+
+        // prefill 阶段: forward_batch 已捕获 hidden_tap_batch_buf [n_batch, n_tap, hidden]
+        // 累积到 history (行优先 token-major, 与 set_target_tap 期望一致)
+        if n_input > 1 {
+            target_tap_history.extend_from_slice(&ctx.hidden_tap_batch_buf);
+        } else if n_input == 1 {
+            // forward_single_token 已写入 hidden_tap_buf (1 行)
+            target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
+        }
+
+        // prefill 后第一个 token: 从 target logits 采样 (anchor)
+        let anchor_raw = sample_top_k_top_p_into(
+            &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
+        );
+        let mut anchor_token = anchor_raw as u32;
+        if anchor_token == self.config.eos_token_id {
+            return Ok(String::new());
+        }
+        generated_ids.push(anchor_token);
+        // forward anchor 以获取其 hidden tap + 更新 cache
+        forward_single_token(&mut ctx, anchor_token)?;
+        // 累积 anchor 的 hidden tap
+        target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
+
+        let decode_start = std::time::Instant::now();
+        let stream_output = !matches!(std::env::var("DAIZA_STREAM").as_deref(),
+            Ok("0") | Ok("false") | Ok("no"));
+
+        let block_size = self.spec_ctx.as_ref().unwrap().cfg().block_size;
+        let mut total_draft_calls = 0usize;
+        let mut total_accepted = 0usize;
+        let mut total_bonus = 0usize;
+        let mut total_draft_truncated = 0usize;  // confidence head 截断的 token 数
+        // ★ 性能分析: 各阶段累计耗时 (DAIZA_PROFILE 控制)
+        let profile_dspark = std::env::var("DAIZA_PROFILE").is_ok();
+        let mut t_draft = 0u128;       // Phase 1: drafter forward
+        let mut t_verify = 0u128;      // Phase 2: sequential verify forwards
+        let mut t_bonus = 0u128;       // Phase 3: bonus forward
+        let mut n_target_forwards = 0usize;  // 总 target forward 次数
+
+        // bonus 采样复用 buffer (p, q, residual, 各 vocab_size = ~1MB, 跨 cycle 复用)
+        let mut bonus_buf = BonusBuffers::new();
+
+        while generated_ids.len() < max_tokens {
+            // --- Phase 1: Draft ---
+            let draft_start = std::time::Instant::now();
+            let draft_tokens: Vec<u32>;
+            {
+                let spec = self.spec_ctx.as_mut().unwrap();
+                // 位置语义 (对齐 llama.cpp dspark speculative.cpp):
+                //   context 行 = target hidden tap [L, ..., start-1] (不含 anchor)
+                //   draft[0] = anchor token at position `start` (= ctx_len)
+                //   draft[k] = mask token at position start + k
+                // 因此:
+                //   ctx_len   = history_rows - 1 (排除最后 1 行 anchor 的 hidden tap)
+                //   start_pos = ctx_len          (anchor 的绝对位置 = ctx_len)
+                // 注: ctx.state.pos = anchor_pos + 1 (anchor forward 后已递增),
+                //     不能直接用 ctx.state.pos 作为 start_pos (会偏大 1)。
+                let history_rows = target_tap_history.len() / n_embd_cap;
+                let ctx_len = history_rows - 1;
+                let start_pos = ctx_len;
+                spec.set_target_tap(
+                    &target_tap_history[..ctx_len * n_embd_cap],
+                    ctx_len,
+                );
+                let dt = spec.draft(anchor_token, start_pos).to_vec();
+                draft_tokens = dt;
+            }
+            t_draft += draft_start.elapsed().as_millis();
+            total_draft_calls += 1;
+
+            // ★ Confidence head: 根据 confidence_logits 与 threshold 截断 draft tokens
+            // 只 verify 前 n_draft_to_verify 个, 后面的 draft token 直接跳过 (省 target forward)
+            // n_draft_to_verify == 0 → 跳过 Phase 2, 直接 bonus (与 all-reject 等价)
+            // n_draft_to_verify == block_size → 不截断, 原行为
+            let n_draft_to_verify = self.spec_ctx.as_ref().unwrap()
+                .confident_prefix_length(confidence_threshold);
+            total_draft_truncated += block_size - n_draft_to_verify;
+
+            // --- Phase 2: Sequential Verify with early stop ---
+            // 逐 token forward + Leviathan check, reject 时立即停止。
+            //
+            // target_logits 语义: ctx.logits_buf 始终持有 "预测下一个 token" 的 target 分布。
+            //   - 进入 Phase 2 前, ctx.logits_buf = 上一 cycle bonus forward 的输出 = 预测 draft[0]
+            //   - 接受 draft[i] 后 forward_single_token(draft[i]) → ctx.logits_buf = 预测 draft[i+1]
+            //   - reject draft[i] 时, ctx.logits_buf = 预测 draft[i] (直接用于 bonus 采样)
+            //
+            // SSM state 处理 (no rollback):
+            // - 只 forward 接受的 draft token, SSM state 推进到 pos_before + n_accepted (正确)
+            // - 不需要 KV truncate (只 forward 了接受的 token, KV cache 自然正确)
+            // - 不需要 SSM undo (未 forward 的 draft token 不影响 state)
+            let verify_start = std::time::Instant::now();
+            let pos_before = ctx.state.pos;
+
+            let mut n_accepted = 0usize;
+            let mut bonus_token: Option<usize> = None;
+            for (i, &dt) in draft_tokens[..n_draft_to_verify].iter().enumerate() {
+                // ctx.logits_buf = 预测 draft[i] 的 target 分布 (前一个 forward 的输出)
+                let target_logits_i = &ctx.logits_buf[..cfg.vocab_size];
+                let draft_logits_i = &self.spec_ctx.as_ref().unwrap().draft_logits
+                    [i * cfg.vocab_size..(i + 1) * cfg.vocab_size];
+
+                // debug: 打印 target top-1 vs draft token
+                if std::env::var("DAIZA_DSPARK_DEBUG").is_ok() {
+                    let mut target_top = (0u32, f32::NEG_INFINITY);
+                    for (tid, &l) in target_logits_i.iter().enumerate() {
+                        if l > target_top.1 { target_top = (tid as u32, l); }
+                    }
+                    let dt_tok = self.tokenizer.vocab.tokens.get(dt as usize).cloned().unwrap_or_default();
+                    let tt_tok = self.tokenizer.vocab.tokens.get(target_top.0 as usize).cloned().unwrap_or_default();
+                    eprintln!("[dspark-debug] pos={} draft[{i}]={dt}({dt_tok:?}) target_argmax={tt}({tt_tok:?})",
+                        pos_before + i, tt = target_top.0);
+                }
+
+                let accepted = leviathan_check(
+                    target_logits_i, draft_logits_i, dt, &mut || rng.next_f32(),
+                );
+
+                if !accepted {
+                    // Reject: 用 ctx.logits_buf 采样 bonus (预测 draft[i] 的分布)
+                    bonus_token = Some(sample_bonus(
+                        target_logits_i, draft_logits_i, params,
+                        &mut || rng.next_f32(), &mut sampling_buf, &mut bonus_buf,
+                    ));
+                    break;
+                }
+
+                // Accept: forward draft[i] (更新 KV/SSM, 产生 draft[i+1] 的 logits)
+                n_accepted += 1;
+                generated_ids.push(dt);
+                if dt == self.config.eos_token_id {
+                    eprintln!("[dspark] EOS accepted at draft pos {i}");
+                    return Ok(self.tokenizer.decode(&generated_ids));
+                }
+                forward_single_token(&mut ctx, dt)?;
+                n_target_forwards += 1;
+                target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
+
+                if stream_output {
+                    if let Some(s) = self.tokenizer.vocab.tokens.get(dt as usize) {
+                        eprint!("\r[dspark] accepted draft[{i}] -> {s}    ");
+                    }
+                }
+            }
+            t_verify += verify_start.elapsed().as_millis();
+            // 注: sequential verify 只 forward 接受的 token,
+            // ctx.state.pos = pos_before + n_accepted (forward_single_token 自然推进)
+            // KV cache 也只含接受的 token, 无需 truncate
+
+            // --- Phase 3: Bonus forward ---
+            // reject: bonus = sample_bonus(target_logits_i, draft_logits_i) (已采样)
+            // all-accept: bonus = sample from ctx.logits_buf (最后接受 token 的 forward 输出)
+            let bonus_start = std::time::Instant::now();
+            let bt_raw = if let Some(bt) = bonus_token {
+                bt
+            } else {
+                // All-accept: 从 ctx.logits_buf 采样 (最后一个 forward 的输出, 预测 pos_before+k)
+                sample_top_k_top_p_into(
+                    &ctx.logits_buf, params,
+                    &mut || rng.next_f32(), &mut sampling_buf,
+                )
+            };
+            let bt = bt_raw as u32;
+            if bt == self.config.eos_token_id {
+                eprintln!("[dspark] EOS from bonus");
+                return Ok(self.tokenizer.decode(&generated_ids));
+            }
+            generated_ids.push(bt);
+            anchor_token = bt;
+            forward_single_token(&mut ctx, bt)?;
+            n_target_forwards += 1;
+            target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
+            total_bonus += 1;
+            if stream_output {
+                if let Some(s) = self.tokenizer.vocab.tokens.get(bt as usize) {
+                    eprint!("\r[dspark] bonus -> {s}    ");
+                }
+            }
+            t_bonus += bonus_start.elapsed().as_millis();
+
+            total_accepted += n_accepted;
+
+            if generated_ids.len() >= max_tokens {
+                break;
+            }
+        }
+        if stream_output {
+            eprintln!();
+        }
+        let decode_ms = decode_start.elapsed().as_millis();
+        let n_gen = generated_ids.len();
+        eprintln!("[bench] dspark decode({n_gen}t)={decode_ms}ms (~{}ms/tok ~{:.2} tok/s)",
+            if n_gen > 0 { decode_ms / n_gen as u128 } else { 0 },
+            if decode_ms > 0 { n_gen as f64 * 1000.0 / decode_ms as f64 } else { 0.0 });
+        eprintln!("[dspark] draft_calls={total_draft_calls} accepted={total_accepted} \
+            (avg {:.2}/{block_size}) bonus={total_bonus} truncated={total_draft_truncated} \
+            (conf_threshold={confidence_threshold})",
+            if total_draft_calls > 0 { total_accepted as f64 / total_draft_calls as f64 }
+            else { 0.0 });
+
+        // ★ 性能分析: 各阶段耗时分解 (DAIZA_PROFILE)
+        if profile_dspark {
+            let total_phase = t_draft + t_verify + t_bonus;
+            let n_verify_forwards = n_target_forwards - total_bonus;
+            eprintln!("───────── [dspark-profile] phase breakdown ─────────");
+            eprintln!("  draft    (drafter fwd): {:>6}ms  ({:>5.1}%)  — {} calls, ~{}ms/call",
+                t_draft, pct(t_draft, total_phase),
+                total_draft_calls, ms_per(t_draft, total_draft_calls));
+            eprintln!("  verify   (sequential):  {:>6}ms  ({:>5.1}%)  — {} forwards (avg {:.2}/cycle)",
+                t_verify, pct(t_verify, total_phase),
+                n_verify_forwards,
+                if total_draft_calls > 0 { n_verify_forwards as f64 / total_draft_calls as f64 }
+                else { 0.0 });
+            eprintln!("  bonus    (bonus fwd):   {:>6}ms  ({:>5.1}%)  — {} forwards",
+                t_bonus, pct(t_bonus, total_phase), total_bonus);
+            eprintln!("  ────────────────────────────────────────────────");
+            eprintln!("  total phase:            {:>6}ms", total_phase);
+            eprintln!("  total decode wall:      {:>6}ms  (diff = overhead/sched)", decode_ms);
+            eprintln!("  target forwards:        {} total = {} verify + {} bonus",
+                n_target_forwards, n_verify_forwards, total_bonus);
+            eprintln!("  per-token cost:  ~{}ms target + ~{}ms draft overhead",
+                ms_per(t_verify + t_bonus, n_target_forwards),
+                ms_per(t_draft, n_gen));
+        }
+
+        if let Ok(path) = std::env::var("DAIZA_DUMP_TOKENS") {
+            let mut content = String::new();
+            content.push_str("prompt:");
+            for (i, &id) in input_ids.iter().enumerate() {
+                if i > 0 { content.push(','); }
+                content.push_str(&id.to_string());
+            }
+            content.push('\n');
+            content.push_str("generated:");
+            for (i, &id) in generated_ids.iter().enumerate() {
+                if i > 0 { content.push(','); }
+                content.push_str(&id.to_string());
+            }
+            content.push('\n');
+            std::fs::write(&path, content)
+                .map_err(|e| crate::BonsaiError::Io(format!("dump_tokens: {e}")))?;
+            eprintln!("[dump_tokens] wrote {n_gen} ids to {path}");
+        }
+
         Ok(self.tokenizer.decode(&generated_ids))
     }
 
@@ -378,4 +728,117 @@ fn build_chat_input(user_prompt: &str, system_prompt: Option<&str>) -> String {
     // 输出 `<think>\n` 作为思考模式开始标记(从 GGUF 原始字节确认:3c 74 68 69 6e 6b 3e)
     s.push_str("<think>\n");
     s
+}
+
+/// Leviathan rejection sampling: 单 token 接受/拒绝判定
+///
+/// - `target_logits`: target 模型在该位置的 logits [vocab]
+/// - `draft_logits`: drafter (markov resample 后) 的 logits [vocab]
+/// - `draft_token`: drafter 采样的 token ID
+/// - `rng`: 均匀随机数 [0, 1)
+///
+/// 返回 true = 接受 draft_token, false = 拒绝
+///
+/// ★ 优化: 只计算 p[dt] 和 q[dt], 避免全量 softmax 分配 [vocab] 两次 (~2MB/call)
+fn leviathan_check(
+    target_logits: &[f32],
+    draft_logits: &[f32],
+    draft_token: u32,
+    rng: &mut dyn FnMut() -> f32,
+) -> bool {
+    debug_assert_eq!(draft_logits.len(), target_logits.len());
+    let dt = draft_token as usize;
+
+    // p[dt] = exp(t[dt] - max_t) / sum_t  (只算 dt 位置, 避免全量 softmax)
+    let (p_dt, _) = softmax_single(target_logits, dt);
+    let (q_dt, _) = softmax_single(draft_logits, dt);
+
+    let r = if q_dt > 1e-12 { p_dt / q_dt } else { 0.0 };
+    let u = rng();
+    u < r
+}
+
+/// 从 residual 分布 norm(max(0, p - q)) 采样 bonus token
+/// p = target prob, q = draft prob (已归一化)
+///
+/// ★ 优化: 复用预分配 buffer (p, q, residual), 避免每 cycle ~4MB 分配
+fn sample_bonus(
+    target_logits: &[f32],
+    draft_logits: &[f32],
+    params: SamplingParams,
+    rng: &mut impl FnMut() -> f32,
+    sampling_buf: &mut SamplingBuffers,
+    bonus_buf: &mut BonusBuffers,
+) -> usize {
+    let vocab = target_logits.len();
+    if bonus_buf.p.len() != vocab {
+        bonus_buf.p = vec![0.0; vocab];
+        bonus_buf.q = vec![0.0; vocab];
+        bonus_buf.residual = vec![0.0; vocab];
+    }
+    let p = &mut bonus_buf.p;
+    let q = &mut bonus_buf.q;
+    softmax_inplace(target_logits, p);
+    softmax_inplace(draft_logits, q);
+
+    // residual = max(0, p - q), 归一化为概率分布, 转为 logits 供 top_k/top_p 采样
+    let residual = &mut bonus_buf.residual;
+    let mut sum = 0.0f32;
+    for i in 0..vocab {
+        let r = (p[i] - q[i]).max(0.0);
+        residual[i] = r;
+        sum += r;
+    }
+    if sum <= 1e-12 {
+        // 退化为 target 分布采样
+        return sample_top_k_top_p_into(target_logits, params, rng, sampling_buf);
+    }
+    // 转为 logits (log of residual prob) 供 top_k_top_p 采样
+    let inv = 1.0 / sum;
+    for i in 0..vocab {
+        residual[i] = (residual[i] * inv).ln();
+    }
+    sample_top_k_top_p_into(residual, params, rng, sampling_buf)
+}
+
+/// 数值稳定的 softmax: logits → prob (写入 out)
+fn softmax_inplace(logits: &[f32], out: &mut [f32]) {
+    let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut sum = 0.0f32;
+    for (i, &l) in logits.iter().enumerate() {
+        let e = (l - max).exp();
+        out[i] = e;
+        sum += e;
+    }
+    let inv = 1.0 / sum;
+    for v in out.iter_mut() {
+        *v *= inv;
+    }
+}
+
+/// 只计算 softmax 在 `idx` 位置的概率值, 避免全量分配
+/// 返回 (prob[idx], sum)
+fn softmax_single(logits: &[f32], idx: usize) -> (f32, f32) {
+    let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut sum = 0.0f32;
+    let mut idx_exp = 0.0f32;
+    for (i, &l) in logits.iter().enumerate() {
+        let e = (l - max).exp();
+        sum += e;
+        if i == idx { idx_exp = e; }
+    }
+    (idx_exp / sum, sum)
+}
+
+/// DSpark bonus 采样复用 buffer (跨 cycle 复用, 避免每 cycle ~4MB 分配)
+struct BonusBuffers {
+    p: Vec<f32>,
+    q: Vec<f32>,
+    residual: Vec<f32>,
+}
+
+impl BonusBuffers {
+    fn new() -> Self {
+        Self { p: Vec::new(), q: Vec::new(), residual: Vec::new() }
+    }
 }

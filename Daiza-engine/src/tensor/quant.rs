@@ -16,19 +16,16 @@
 //! - `bit = 0  →  weight = -scale`
 //! - `bit = 1  →  weight = +scale`
 //!
-//! ## Q1_0 GEMM 的位运算加速思路(留给后续优化)
+//! ## Q1_0 GEMM 当前方案: SIGN_LUT 查表 + AVX2 FMA
 //!
 //! 计算 `y = W x`,其中 W 是 Q1_0 矩阵。直接展开成 F32 会失去 Q1_0 的核心带宽优势。
-//! 利用 ±1 权重的性质:
+//! 当前采用 SIGN_LUT 查表方案: 16 字节符号位 → 2 次 `_mm256_shuffle_epi8` 查表
+//! 得到 8 个 ±1.0 f32,再 FMA 累加 x。详见 `SIGN_LUT` 注释与 `dot_q1_0_row_avx2`。
 //!
-//! ```text
-//! y_i = sum_k s_g * b_ik * x_k
-//!     = s_g * (2 * popcount(b_ik bits where x_k is weighted) - sum_k x_k)
-//! ```
-//!
-//! 学习项目的 v0 先做正确性(反量化到 F32 再 GEMM),v1 再做位运算融合。
+//! 历史上曾尝试 BLENDV/sign-mask 方案,但 port 5 压力 + 4c 依赖链导致退化,已放弃。
+//! AVX-512 上的 popcount 位运算方案在本项目目标 CPU (Meteor Lake, 无 AVX-512) 不可用。
 
-use crate::tensor::dtype::{Q1_0_BLOCK_BYTES, Q1_0_GROUP_SIZE};
+use crate::tensor::dtype::{Q1_0_BLOCK_BYTES, Q1_0_GROUP_SIZE, Q4_1_BLOCK_BYTES, Q4_1_GROUP_SIZE};
 
 /// IEEE 754 半精度 (binary16) → f32 转换
 ///
@@ -895,6 +892,116 @@ pub unsafe fn dot_q1_0_row_batch_avx2(
     }
 }
 
+/// AVX2 batch4 kernel — 4 个 x 单次 pass, 权重只读 1 次
+///
+/// **设计动机**: 原 `dot_q1_0_row_batch_avx2` 对 n_batch=4 分 2 pair 处理,
+/// 每 pair 重读权重; 在 14 线程下 L2 thrashing 导致 pair 2 也走 DRAM,
+/// 实测 forward_batch(k=4) ≈ 4× single forward (无权重复用)。
+///
+/// **新设计**: 4 个 x 在单次 weight pass 内全部处理完。
+/// - 寄存器: 4 row_acc + 8 group_acc (2/x × 4 x) + 2 LUT + 1 scale = 15 YMM
+/// - step_by(2) 拆 16 字节为 8 次迭代, 每次 2 LUT + 8 FMA
+/// - 权重 bytes 每行只读 1 次 (DRAM 带宽 = single forward)
+///
+/// 相比 batch_avx2 (n_batch=4):
+/// - 权重 DRAM 读取: 1× vs 2-4× (主要收益)
+/// - LUT loads: 16 vs 32 (pair-based 重复)
+/// - FMA 数: 64 vs 64 (相同)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+#[allow(unsafe_code)]
+#[inline]
+pub unsafe fn dot_q1_0_row_batch4_avx2(
+    data: &[u8],
+    row_idx: usize,
+    n_cols: usize,
+    x: &[f32],  // [4 * n_cols], 行优先
+    y: &mut [f32],  // [4]
+) {
+    use std::arch::x86_64::*;
+    debug_assert!(x.len() >= 4 * n_cols);
+    debug_assert!(y.len() >= 4);
+
+    let groups_per_row = n_cols / Q1_0_GROUP_SIZE;
+    let row_byte_offset = row_idx * (groups_per_row * Q1_0_BLOCK_BYTES);
+
+    // 4 个 row 级累加器 (每 x 一个, 跨 group 累加, 行末一次 hsum)
+    let mut row_acc0 = _mm256_setzero_ps();
+    let mut row_acc1 = _mm256_setzero_ps();
+    let mut row_acc2 = _mm256_setzero_ps();
+    let mut row_acc3 = _mm256_setzero_ps();
+
+    for g in 0..groups_per_row {
+        let block_start = row_byte_offset + g * Q1_0_BLOCK_BYTES;
+        let scale_bits = u16::from_le_bytes([
+            *data.get_unchecked(block_start),
+            *data.get_unchecked(block_start + 1),
+        ]);
+        // scale F16C + broadcast 每 group 只做一次, 4 x 共享
+        let scale_xmm = _mm_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
+        let scale_v = _mm256_broadcastss_ps(scale_xmm);
+        let sign_ptr = data.as_ptr().add(block_start + 2);
+
+        // 4 个 x base (不同 x, 同一 group)
+        let x_base0 = x.as_ptr().add(0 * n_cols + g * Q1_0_GROUP_SIZE);
+        let x_base1 = x.as_ptr().add(1 * n_cols + g * Q1_0_GROUP_SIZE);
+        let x_base2 = x.as_ptr().add(2 * n_cols + g * Q1_0_GROUP_SIZE);
+        let x_base3 = x.as_ptr().add(3 * n_cols + g * Q1_0_GROUP_SIZE);
+
+        // 8 个 group 级累加器 (2/x × 4 x), step_by(2) 下两路独立 FMA 链
+        let mut g0a = _mm256_setzero_ps();
+        let mut g1a = _mm256_setzero_ps();
+        let mut g0b = _mm256_setzero_ps();
+        let mut g1b = _mm256_setzero_ps();
+        let mut g0c = _mm256_setzero_ps();
+        let mut g1c = _mm256_setzero_ps();
+        let mut g0d = _mm256_setzero_ps();
+        let mut g1d = _mm256_setzero_ps();
+
+        for byte_idx in (0..16).step_by(2) {
+            // 2 LUT loads (4 x 共享, 相比 batch_avx2 省 50% LUT)
+            let lut0 = _mm256_loadu_ps(SIGN_LUT[*sign_ptr.add(byte_idx) as usize].0.as_ptr());
+            let lut1 = _mm256_loadu_ps(SIGN_LUT[*sign_ptr.add(byte_idx + 1) as usize].0.as_ptr());
+
+            // x0, x1 for this byte_idx (4 x's)
+            let x0a = _mm256_loadu_ps(x_base0.add(byte_idx * 8));
+            let x1a = _mm256_loadu_ps(x_base0.add((byte_idx + 1) * 8));
+            let x0b = _mm256_loadu_ps(x_base1.add(byte_idx * 8));
+            let x1b = _mm256_loadu_ps(x_base1.add((byte_idx + 1) * 8));
+            let x0c = _mm256_loadu_ps(x_base2.add(byte_idx * 8));
+            let x1c = _mm256_loadu_ps(x_base2.add((byte_idx + 1) * 8));
+            let x0d = _mm256_loadu_ps(x_base3.add(byte_idx * 8));
+            let x1d = _mm256_loadu_ps(x_base3.add((byte_idx + 1) * 8));
+
+            // 8 FMA (2/x × 4 x), 两路独立链
+            g0a = _mm256_fmadd_ps(lut0, x0a, g0a);
+            g1a = _mm256_fmadd_ps(lut1, x1a, g1a);
+            g0b = _mm256_fmadd_ps(lut0, x0b, g0b);
+            g1b = _mm256_fmadd_ps(lut1, x1b, g1b);
+            g0c = _mm256_fmadd_ps(lut0, x0c, g0c);
+            g1c = _mm256_fmadd_ps(lut1, x1c, g1c);
+            g0d = _mm256_fmadd_ps(lut0, x0d, g0d);
+            g1d = _mm256_fmadd_ps(lut1, x1d, g1d);
+        }
+
+        // 2 路 merge → group_acc, FMA scale → row_acc
+        let group_acc0 = _mm256_add_ps(g0a, g1a);
+        let group_acc1 = _mm256_add_ps(g0b, g1b);
+        let group_acc2 = _mm256_add_ps(g0c, g1c);
+        let group_acc3 = _mm256_add_ps(g0d, g1d);
+        row_acc0 = _mm256_fmadd_ps(scale_v, group_acc0, row_acc0);
+        row_acc1 = _mm256_fmadd_ps(scale_v, group_acc1, row_acc1);
+        row_acc2 = _mm256_fmadd_ps(scale_v, group_acc2, row_acc2);
+        row_acc3 = _mm256_fmadd_ps(scale_v, group_acc3, row_acc3);
+    }
+
+    // 行末一次性横向求和
+    *y.get_unchecked_mut(0) = horizontal_sum_avx2(row_acc0);
+    *y.get_unchecked_mut(1) = horizontal_sum_avx2(row_acc1);
+    *y.get_unchecked_mut(2) = horizontal_sum_avx2(row_acc2);
+    *y.get_unchecked_mut(3) = horizontal_sum_avx2(row_acc3);
+}
+
 /// __m256 → f32 横向求和 (纯寄存器内 SSE, 无 store)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -909,4 +1016,373 @@ unsafe fn horizontal_sum_avx2(v: std::arch::x86_64::__m256) -> f32 {
     let sums = _mm_add_ps(sum128, shuf);
     let shuf2 = _mm_movehl_ps(sums, sums);
     _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+}
+
+// ============================================================================
+// Q4_1 反量化与 GEMM (用于 DSpark drafter)
+// ============================================================================
+//
+// Q4_1 布局 (每 32 权重 = 20 字节):
+//   ┌──────────┬──────────┬─────────────────────────────┐
+//   │ FP16 d   │ FP16 m   │ 16 字节 packed (32 × 4 bit) │
+//   │ 2 字节    │ 2 字节    │                             │
+//   └──────────┴──────────┴─────────────────────────────┘
+// 反量化: w = m + d * q,  q ∈ [0, 15] (4-bit 无符号, 无 -8 偏移; -8 是 Q4_0)
+//
+// 相比 Q1_0 (1.125 bit/weight), Q4_1 是 5 bit/weight, 精度更高但带宽需求 4.4×。
+// DSpark drafter 仅 6 层 × 5120 hidden, 总权重 ~200MB, 可接受。
+
+/// 反量化 Q4_1 单行, 写入 caller 提供的 slice
+pub fn dequantize_q4_1_row_into(data: &[u8], row_idx: usize, n_cols: usize, out: &mut [f32]) {
+    debug_assert!(out.len() >= n_cols);
+    let groups_per_row = n_cols.div_ceil(Q4_1_GROUP_SIZE);
+    let row_byte_offset = row_idx * (groups_per_row * Q4_1_BLOCK_BYTES);
+    let row_bytes = &data[row_byte_offset..];
+    let mut out_idx = 0;
+    for g in 0..groups_per_row {
+        let bs = g * Q4_1_BLOCK_BYTES;
+        if bs + Q4_1_BLOCK_BYTES > row_bytes.len() {
+            break;
+        }
+        let d_bits = u16::from_le_bytes([row_bytes[bs], row_bytes[bs + 1]]);
+        let m_bits = u16::from_le_bytes([row_bytes[bs + 2], row_bytes[bs + 3]]);
+        let d = f16_to_f32_fast(d_bits);
+        let m = f16_to_f32_fast(m_bits);
+        let packed = &row_bytes[bs + 4..bs + Q4_1_BLOCK_BYTES];
+        // llama.cpp Q4_1 nibble 布局: 低 nibble → 前半 0..15, 高 nibble → 后半 16..31
+        for byte_idx in 0..16 {
+            let b = packed[byte_idx];
+            if out_idx < n_cols {
+                out[out_idx] = m + d * (b & 0x0F) as f32;
+                out_idx += 1;
+            }
+        }
+        for byte_idx in 0..16 {
+            let b = packed[byte_idx];
+            if out_idx < n_cols {
+                out[out_idx] = m + d * ((b >> 4) & 0x0F) as f32;
+                out_idx += 1;
+            }
+        }
+    }
+    while out_idx < n_cols {
+        out[out_idx] = 0.0;
+        out_idx += 1;
+    }
+}
+
+/// Q4_1 matvec 标量实现 (正确性优先, drafter 权重小性能不敏感)
+///
+/// y[i] = sum_g sum_{j=0..32} (m_g + d_g * q_j) * x[g*32 + j],  q_j ∈ [0, 15]
+pub fn dot_q4_1_row_scalar(data: &[u8], row_idx: usize, n_cols: usize, x: &[f32]) -> f32 {
+    debug_assert!(x.len() >= n_cols);
+    let groups_per_row = n_cols / Q4_1_GROUP_SIZE;
+    let row_byte_offset = row_idx * (groups_per_row * Q4_1_BLOCK_BYTES);
+
+    let mut acc = 0.0f32;
+    let mut w_buf = [0.0f32; 32];
+
+    for g in 0..groups_per_row {
+        let bs = row_byte_offset + g * Q4_1_BLOCK_BYTES;
+        let d_bits = u16::from_le_bytes([data[bs], data[bs + 1]]);
+        let m_bits = u16::from_le_bytes([data[bs + 2], data[bs + 3]]);
+        let d = f16_to_f32_fast(d_bits);
+        let m = f16_to_f32_fast(m_bits);
+        let packed = &data[bs + 4..bs + Q4_1_BLOCK_BYTES];
+        // llama.cpp Q4_1 nibble 布局: 低 nibble → 前半 0..15, 高 nibble → 后半 16..31
+        // Q4_1 公式: w = d * q + m  (q 为 4-bit 值 0..15, 无 -8 偏移; -8 是 Q4_0 的)
+        for byte_idx in 0..16 {
+            let b = packed[byte_idx];
+            w_buf[byte_idx] = m + d * (b & 0x0F) as f32;           // 低 nibble → 前半
+            w_buf[byte_idx + 16] = m + d * ((b >> 4) & 0x0F) as f32;  // 高 nibble → 后半
+        }
+        let x_off = g * Q4_1_GROUP_SIZE;
+        let mut group_acc = 0.0f32;
+        for j in 0..32 {
+            group_acc += w_buf[j] * x[x_off + j];
+        }
+        acc += group_acc;
+    }
+    acc
+}
+
+/// Q4_1 runtime AVX2 feature 检测
+#[cfg(target_arch = "x86_64")]
+pub fn avx2_q4_1_available() -> bool {
+    std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("fma")
+        && std::is_x86_feature_detected!("f16c")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn avx2_q4_1_available() -> bool {
+    false
+}
+
+/// ★ Q4_1 AVX2 kernel — 8x 加速 vs scalar
+///
+/// 每个 Q4_1 block = 32 weights = 4 × __m256:
+///   1. Load 16 bytes nibbles as __m128i
+///   2. Low nibbles (AND 0x0F) → weights 0..15
+///   3. High nibbles (SHR 4 + AND 0x0F) → weights 16..31
+///   4. cvtepi8_epi32 (8 bytes → 8 × i32, 0..15 安全当 i8) → cvtepi32_ps → __m256 f32
+///   5. w = m + d * nibble (FMA)
+///   6. acc = w * x + acc (FMA)
+///
+/// 注: nibble 值 0..15 < 128, 用有符号 cvtepi8_epi32 安全 (u8 当 i8 解读不变)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+#[allow(unsafe_code)]
+#[inline]
+pub unsafe fn dot_q4_1_row_avx2(
+    data: &[u8],
+    row_idx: usize,
+    n_cols: usize,
+    x: &[f32],
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let groups_per_row = n_cols / Q4_1_GROUP_SIZE;
+    let row_byte_offset = row_idx * (groups_per_row * Q4_1_BLOCK_BYTES);
+
+    let mut acc_vec = _mm256_setzero_ps();
+    let nibble_mask = _mm_set1_epi8(0x0F as i8);
+
+    for g in 0..groups_per_row {
+        let bs = row_byte_offset + g * Q4_1_BLOCK_BYTES;
+
+        // Load d, m (f16) → broadcast to f32
+        let d_bits = u16::from_le_bytes([*data.get_unchecked(bs), *data.get_unchecked(bs + 1)]);
+        let m_bits = u16::from_le_bytes([*data.get_unchecked(bs + 2), *data.get_unchecked(bs + 3)]);
+        let d_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(d_bits as i16)));
+        let m_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(m_bits as i16)));
+
+        // Load 16 bytes nibbles
+        let nibbles = _mm_loadu_si128(data.as_ptr().add(bs + 4) as *const __m128i);
+        // Low nibbles (bytes 0..15 → weights 0..15)
+        let low = _mm_and_si128(nibbles, nibble_mask);
+        // High nibbles (bytes 0..15 → weights 16..31)
+        let high = _mm_and_si128(_mm_srli_epi16(nibbles, 4), nibble_mask);
+
+        // Convert 16 bytes → 16 × i32 → 16 × f32 (4 个 __m256)
+        // low[0..7] → weights 0..7
+        let w0_n = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(low));
+        // low[8..15] → weights 8..15
+        let low_hi = _mm_srli_si128(low, 8);
+        let w1_n = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(low_hi));
+        // high[0..7] → weights 16..23
+        let w2_n = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(high));
+        // high[8..15] → weights 24..31
+        let high_hi = _mm_srli_si128(high, 8);
+        let w3_n = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(high_hi));
+
+        // w = m + d * nibble (FMA: d * nibble + m)
+        let w0 = _mm256_fmadd_ps(d_v, w0_n, m_v);
+        let w1 = _mm256_fmadd_ps(d_v, w1_n, m_v);
+        let w2 = _mm256_fmadd_ps(d_v, w2_n, m_v);
+        let w3 = _mm256_fmadd_ps(d_v, w3_n, m_v);
+
+        // Load x[32] as 4 × __m256
+        let x_ptr = x.as_ptr().add(g * Q4_1_GROUP_SIZE);
+        let x0 = _mm256_loadu_ps(x_ptr);
+        let x1 = _mm256_loadu_ps(x_ptr.add(8));
+        let x2 = _mm256_loadu_ps(x_ptr.add(16));
+        let x3 = _mm256_loadu_ps(x_ptr.add(24));
+
+        // acc += w * x (FMA)
+        acc_vec = _mm256_fmadd_ps(w0, x0, acc_vec);
+        acc_vec = _mm256_fmadd_ps(w1, x1, acc_vec);
+        acc_vec = _mm256_fmadd_ps(w2, x2, acc_vec);
+        acc_vec = _mm256_fmadd_ps(w3, x3, acc_vec);
+    }
+
+    // Horizontal sum __m256 → f32 (SSE)
+    let hi = _mm256_extractf128_ps(acc_vec, 1);
+    let lo = _mm256_castps256_ps128(acc_vec);
+    let sum128 = _mm_add_ps(hi, lo);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+}
+
+/// ★ Q4_1 batched AVX2 kernel — 同一 W[row] 与 n_batch 个 x 向量做点积
+///
+/// **设计** (P7 优化):
+/// - 主循环 4 token 分块, 每 group 内 4 个 w 向量 (32 weights) 在 4 token 间共享,
+///   节省 nibble unpack + d/m broadcast 各 75% (vs 逐 token)。
+/// - 余数走 2-token + 1-token fallback。
+///
+/// 相比 `dot_q4_1_row_avx2` 调用 n_batch 次:
+/// - nibble unpack (load+AND+SHR+cvtepi8+cvtepi32) 从 n_batch 降到 n_batch/4
+/// - d/m F16C+broadcast 从 n_batch 降到 n_batch/4
+/// - hsum 次数不变 (n_batch, 每 token 行末一次)
+///
+/// 寄存器分配 (4-token path): 4 w (shared) + 4 row_acc + 2 (d_v, m_v) + 4 x (transient) = 14/16 YMM
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+#[allow(unsafe_code)]
+#[inline]
+pub unsafe fn dot_q4_1_row_batch_avx2(
+    data: &[u8],
+    row_idx: usize,
+    n_cols: usize,
+    x: &[f32],
+    x_stride: usize,
+    n_batch: usize,
+    y: &mut [f32],
+    y_stride: usize,
+) {
+    use std::arch::x86_64::*;
+    let groups_per_row = n_cols / Q4_1_GROUP_SIZE;
+    let row_byte_offset = row_idx * (groups_per_row * Q4_1_BLOCK_BYTES);
+    let nibble_mask = _mm_set1_epi8(0x0F as i8);
+
+    let mut t_start = 0usize;
+
+    // ★ P7: 4-token 主循环 — 每 group 内 w unpack 只做 1 次, 共享给 4 个 token
+    // 节省 50% unpack (vs 2-token), instruction count -28%, 权重带宽 -3.5%
+    while t_start + 4 <= n_batch {
+        let mut row_acc0 = _mm256_setzero_ps();
+        let mut row_acc1 = _mm256_setzero_ps();
+        let mut row_acc2 = _mm256_setzero_ps();
+        let mut row_acc3 = _mm256_setzero_ps();
+
+        for g in 0..groups_per_row {
+            let bs = row_byte_offset + g * Q4_1_BLOCK_BYTES;
+
+            // Load d, m (f16) → broadcast (shared across 4 tokens)
+            let d_bits = u16::from_le_bytes([*data.get_unchecked(bs), *data.get_unchecked(bs + 1)]);
+            let m_bits = u16::from_le_bytes([*data.get_unchecked(bs + 2), *data.get_unchecked(bs + 3)]);
+            let d_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(d_bits as i16)));
+            let m_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(m_bits as i16)));
+
+            // Unpack nibbles → 4 w vectors (shared across 4 tokens)
+            let nibbles = _mm_loadu_si128(data.as_ptr().add(bs + 4) as *const __m128i);
+            let low = _mm_and_si128(nibbles, nibble_mask);
+            let high = _mm_and_si128(_mm_srli_epi16(nibbles, 4), nibble_mask);
+
+            let w0 = _mm256_fmadd_ps(d_v, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(low)), m_v);
+            let w1 = _mm256_fmadd_ps(d_v, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(low, 8))), m_v);
+            let w2 = _mm256_fmadd_ps(d_v, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(high)), m_v);
+            let w3 = _mm256_fmadd_ps(d_v, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(high, 8))), m_v);
+
+            // Token 0: load x[32], 4 FMA into row_acc0
+            let x0_ptr = x.as_ptr().add(t_start * x_stride + g * Q4_1_GROUP_SIZE);
+            row_acc0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x0_ptr), row_acc0);
+            row_acc0 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x0_ptr.add(8)), row_acc0);
+            row_acc0 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(x0_ptr.add(16)), row_acc0);
+            row_acc0 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(x0_ptr.add(24)), row_acc0);
+
+            // Token 1: same w, different x
+            let x1_ptr = x.as_ptr().add((t_start + 1) * x_stride + g * Q4_1_GROUP_SIZE);
+            row_acc1 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x1_ptr), row_acc1);
+            row_acc1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x1_ptr.add(8)), row_acc1);
+            row_acc1 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(x1_ptr.add(16)), row_acc1);
+            row_acc1 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(x1_ptr.add(24)), row_acc1);
+
+            // Token 2
+            let x2_ptr = x.as_ptr().add((t_start + 2) * x_stride + g * Q4_1_GROUP_SIZE);
+            row_acc2 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x2_ptr), row_acc2);
+            row_acc2 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x2_ptr.add(8)), row_acc2);
+            row_acc2 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(x2_ptr.add(16)), row_acc2);
+            row_acc2 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(x2_ptr.add(24)), row_acc2);
+
+            // Token 3
+            let x3_ptr = x.as_ptr().add((t_start + 3) * x_stride + g * Q4_1_GROUP_SIZE);
+            row_acc3 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x3_ptr), row_acc3);
+            row_acc3 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x3_ptr.add(8)), row_acc3);
+            row_acc3 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(x3_ptr.add(16)), row_acc3);
+            row_acc3 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(x3_ptr.add(24)), row_acc3);
+        }
+
+        *y.get_unchecked_mut(t_start * y_stride + row_idx) = horizontal_sum_avx2(row_acc0);
+        *y.get_unchecked_mut((t_start + 1) * y_stride + row_idx) = horizontal_sum_avx2(row_acc1);
+        *y.get_unchecked_mut((t_start + 2) * y_stride + row_idx) = horizontal_sum_avx2(row_acc2);
+        *y.get_unchecked_mut((t_start + 3) * y_stride + row_idx) = horizontal_sum_avx2(row_acc3);
+
+        t_start += 4;
+    }
+
+    // 余数: 2-token fallback (n_batch % 4 ∈ {2, 3})
+    while t_start < n_batch {
+        let has_pair = t_start + 1 < n_batch;
+
+        let mut row_acc0 = _mm256_setzero_ps();
+        let mut row_acc1 = _mm256_setzero_ps();
+
+        for g in 0..groups_per_row {
+            let bs = row_byte_offset + g * Q4_1_BLOCK_BYTES;
+
+            let d_bits = u16::from_le_bytes([*data.get_unchecked(bs), *data.get_unchecked(bs + 1)]);
+            let m_bits = u16::from_le_bytes([*data.get_unchecked(bs + 2), *data.get_unchecked(bs + 3)]);
+            let d_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(d_bits as i16)));
+            let m_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(m_bits as i16)));
+
+            let nibbles = _mm_loadu_si128(data.as_ptr().add(bs + 4) as *const __m128i);
+            let low = _mm_and_si128(nibbles, nibble_mask);
+            let high = _mm_and_si128(_mm_srli_epi16(nibbles, 4), nibble_mask);
+
+            let w0 = _mm256_fmadd_ps(d_v, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(low)), m_v);
+            let w1 = _mm256_fmadd_ps(d_v, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(low, 8))), m_v);
+            let w2 = _mm256_fmadd_ps(d_v, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(high)), m_v);
+            let w3 = _mm256_fmadd_ps(d_v, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(high, 8))), m_v);
+
+            let x0_ptr = x.as_ptr().add(t_start * x_stride + g * Q4_1_GROUP_SIZE);
+            row_acc0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x0_ptr), row_acc0);
+            row_acc0 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x0_ptr.add(8)), row_acc0);
+            row_acc0 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(x0_ptr.add(16)), row_acc0);
+            row_acc0 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(x0_ptr.add(24)), row_acc0);
+
+            if has_pair {
+                let x1_ptr = x.as_ptr().add((t_start + 1) * x_stride + g * Q4_1_GROUP_SIZE);
+                row_acc1 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x1_ptr), row_acc1);
+                row_acc1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x1_ptr.add(8)), row_acc1);
+                row_acc1 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(x1_ptr.add(16)), row_acc1);
+                row_acc1 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(x1_ptr.add(24)), row_acc1);
+            }
+        }
+
+        *y.get_unchecked_mut(t_start * y_stride + row_idx) = horizontal_sum_avx2(row_acc0);
+        if has_pair {
+            *y.get_unchecked_mut((t_start + 1) * y_stride + row_idx) = horizontal_sum_avx2(row_acc1);
+        }
+
+        t_start += if has_pair { 2 } else { 1 };
+    }
+}
+
+/// Q4_1 batched matvec 入口 (runtime AVX2 检测 + scalar fallback)
+///
+/// 计算 `y[t * y_stride + row_idx] = dot(W[row_idx], x[t * x_stride..t * x_stride + n_cols])`
+/// 对 t ∈ 0..n_batch。同一 W 行被所有 token 共享 (只 unpack 一次)。
+#[allow(unsafe_code)]
+pub fn dot_q4_1_row_batch(
+    data: &[u8],
+    row_idx: usize,
+    n_cols: usize,
+    x: &[f32],
+    x_stride: usize,
+    n_batch: usize,
+    y: &mut [f32],
+    y_stride: usize,
+) {
+    debug_assert!(x.len() >= n_batch * x_stride);
+    debug_assert!(y.len() >= n_batch * y_stride);
+    if n_batch == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if avx2_q4_1_available() {
+        #[allow(unsafe_code)]
+        unsafe {
+            dot_q4_1_row_batch_avx2(data, row_idx, n_cols, x, x_stride, n_batch, y, y_stride);
+        }
+        return;
+    }
+    // Fallback: 逐 token 调用 scalar
+    for t in 0..n_batch {
+        let xt = &x[t * x_stride..t * x_stride + n_cols];
+        y[t * y_stride + row_idx] = dot_q4_1_row_scalar(data, row_idx, n_cols, xt);
+    }
 }

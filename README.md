@@ -13,12 +13,14 @@
 ## ✨ 特性
 
 - **零依赖**:所有功能(GGUF 解析、FP16/BF16、BPE、GEMV、SSM、RoPE)从零实现
-- **纯 CPU**:`#![forbid(unsafe_code)]`,完全依赖编译器自动向量化(`target-cpu=native`)
+- **纯 CPU**:AVX2 + FMA 手写向量化内核(`target-cpu=native`)
 - **Q1_0 反量化**:1.125 bits/weight 二值化格式,每 128 权重共享一个 FP16 scale
 - **混合注意力架构**:64 层 = 48 SSM 块 + 16 全注意力块(节拍 `(i+1) % 4 == 0`)
 - **M-RoPE**:多模态 RoPE,文本推理时仅旋转时间维(22/64 维)
 - **Gated DeltaNet**:SSM 层使用 Gated Delta Rule 循环更新
 - **Qwen3.6 chat 模板**:支持 `<|im_start|>` 格式与 `mind` 思考模式标记
+- **DSpark 推测解码**:6 层 block-parallel drafter + Markov head + Leviathan rejection sampling,~5.5 tok/s
+- **多线程并行**:持久线程池 (park/unpark 零分配),14 线程 GEMM 并行
 
 ## 📦 目录结构
 
@@ -65,7 +67,7 @@ pip install -U "huggingface_hub[cli]"
 | 文件 | 大小 | 用途 | 状态 |
 |------|------|------|------|
 | `Bonsai-27B-Q1_0.gguf` | 3.9 GB | **主权重**(1.125 bits/weight,语言模型) | ✅ 已支持 |
-| `Bonsai-27B-dspark-Q4_1.gguf` | 1.8 GB | DSpark 投机解码 drafter | 🔜 计划支持 |
+| `Bonsai-27B-dspark-Q4_1.gguf` | 1.8 GB | DSpark 投机解码 drafter | ✅ 已支持 |
 | `Bonsai-27B-mmproj-Q8_0.gguf` | 0.63 GB | 视觉塔(多模态输入) | 🔜 计划支持 |
 
 **一键下载全部**:
@@ -137,6 +139,14 @@ cargo build --release --bin daiza-cli
 
 # Raw 模式(跳过 chat 模板,用于调试)
 .\target\release\daiza-cli.exe "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "The capital of China is" 8 --raw
+
+# 启用 DSpark 投机解码(需先下载 drafter 权重)
+.\target\release\daiza-cli.exe "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "请用中文写一首关于春天的诗,8句" 200 `
+    --dspark "..\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf"
+
+# Greedy 模式(temperature=0, 用于正确性验证)
+.\target\release\daiza-cli.exe "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "你好" 100 `
+    --dspark "..\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf" --greedy
 
 # 检查模型元信息
 .\target\release\daiza-cli.exe "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
@@ -238,21 +248,30 @@ mind
 
 ## 📊 性能参考(纯 CPU,单 token decode)
 
+测试硬件:Intel Core Ultra 5 225H (Meteor Lake, 14 核, AVX2 + FMA, LPDDR5X-7467)
+
+| 模式 | 吞吐量 | 接受率 | 说明 |
+|------|--------|--------|------|
+| 纯 target (无 DSpark) | ~4.4 tok/s | — | 64 层前向 ~227ms/tok |
+| DSpark 推测解码 | ~5.5 tok/s | ~36% | drafter 53ms/call + target verify,~1.25× 加速 |
+
 - 单 block 前向:~220ms(SSM 层)/ ~530ms(全注意力层)
 - 完整 64 层前向:~14s(纯 SSM 层)/ ~34s(包含全注意力)
 - 内存占用:~13 GB(权重)+ ~1.3 GB(KV/SSM/激活)
+- DSpark 加速比:target forward 197ms/tok → DSpark 179ms/tok (~10% 加速)
 
-**说明**:这是学习项目,未做性能优化(如 KV 量化、批处理、线程并行)。商业部署请使用 [llama.cpp PrismML fork](https://github.com/PrismML-Eng/llama.cpp)。
+**说明**:这是学习项目。当前性能已接近 LPDDR5X 单通道带宽极限 (~22 GB/s 实测 vs 60 GB/s 理论),
+MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](https://github.com/PrismML-Eng/llama.cpp)。
 
 ## 🗺️ 路线图
 
 - [x] Q1_0 主权重文本推理
 - [x] 混合注意力(SSM + Full Attention)
 - [x] Chat 模板与思考模式
-- [ ] DSpark 投机解码(`Bonsai-27B-dspark-Q4_1.gguf`)
+- [x] 多线程并行(持久线程池 + AVX2 手写内核)
+- [x] DSpark 投机解码(`Bonsai-27B-dspark-Q4_1.gguf`)
 - [ ] 多模态视觉输入(`Bonsai-27B-mmproj-Q8_0.gguf`)
 - [ ] KV cache 量化(4-bit)
-- [ ] 多线程并行
 
 ## 📚 参考资料
 

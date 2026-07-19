@@ -57,4 +57,17 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.len = 0;
     }
+
+    /// 截断缓存到 `new_len` 个 token (用于 speculative decoding rollback)
+    /// 保留前 new_len 个 token 的 K/V, 多余的被逻辑丢弃 (Vec 不缩容, 避免 realloc)
+    pub fn truncate(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.len);
+        if new_len < self.len {
+            let drop = (self.len - new_len) * self.per_token;
+            let new_total = self.k.len() - drop;
+            self.k.truncate(new_total);
+            self.v.truncate(new_total);
+            self.len = new_len;
+        }
+    }
 }

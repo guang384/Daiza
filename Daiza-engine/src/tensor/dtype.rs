@@ -13,6 +13,12 @@ pub const Q1_0_GROUP_SIZE: usize = 128;
 /// Q1_0 一组的字节数:2 字节 scale + 16 字节符号位(128 bit / 8)
 pub const Q1_0_BLOCK_BYTES: usize = 18;
 
+/// Q4_1 一组的元素数:32 权重共享 FP16 scale + FP16 min
+pub const Q4_1_GROUP_SIZE: usize = 32;
+
+/// Q4_1 一组的字节数:2 字节 scale + 2 字节 min + 16 字节 packed(32 × 4 bit)
+pub const Q4_1_BLOCK_BYTES: usize = 20;
+
 /// 给定 dtype 和元素总数,返回该张量在文件中的字节数
 pub fn byte_size(dtype: TensorType, n_elements: u64) -> usize {
     match dtype {

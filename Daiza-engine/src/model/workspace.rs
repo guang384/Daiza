@@ -140,6 +140,10 @@ pub struct ThreadPool {
 }
 
 impl ThreadPool {
+    /// 总线程数 (workers + 主线程)
+    pub fn n_threads(&self) -> usize {
+        self.n_workers + 1
+    }
     /// 创建 n_threads-1 个 worker 线程 (主线程作为第 n_threads 个 worker)
     pub fn new(n_threads: usize) -> Self {
         let n_workers = n_threads.saturating_sub(1);

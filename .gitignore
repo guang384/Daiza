@@ -23,6 +23,7 @@ Daiza-engine/gguf_inspect_output.txt
 # ===== 编辑器与系统文件 =====
 .vscode/
 .idea/
+.trae/
 *.swp
 *.swo
 *~
