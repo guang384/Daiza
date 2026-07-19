@@ -254,8 +254,8 @@ mind
 | Raw | `10+20=` (16t) | `30=50=70=100=100` | ⚠️ 首字 `30` 正确, 随后退化 |
 | Raw | `What is 2 plus 2?` (16t) | (空白) | ❌ 模型为 chat 模式训练, raw 模式缺思考标记无法回答 |
 | Chat | `你好` (32 tok) | `Here's a thinking process: 1. **Analyze the user's input:** User says: "你好" (Hello)` | ✅ 正确进入思考 |
-| Chat | `1+1等于几` (300t) | `Here's a thinking process: 1. **Analyze the user's input:** - The user wrote: "1+1等于几" - The user is asking "1+1等于几" - The user is asking "1+1等于几" ...` | ❌ 进入 thinking 后立刻陷入重复 collapse, 无法到达 `</mind>` 给出答案 |
-| Chat | `2+3等于多少` / `计算 10+20` / `What is 2 plus 2?` (300t) | 同上,均在 thinking 步骤 1 重复 collapse | ❌ Chat 模式无法改善数学推理 |
+| Chat (T=0.7) | `1+1等于几` (300t) | `Here's a thinking process: 1. **Analyze the user's input:** - The user wrote: "1+1=几" - The user is asking for the meaning of "1+1=几" - The user is asking for the meaning of "1+1=几" ...` | ❌ T=0.7/top_k=20/top_p=0.95 (官方推荐参数) 仍退化, thinking 步骤 1 重复 collapse |
+| Chat (T=0.7) | `2+3等于多少` / `计算 10+20` / `What is 2 plus 2?` (300t) | 同上,均在 thinking 步骤 1 重复 collapse | ❌ 官方推荐参数无法改善数学推理 |
 
 **模式总结**:
 - 知识检索 / 序列补全类 prompt 工作良好 (北京 / Paris / 1,2,3,4 → 5,6,7,8,9)
