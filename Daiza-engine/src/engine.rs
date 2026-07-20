@@ -459,6 +459,13 @@ impl Engine {
             // - 只 forward 接受的 draft token, SSM state 推进到 pos_before + n_accepted (正确)
             // - 不需要 KV truncate (只 forward 了接受的 token, KV cache 自然正确)
             // - 不需要 SSM undo (未 forward 的 draft token 不影响 state)
+            //
+            // ★ Batched verify (forward_batch 一次处理 k drafts) 已尝试并回退:
+            //   - 方案 A (SSM state 不 rollback): Gated DeltaNet gate 不能有效衰减 rejected tokens,
+            //     conv_history 滑窗含 rejected drafts 的 qkv, 导致 SSM 输出错乱 (输出重复 "the user's
+            //     perspective..."), 接受率下降, 性能退化 +91% (414ms/tok vs 217ms)
+            //   - forward_batch 为 prefill 设计, 小批量 (k=4) 时开销超过 batched matvec 收益
+            //   - 方案 B (SSM state snapshot/restore) 可行但复杂度高, 收益不确定, 暂不实施
             let verify_start = std::time::Instant::now();
             let pos_before = ctx.state.pos;
 
