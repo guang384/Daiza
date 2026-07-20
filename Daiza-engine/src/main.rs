@@ -109,28 +109,27 @@ fn main() -> Result<()> {
 
     // --generate 模式:完整推理
     //
-    // ★ 热降频根治: 统一使用 7 active workers + park 模式
+    // ★ 热降频根治: 9 active workers + yield 模式 (10 核活跃, 接近 llama.cpp 性能)
     //
-    // 核心发现 (Meteor Lake 14 核实测):
-    //   - 14 核 park: 功耗波动触发 turbo → 热降频 (256t: 235ms, 64t: 223ms)
-    //   - 14 核 yield: 不降频但调度开销大 (229ms/tok)
-    //   - 9 核+ park: 仍降频 (223ms/tok)
-    //   - 8 核 park (7 active + main): 不降频, 零调度开销, 最优 (256t: 207ms, 64t: 202ms)
+    // 核心发现 (Meteor Lake 14 核实测, 256t):
+    //   - 14 核 park: 功耗波动触发 turbo → 热降频 (235ms)
+    //   - 7 active + park (8核): 212ms 稳定 (±1ms, 但算力不足)
+    //   - 9 active + yield (10核): 147-165ms (冷启动147, 热稳定165, ±4ms) ← 当前
+    //   - 10 active + yield (11核): 167-186ms (热积累退化)
+    //   - llama.cpp 14 核: 154ms (稳定, 参考)
     //
-    // 策略: 所有场景统一 7 active + park
-    //   - 短跑 64t 全核降频 (223ms) vs 7 active 不降频 (202ms) → 7 active 更优
-    //   - 长跑 256t 7 active 稳定 207ms, 不降频
-    //   - 8 核活跃 (7 workers + main) + 6 核空闲散热 = 不触发 turbo, 持续基准频率
+    // 关键洞察: yield 模式 duty cycle ~40% (spin 4096 + yield), 类似 llama.cpp 的
+    //   spin 6.5M + cond_wait, 平滑功耗避免热降频, 同时允许更多核心活跃
     //
     // 用户已手动设置的环境变量优先 (不覆盖)
     if std::env::var("DAIZA_WAIT_MODE").is_err() {
-        // park 模式 (零调度开销, yield 有 ~40ms/token 调度开销)
-        std::env::set_var("DAIZA_WAIT_MODE", "park");
+        // yield 模式: spin 4096 + yield, duty cycle ~40% (类似 llama.cpp spin+cond_wait)
+        std::env::set_var("DAIZA_WAIT_MODE", "yield");
     }
     if std::env::var("DAIZA_ACTIVE_WORKERS").is_err() {
-        // 限制 7 active workers (8核活跃含main, 6核空闲散热, 避免热降频)
-        // set_active_workers 会 min(7, n_workers), 小线程数自动全核
-        std::env::set_var("DAIZA_ACTIVE_WORKERS", "7");
+        // 9 active workers (10核活跃含main, 4核空闲散热, 避免热降频)
+        // set_active_workers 会 min(9, n_workers), 小线程数自动全核
+        std::env::set_var("DAIZA_ACTIVE_WORKERS", "9");
     }
 
     let mut engine = Engine::load(&gguf_path)?;
