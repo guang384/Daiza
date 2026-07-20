@@ -37,8 +37,23 @@ use crate::model::config::Config;
 static GLOBAL_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
 /// 初始化全局线程池(引擎启动时调用一次)
+///
+/// ★ 热降频根治: 读取 DAIZA_ACTIVE_WORKERS 环境变量, 限制活跃 worker 数
+///   未设置时默认全核利用; main.rs 根据 max_tokens 自动设置
 pub fn init_thread_pool(n_threads: usize) {
-    GLOBAL_POOL.get_or_init(|| ThreadPool::new(n_threads));
+    GLOBAL_POOL.get_or_init(|| {
+        let pool = ThreadPool::new(n_threads);
+        // ★ 读取 DAIZA_ACTIVE_WORKERS: 长跑时减少活跃核心, 避免热降频
+        if let Ok(s) = std::env::var("DAIZA_ACTIVE_WORKERS") {
+            if let Ok(n) = s.parse::<usize>() {
+                if n > 0 && n < n_threads {
+                    pool.set_active_workers(n);
+                    eprintln!("[threadpool] active workers limited to {n} (DAIZA_ACTIVE_WORKERS)");
+                }
+            }
+        }
+        pool
+    });
 }
 
 /// 获取全局线程池引用(若已初始化)
@@ -87,13 +102,16 @@ struct Shared {
     func: AtomicUsize,
     ctx: AtomicPtr<()>,
     n_dispatch: AtomicUsize,
+    // ★ 热降频根治: 限制活跃 worker 数 (tid >= n_active_workers 的 worker 深度 park)
+    //   14 线程全负载 → 热积累 → 降频; 限制到 10 active → 4 核空闲散热 → 不降频
+    n_active_workers: AtomicUsize,
     // ★ Work-stealing: 下一个待抢的 chunk 起始 (worker fetch_add 抢)
     next_chunk: AtomicUsize,
     // ★ Work-stealing: 总工作单元数 (抢到 >= total 即结束)
     total_work: AtomicUsize,
     // ★ Work-stealing: chunk 大小
     chunk_size: AtomicUsize,
-    _pad1: [u8; 64 - 48], // 6×8=48B, 补到 64B
+    _pad1: [u8; 64 - 56], // 7×8=56B, 补到 64B
 
     // --- Line 2: main 写 Release, worker 读 Acquire (hot signal) ---
     generation: AtomicU64,
@@ -117,24 +135,53 @@ unsafe fn trampoline<F: Fn(usize)>(ctx: *const (), i: usize) {
     (&*(ctx as *const F))(i)
 }
 
-/// Worker 主循环: spin-first + park fallback
+/// Worker 主循环: 自适应 wait 策略 (彻底解决热降频)
 ///
-/// ★ Spin-first 优化: worker 完成任务后先 spin SPIN_ROUNDS 轮检查 generation,
-/// 若期间有新任务立即执行 (零唤醒开销), 否则 park 睡眠 (节能)。
+/// ★ 核心问题: 14 线程全负载 → 热积累 → 降频 (PERF% 309%→250%, decode 96→235ms)
+/// ★ llama.cpp 方案: spin 6.5M + cond_wait, 持续中等功耗 (PERF% 稳定 260%)
+/// ★ Daiza 方案: 7 active workers + park + main yield (稳定 212ms)
 ///
-/// SPIN_ROUNDS 选择 (权衡):
-/// - 太小 (如 64): 几乎无收益, 仍走 park 路径
-/// - 太大 (如 6.5M = llama.cpp): 14 核持续 spin 触发 CPU 频率降级 (见 P0-F 教训)
-/// - 4096 cycles ≈ 1.3μs at 3GHz: 远短于典型 barrier 间隔 (~10-100μs),
-///   能捕获短间隔 barrier, 又不持续占核触发降频
+/// 三种 worker 状态:
+/// 1. active worker (tid < n_active_workers=7) + park 模式:
+///    spin 4096 + park: 零调度开销, worker park 期间 0% CPU
+/// 2. idle worker (tid >= n_active_workers=7): 深度 park, 0% CPU
+///    → 6 核空闲散热, 避免 14 核全负载降频
+/// 3. main thread: scatter_wait 中 spin 4096 + yield, 避免持续 spin 占满 main 核
+///    → main 核有散热间隙, 功耗平滑, 性能稳定 (212ms ±1ms)
+///
+/// ★ 实测 (Meteor Lake 14 核, 256t):
+///   - 14 active + park: 235ms (降频, 不稳定)
+///   - 7 active + park (main spin): 200-257ms (不降频, 但波动 57ms)
+///   - 7 active + park (main yield): 212-213ms (不降频, 稳定 ±1ms) ← 当前方案
+///   - llama.cpp 14 核: 154ms (稳定, 参考)
+///
+/// 为什么不能全 14 线程 spin 6.5M (llama.cpp 方案):
+///   Daiza 每 token 257 barriers, 间隔 0.78ms < spin 2ms
+///   spin 6.5M 期间 14 worker 占满 14 核, main thread 无法调度 (P0-F 教训)
+///
+/// ★ 实验: DAIZA_SPIN_ROUNDS env var 控制 spin 轮数 (默认 4096)
+///   DAIZA_WAIT_MODE=park 回退到 park 方案
 #[allow(unsafe_code)]
 fn worker_loop(shared: Arc<Shared>, tid: usize) {
-    const SPIN_ROUNDS: usize = 4096;
+    const SPIN_ROUNDS_DEFAULT: usize = 4096;
+    static SPIN_ROUNDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let spin_rounds = *SPIN_ROUNDS.get_or_init(|| {
+        std::env::var("DAIZA_SPIN_ROUNDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(SPIN_ROUNDS_DEFAULT)
+    });
+    static WAIT_MODE_PARK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let use_park = *WAIT_MODE_PARK.get_or_init(|| {
+        std::env::var("DAIZA_WAIT_MODE").as_deref() == Ok("park")
+    });
     let mut last_gen: u64 = 0;
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
             break;
         }
+        // ★ 读取 n_active_workers (Relaxed: 即使读到旧值也安全, 最多多 spin 一轮)
+        let n_active = shared.n_active_workers.load(Ordering::Relaxed);
         // Acquire: 看到 generation 变化后, 读到 main 的 func/ctx/n_dispatch 写入
         let gen = shared.generation.load(Ordering::Acquire);
         if gen != last_gen {
@@ -150,27 +197,39 @@ fn worker_loop(shared: Arc<Shared>, tid: usize) {
                 // Release: 确保 f(tid) 的内存写对 main 的 Acquire 可见
                 shared.done.fetch_add(1, Ordering::Release);
             }
-        } else {
-            // ★ Spin-first: 先 spin SPIN_ROUNDS 轮, 期间检查 generation
-            // 若 spin 期间有新任务, 立即执行 (避免 park/unpark ~10μs 唤醒开销)
-            // 若 spin 期满仍无任务, park 睡眠 (节能, 避免持续 spin 触发 CPU 降频)
+            // gen 变化但 tid >= n_dispatch: 不是给我的 dispatch, 继续循环
+        } else if tid >= n_active {
+            // ★ idle worker: 深度 park, 0% CPU (避免 14 核全负载降频)
+            //   只有 set_active_workers 或 shutdown 会 unpark
+            //   park 返回后更新 last_gen, 避免执行过期 dispatch
+            std::thread::park();
+            last_gen = shared.generation.load(Ordering::Acquire);
+        } else if use_park {
+            // ★ active worker + park 模式 (短跑): spin + park
             let mut spun = 0;
-            while spun < SPIN_ROUNDS {
+            while spun < spin_rounds {
                 let g = shared.generation.load(Ordering::Acquire);
-                if g != last_gen {
-                    break; // 有新任务, 跳出 spin 回到循环顶部执行
-                }
+                if g != last_gen { break; }
                 std::hint::spin_loop();
                 spun += 1;
             }
-            if spun >= SPIN_ROUNDS {
-                // spin 期满无任务, park 等待唤醒 (不消耗 CPU)
-                // park 语义: 若 main 已先 unpark, park 立即返回, 不会错过任务
-                // 重新检查一次 generation 防止 TOCTOU (park 前 main 可能已 dispatch)
+            if spun >= spin_rounds {
                 let g = shared.generation.load(Ordering::Acquire);
-                if g == last_gen {
-                    std::thread::park();
-                }
+                if g == last_gen { std::thread::park(); }
+            }
+        } else {
+            // ★ active worker + yield 模式 (长跑默认): spin + yield
+            // spin spin_rounds cycles 检查 generation, 期满 yield_now 让出核心
+            // yield 后立即回到 loop 顶部重新检查, 无 unpark 唤醒延迟
+            let mut spun = 0;
+            while spun < spin_rounds {
+                let g = shared.generation.load(Ordering::Acquire);
+                if g != last_gen { break; }
+                std::hint::spin_loop();
+                spun += 1;
+            }
+            if spun >= spin_rounds {
+                std::thread::yield_now();
             }
         }
     }
@@ -199,10 +258,12 @@ impl ThreadPool {
             func: AtomicUsize::new(0),
             ctx: AtomicPtr::new(std::ptr::null_mut()),
             n_dispatch: AtomicUsize::new(0),
+            // 默认全部 worker 活跃 (向后兼容; main.rs 会根据 max_tokens 调整)
+            n_active_workers: AtomicUsize::new(n_workers),
             next_chunk: AtomicUsize::new(0),
             total_work: AtomicUsize::new(0),
             chunk_size: AtomicUsize::new(0),
-            _pad1: [0; 64 - 48],
+            _pad1: [0; 64 - 56],
             generation: AtomicU64::new(0),
             _pad2: [0; 64 - 8],
             done: AtomicUsize::new(0),
@@ -245,7 +306,10 @@ impl ThreadPool {
             return;
         }
 
-        let n_dispatch = (n - 1).min(self.n_workers);
+        // ★ 限制活跃 worker 数: tid >= n_active 的 worker 深度 park, 不参与 dispatch
+        //   长跑时减少 active worker → 降低功耗 → 避免热降频
+        let n_active = self.shared.n_active_workers.load(Ordering::Relaxed);
+        let n_dispatch = (n - 1).min(n_active);
 
         // 重置完成计数 (上一轮 worker 已全部完成, 无竞争)
         self.shared.done.store(0, Ordering::Relaxed);
@@ -269,9 +333,18 @@ impl ThreadPool {
         f(n - 1);
 
         // 等待所有 worker 完成 (Acquire: 看到 done 后, 读到 worker 的内存写)
+        // ★ 热降频根治: main spin + yield 混合, 避免持续 spin 占满 main 核
+        //   纯 spin 让 main 核 100% 占用, 加剧 8 核热积累;
+        //   spin 4096 + yield 让 main 核有散热间隙, 功耗平滑
         if n_dispatch > 0 {
+            let mut spun = 0;
             while self.shared.done.load(Ordering::Acquire) < n_dispatch {
                 std::hint::spin_loop();
+                spun += 1;
+                if spun >= 4096 {
+                    std::thread::yield_now();
+                    spun = 0;
+                }
             }
         }
     }
@@ -305,7 +378,7 @@ impl ThreadPool {
             return;
         }
 
-        let n_dispatch = self.n_workers;
+        let n_dispatch = self.shared.n_active_workers.load(Ordering::Relaxed);
 
         // 重置完成计数
         self.shared.done.store(0, Ordering::Relaxed);
@@ -342,6 +415,31 @@ impl ThreadPool {
         while self.shared.done.load(Ordering::Acquire) < n_dispatch {
             std::hint::spin_loop();
         }
+    }
+
+    /// ★ 热降频根治: 设置活跃 worker 数量
+    ///
+    /// tid >= n_active 的 worker 进入深度 park (0% CPU), 不参与 dispatch。
+    /// 用于长跑时减少活跃核心数, 避免 14 核全负载导致热降频。
+    ///
+    /// 调用后立即 unpark 所有 worker, 让 idle worker 重新检查 n_active 并 park。
+    ///
+    /// 典型用法:
+    /// - 短跑 (≤64t): set_active_workers(n_workers) — 全核利用, 短跑不降频
+    /// - 长跑 (>64t): set_active_workers(9) — 10 核活跃 (9 worker + main), 4 核散热
+    pub fn set_active_workers(&self, n_active: usize) {
+        let n = n_active.min(self.n_workers);
+        self.shared.n_active_workers.store(n, Ordering::Relaxed);
+        // unpark 所有 worker, 让 idle worker 重新检查 n_active 并 park
+        // active worker 被 unpark 后无副作用 (park 是 sticky 的)
+        for thread in &self.threads {
+            thread.unpark();
+        }
+    }
+
+    /// 获取当前活跃 worker 数
+    pub fn n_active_workers(&self) -> usize {
+        self.shared.n_active_workers.load(Ordering::Relaxed)
     }
 }
 

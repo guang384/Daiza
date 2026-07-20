@@ -14,7 +14,7 @@ use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::load_as_f32;
 use crate::tensor::quant::{
     avx2_q1_0_available, dot_q1_0_row_batch, dot_q1_0_row_scalar,
-    quantize_dequantize_q8_0_into,
+    quantize_dequantize_q8_0_into, quantize_f32_to_q8_0_simple, dot_q1_0_q8_0_row_avx2,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::tensor::quant::{
@@ -98,11 +98,41 @@ impl Q1_0Matrix {
         let n_threads = crate::model::workspace::thread_count();
         // ★ P2-1: runtime AVX2 check 提到循环外, 避免每行 dot_q1_0_row 内部重复检测
         let use_avx2 = avx2_q1_0_available();
+        // ★ 实验: DAIZA_KERNEL_MODE 控制并行度 (quad=4行/dual=2行/single=1行)
+        // quad: 8 FMA 链/group (默认, 最高功耗密度)
+        // dual: 4 FMA 链/group (降功耗密度 50%)
+        // single: 2 FMA 链/group (降功耗密度 75%)
+        let kernel_mode = std::env::var("DAIZA_KERNEL_MODE").unwrap_or_default();
+        // ★ 实验: DAIZA_INT_KERNEL=1 走整数乘加 kernel (模仿 llama.cpp, 降低功耗密度)
+        let use_int_kernel = use_avx2 && std::env::var("DAIZA_INT_KERNEL").is_ok();
         // ★ P2-5: 阈值从 4096 降到 1024, 让 attn_k/v (1024 rows) 也走线程池
         if n_threads <= 1 || n < 1024 {
             #[cfg(target_arch = "x86_64")]
+            if use_int_kernel {
+                // ★ 整数乘加 kernel (模仿 llama.cpp)
+                let x_q8_bytes = quantize_f32_to_q8_0_simple(x);
+                for i in 0..n {
+                    y[i] = unsafe { dot_q1_0_q8_0_row_avx2(&self.bytes, i, k, &x_q8_bytes) };
+                }
+                return;
+            }
+            #[cfg(target_arch = "x86_64")]
             if use_avx2 {
-                // ★ P0-H: 四行并行, 共享 x load (load/FMA 比 1.25 vs triple 1.33)
+                // ★ 实验: kernel_mode 切换并行度
+                if kernel_mode == "dual" {
+                    let mut i = 0;
+                    while i + 1 < n {
+                        let (y0, y1) = unsafe { dot_q1_0_row_dual_avx2(&self.bytes, i, i + 1, k, x) };
+                        y[i] = y0; y[i + 1] = y1;
+                        i += 2;
+                    }
+                    if i < n { y[i] = unsafe { dot_q1_0_row_avx2(&self.bytes, i, k, x) }; }
+                    return;
+                } else if kernel_mode == "single" {
+                    for i in 0..n { y[i] = unsafe { dot_q1_0_row_avx2(&self.bytes, i, k, x) }; }
+                    return;
+                }
+                // 默认: quad (P0-H 四行并行, 共享 x load)
                 let mut i = 0;
                 while i + 3 < n {
                     let (y0, y1, y2, y3) = unsafe { dot_q1_0_row_quad_avx2(&self.bytes, i, i + 1, i + 2, i + 3, k, x) };
@@ -141,13 +171,52 @@ impl Q1_0Matrix {
             let y_addr = y.as_mut_ptr() as usize;
             // ★ Work-stealing: chunk_size=256 改善负载均衡
             let steal_chunk = 256;
+            let km = kernel_mode.clone();
+
+            // ★ 整数乘加 kernel 路径 (模仿 llama.cpp)
+            if use_int_kernel {
+                let x_q8_bytes = quantize_f32_to_q8_0_simple(x);
+                let xq8_addr = x_q8_bytes.as_ptr() as usize;
+                let xq8_len = x_q8_bytes.len();
+                pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
+                    let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
+                    let xq8 = unsafe { std::slice::from_raw_parts(xq8_addr as *const u8, xq8_len) };
+                    for i in start..end {
+                        unsafe {
+                            *((y_addr as *mut f32).add(i)) = dot_q1_0_q8_0_row_avx2(bytes, i, k, xq8);
+                        }
+                    }
+                });
+                return;
+            }
 
             pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
                 #[cfg(target_arch = "x86_64")]
                 if use_avx2 {
-                    // ★ P0-H: 四行并行
+                    // ★ 实验: kernel_mode 切换并行度
+                    if km == "dual" {
+                        let mut i = start;
+                        while i + 1 < end {
+                            let (y0, y1) = unsafe { dot_q1_0_row_dual_avx2(bytes, i, i + 1, k, x) };
+                            unsafe {
+                                *((y_addr as *mut f32).add(i)) = y0;
+                                *((y_addr as *mut f32).add(i + 1)) = y1;
+                            }
+                            i += 2;
+                        }
+                        if i < end {
+                            unsafe { *((y_addr as *mut f32).add(i)) = dot_q1_0_row_avx2(bytes, i, k, x); }
+                        }
+                        return;
+                    } else if km == "single" {
+                        for i in start..end {
+                            unsafe { *((y_addr as *mut f32).add(i)) = dot_q1_0_row_avx2(bytes, i, k, x); }
+                        }
+                        return;
+                    }
+                    // 默认: quad (P0-H 四行并行)
                     let mut i = start;
                     while i + 3 < end {
                         let (y0, y1, y2, y3) = unsafe { dot_q1_0_row_quad_avx2(bytes, i, i + 1, i + 2, i + 3, k, x) };

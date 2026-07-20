@@ -739,6 +739,134 @@ pub fn dot_q1_0_row_scalar(data: &[u8], row_idx: usize, n_cols: usize, x: &[f32]
     acc
 }
 
+// ===========================================================================
+// ★ 整数乘加 kernel (模仿 llama.cpp): Q1_0 × Q8_0 用 maddubs + madd
+// 降低浮点 FMA 数量 (16→5), 降低功耗密度, 避免热降频
+// ===========================================================================
+
+/// 将 F32 向量量化为简化 Q8_0 字节流
+/// 格式: 每 32 值一组, 4 字节 f32 scale + 32 字节 int8 values = 36 字节/block
+pub fn quantize_f32_to_q8_0_simple(x: &[f32]) -> Vec<u8> {
+    debug_assert!(x.len() % 32 == 0, "Q8_0 requires len % 32 == 0, got {}", x.len());
+    let n_blocks = x.len() / 32;
+    let mut out = vec![0u8; n_blocks * 36];
+    for b in 0..n_blocks {
+        let off = b * 32;
+        let mut amax = 0.0f32;
+        for j in 0..32 {
+            let ax = x[off + j].abs();
+            if ax > amax { amax = ax; }
+        }
+        let d = amax / 127.0;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        // f32 scale (little-endian)
+        let d_bits = d.to_bits();
+        out[b * 36] = (d_bits & 0xFF) as u8;
+        out[b * 36 + 1] = ((d_bits >> 8) & 0xFF) as u8;
+        out[b * 36 + 2] = ((d_bits >> 16) & 0xFF) as u8;
+        out[b * 36 + 3] = ((d_bits >> 24) & 0xFF) as u8;
+        // int8 values
+        for j in 0..32 {
+            let q = (x[off + j] * id).round() as i32;
+            let q = q.clamp(-128, 127) as i8;
+            out[b * 36 + 4 + j] = q as u8;
+        }
+    }
+    out
+}
+
+/// Q1_0 × Q8_0 整数乘加 kernel (模仿 llama.cpp)
+///
+/// 算法: 每 block (128 值) 分 4 个 K-iteration:
+///   1. sign-mask: shuffle + and + cmpeq + xor + sub → signed int8 sy
+///   2. 整数乘加: maddubs(ones, sy) → 16-bit, madd(16-bit, ones) → 32-bit
+///   3. 浮点累加: cvtepi32_ps + fmadd(y_d, sum32, acc_block)
+///
+/// 浮点 FMA 数量: 5/block (vs LUT 方案 16/block) — 降低功耗密度 70%
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_code)]
+#[inline]
+pub unsafe fn dot_q1_0_q8_0_row_avx2(
+    data: &[u8],
+    row_idx: usize,
+    n_cols: usize,
+    x_q8: &[u8],  // 简化 Q8_0: 36 字节/block
+) -> f32 {
+    use std::arch::x86_64::*;
+    let groups_per_row = n_cols / Q1_0_GROUP_SIZE;
+    let row_byte_offset = row_idx * (groups_per_row * Q1_0_BLOCK_BYTES);
+
+    let ones_8 = _mm256_set1_epi8(1);
+    let ones_16 = _mm256_set1_epi16(1);
+    let byte_shuf = _mm256_setr_epi8(
+        0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+        2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3,
+    );
+    let bit_masks = _mm256_setr_epi8(
+        1,2,4,8,16,32,64,-128i8 as u8 as i8, 1,2,4,8,16,32,64,-128i8 as u8 as i8,
+        1,2,4,8,16,32,64,-128i8 as u8 as i8, 1,2,4,8,16,32,64,-128i8 as u8 as i8,
+    );
+    let zero = _mm256_setzero_si256();
+    let mut acc = _mm256_setzero_ps();
+
+    for g in 0..groups_per_row {
+        let block_start = row_byte_offset + g * Q1_0_BLOCK_BYTES;
+        let scale_bits = u16::from_le_bytes([
+            *data.get_unchecked(block_start),
+            *data.get_unchecked(block_start + 1),
+        ]);
+        let d0 = _mm256_set1_ps(f16_to_f32_fast(scale_bits));
+        let qs_ptr = data.as_ptr().add(block_start + 2);
+        // 每 group 128 值 = 4 个 Q8_0 block (32 值 each, 36 字节 each)
+        let x_q8_off = g * 4 * 36;
+
+        let mut acc_block = _mm256_setzero_ps();
+        for K in 0..4 {
+            // Q1_0 sign bits: 4 字节 (uint32)
+            let qs32 = *(qs_ptr.add(K * 4) as *const u32) as i32;
+            // Q8_0 int8 values: 32 字节
+            let qy = _mm256_loadu_si256(x_q8.as_ptr().add(x_q8_off + K * 36 + 4) as *const __m256i);
+            // Q8_0 f32 scale
+            let y_d_bits = u32::from_le_bytes([
+                *x_q8.get_unchecked(x_q8_off + K * 36),
+                *x_q8.get_unchecked(x_q8_off + K * 36 + 1),
+                *x_q8.get_unchecked(x_q8_off + K * 36 + 2),
+                *x_q8.get_unchecked(x_q8_off + K * 36 + 3),
+            ]);
+            let y_d = _mm256_set1_ps(f32::from_bits(y_d_bits));
+
+            // sign-mask: sy = (qy XOR sm) - sm, sm = cmpeq(and(shuffle(qs32), bit_masks), zero)
+            let sm = _mm256_cmpeq_epi8(
+                _mm256_and_si256(
+                    _mm256_shuffle_epi8(_mm256_set1_epi32(qs32), byte_shuf),
+                    bit_masks,
+                ),
+                zero,
+            );
+            let sy = _mm256_sub_epi8(_mm256_xor_si256(qy, sm), sm);
+            // 整数乘加: ones × sy → 16-bit, ones × 16-bit → 32-bit
+            let s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy), ones_16);
+
+            if K == 0 {
+                acc_block = _mm256_mul_ps(y_d, _mm256_cvtepi32_ps(s32));
+            } else {
+                acc_block = _mm256_fmadd_ps(y_d, _mm256_cvtepi32_ps(s32), acc_block);
+            }
+        }
+        acc = _mm256_fmadd_ps(d0, acc_block, acc);
+    }
+
+    // hsum
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(hi, lo);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+}
+
 /// 批量计算 Q1_0 一行与多个 x 的点积 (P1-4 优化)
 ///
 /// 固定 `row_idx`, 对 `n_batch` 个 `x[t]` 同时计算点积, 写入 `y[t * y_stride]`。
