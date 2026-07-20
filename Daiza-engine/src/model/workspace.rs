@@ -411,9 +411,19 @@ impl ThreadPool {
         // 主线程也参与抢 chunk (像 llama.cpp)
         steal_loop(&self.shared, &f);
 
-        // 等待所有 worker 完成
-        while self.shared.done.load(Ordering::Acquire) < n_dispatch {
-            std::hint::spin_loop();
+        // 等待所有 worker 完成 (Acquire: 看到 done 后, 读到 worker 的内存写)
+        // ★ 热降频根治: main spin + yield 混合, 避免持续 spin 占满 main 核
+        //   (与 scatter_wait 一致, 见 scatter_wait 注释)
+        if n_dispatch > 0 {
+            let mut spun = 0;
+            while self.shared.done.load(Ordering::Acquire) < n_dispatch {
+                std::hint::spin_loop();
+                spun += 1;
+                if spun >= 4096 {
+                    std::thread::yield_now();
+                    spun = 0;
+                }
+            }
         }
     }
 
