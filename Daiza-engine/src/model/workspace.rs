@@ -200,10 +200,10 @@ fn worker_loop(shared: Arc<Shared>, tid: usize) {
             // gen 变化但 tid >= n_dispatch: 不是给我的 dispatch, 继续循环
         } else if tid >= n_active {
             // ★ idle worker: 深度 park, 0% CPU (避免 14 核全负载降频)
-            //   只有 set_active_workers 或 shutdown 会 unpark
-            //   park 返回后更新 last_gen, 避免执行过期 dispatch
+            //   被 unpark 唤醒后不更新 last_gen: 让 loop 顶部的 gen != last_gen 检查
+            //   决定是否执行任务 (scatter_wait 设置新 generation 后 unpark 会触发执行)
+            //   spurious wakeup 时 gen == last_gen, 再次 park (安全)
             std::thread::park();
-            last_gen = shared.generation.load(Ordering::Acquire);
         } else if use_park {
             // ★ active worker + park 模式 (短跑): spin + park
             let mut spun = 0;
@@ -306,10 +306,69 @@ impl ThreadPool {
             return;
         }
 
-        // ★ 限制活跃 worker 数: tid >= n_active 的 worker 深度 park, 不参与 dispatch
-        //   长跑时减少 active worker → 降低功耗 → 避免热降频
         let n_active = self.shared.n_active_workers.load(Ordering::Relaxed);
-        let n_dispatch = (n - 1).min(n_active);
+
+        // ★ dspark 性能修复: n > n_active+1 时用 stride 分块
+        //   原方案 (n_dispatch = n-1) 会唤醒 idle worker (tid >= n_active), 导致:
+        //   (1) park/unpark 开销 ~5μs × 5 idle workers = ~25μs/barrier
+        //   (2) idle worker 多为 E-core, 执行慢, 成为 stride 瓶颈
+        //   (3) dspark 每 forward ~257 barriers, 累积开销使 target forward 165→200ms (+21%)
+        //   stride 分块: n_active+1 个 executor (active workers + main) 按 stride 分担 n 个 chunk
+        //     - worker tid: 执行 f(tid), f(tid+stride), f(tid+2*stride), ...
+        //     - main (tid=n_active): 执行 f(n_active), f(n_active+stride), ...
+        //   优势: (1) 不唤醒 idle worker (避免 park/unpark + E-core 慢)
+        //         (2) 无 chunk 跳过 (stride 覆盖全部 i=0..n-1)
+        //         (3) 无 false sharing (f(i) 内部连续写 y[i*chunk..(i+1)*chunk], 不同 i 不重叠)
+        //         (4) 负载匹配 P/E core: P-core (tid 0..5) 做 2 个 chunk, E-core (tid 6..8) 做 1 个
+        //   注: f(i) 语义不变 — i 仍是虚拟 executor id, f 内部用 i 计算 start=i*chunk
+        if n > n_active + 1 {
+            let stride = n_active + 1;
+            let n_dispatch = n_active; // 只唤醒 n_active 个 active worker
+
+            self.shared.done.store(0, Ordering::Relaxed);
+
+            // 用 StrideCtx 把 shared 和 f 打包 (stride_trampoline 从 shared 读 n_total/stride)
+            let stride_ctx = StrideCtx {
+                shared: self.shared.as_ref() as *const Shared,
+                f: &f as *const F,
+            };
+            let ctx_ptr = &stride_ctx as *const StrideCtx<F> as *const ();
+            let tramp = stride_trampoline::<F> as *const () as usize;
+            self.shared.ctx.store(ctx_ptr as *mut (), Ordering::Relaxed);
+            self.shared.func.store(tramp, Ordering::Relaxed);
+            self.shared.n_dispatch.store(n_dispatch, Ordering::Relaxed);
+            self.shared.total_work.store(n, Ordering::Relaxed); // n_total = n
+
+            self.shared.generation.fetch_add(1, Ordering::Release);
+
+            for i in 0..n_dispatch {
+                self.threads[i].unpark();
+            }
+
+            // main 执行 stride 循环: f(n_active), f(n_active+stride), ...
+            let mut i = n_active;
+            while i < n {
+                f(i);
+                i += stride;
+            }
+
+            if n_dispatch > 0 {
+                let mut spun = 0;
+                while self.shared.done.load(Ordering::Acquire) < n_dispatch {
+                    std::hint::spin_loop();
+                    spun += 1;
+                    if spun >= 4096 {
+                        std::thread::yield_now();
+                        spun = 0;
+                    }
+                }
+            }
+            return;
+        }
+
+        // n <= n_active+1: 每个 executor 最多 1 个 chunk, 走原逻辑
+        // n_dispatch = n-1 (≤ n_active), 只唤醒 active worker, main 执行 chunk n-1
+        let n_dispatch = n - 1;
 
         // 重置完成计数 (上一轮 worker 已全部完成, 无竞争)
         self.shared.done.store(0, Ordering::Relaxed);
@@ -333,9 +392,6 @@ impl ThreadPool {
         f(n - 1);
 
         // 等待所有 worker 完成 (Acquire: 看到 done 后, 读到 worker 的内存写)
-        // ★ 热降频根治: main spin + yield 混合, 避免持续 spin 占满 main 核
-        //   纯 spin 让 main 核 100% 占用, 加剧 8 核热积累;
-        //   spin 4096 + yield 让 main 核有散热间隙, 功耗平滑
         if n_dispatch > 0 {
             let mut spun = 0;
             while self.shared.done.load(Ordering::Acquire) < n_dispatch {
@@ -477,6 +533,33 @@ fn steal_loop<F: Fn(usize, usize)>(shared: &Shared, f: &F) {
 struct StealCtx<F> {
     shared: *const Shared,
     f: *const F,
+}
+
+/// ★ Stride context: scatter_wait 在 n > n_active+1 时用 stride 分块
+///   worker tid 执行 f(tid), f(tid+stride), f(tid+2*stride), ... 直到 i >= n_total
+///   stride = n_active + 1 (active workers + main), n_total 存在 total_work 中
+#[repr(C)]
+struct StrideCtx<F> {
+    shared: *const Shared,
+    f: *const F,
+}
+
+/// ★ Stride trampoline: worker 调用此函数, 内部按 stride 循环执行 f(i)
+///   不 fetch_add done — done 由 worker_loop 统一处理 (与 trampoline 一致)
+#[allow(unsafe_code)]
+unsafe fn stride_trampoline<F: Fn(usize)>(ctx: *const (), tid: usize) {
+    let sc = &*(ctx as *const StrideCtx<F>);
+    let shared = &*sc.shared;
+    let f = &*sc.f;
+    // n_total 存在 total_work (复用 scatter_wait_stealing 的字段)
+    let n_total = shared.total_work.load(Ordering::Relaxed);
+    // stride = n_active + 1 (active workers + main)
+    let stride = shared.n_active_workers.load(Ordering::Relaxed) + 1;
+    let mut i = tid;
+    while i < n_total {
+        f(i);
+        i += stride;
+    }
 }
 
 /// Work-stealing trampoline: worker 调用此函数, 内部抢完所有 chunk 后返回

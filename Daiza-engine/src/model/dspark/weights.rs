@@ -97,9 +97,7 @@ impl DrafterMatrix {
                 let bytes_len = self.bytes.len();
                 let x_addr = x.as_ptr() as usize;
                 let y_addr = y.as_mut_ptr() as usize;
-                pool.scatter_wait(n_threads, move |tid| {
-                    let start = tid * chunk;
-                    let end = (start + chunk).min(n);
+                pool.scatter_wait_stealing(n, chunk, move |start, end| {
                     if start >= end { return; }
                     let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                     let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
@@ -144,9 +142,7 @@ impl DrafterMatrix {
                 let bytes_len = self.bytes.len();
                 let x_addr = x.as_ptr() as usize;
                 let y_addr = y.as_mut_ptr() as usize;
-                pool.scatter_wait(n_threads, move |tid| {
-                    let start = tid * chunk;
-                    let end = (start + chunk).min(n);
+                pool.scatter_wait_stealing(n, chunk, move |start, end| {
                     if start >= end { return; }
                     let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                     let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
@@ -221,9 +217,7 @@ impl DrafterMatrix {
                 let bytes_len = self.bytes.len();
                 let x_addr = x.as_ptr() as usize;
                 let y_addr = y.as_mut_ptr() as usize;
-                pool.scatter_wait(n_threads, move |tid| {
-                    let start = tid * chunk;
-                    let end = (start + chunk).min(n);
+                pool.scatter_wait_stealing(n, chunk, move |start, end| {
                     if start >= end { return; }
                     let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                     let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
@@ -267,9 +261,7 @@ impl DrafterMatrix {
                 let bytes_len = self.bytes.len();
                 let x_addr = x.as_ptr() as usize;
                 let y_addr = y.as_mut_ptr() as usize;
-                pool.scatter_wait(n_threads, move |tid| {
-                    let start = tid * chunk;
-                    let end = (start + chunk).min(n);
+                pool.scatter_wait_stealing(n, chunk, move |start, end| {
                     if start >= end { return; }
                     let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                     let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
@@ -364,9 +356,7 @@ impl DrafterMatrix {
                 let bytes_len = self.bytes.len();
                 let x_addr = x.as_ptr() as usize;
                 let y_addr = y.as_mut_ptr() as usize;
-                pool.scatter_wait(n_threads, move |tid| {
-                    let start = tid * chunk;
-                    let end = (start + chunk).min(n);
+                pool.scatter_wait_stealing(n, chunk, move |start, end| {
                     if start >= end { return; }
                     let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                     let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, n_batch * k) };
