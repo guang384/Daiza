@@ -1,18 +1,17 @@
 //! DSpark drafter 权重加载
 //!
-//! 权重量化格式:
+//! 权重量化格式 (dtype 映射已修正: 29=Iq1M, 30=Bf16):
 //! - Q4_1: attn_q/k/v/output, ffn_gate/up/down, fc, markov_head_b, output (LM head)
 //! - Q1_0: token_embd (与 target 共享)
-//! - Iq1M: markov_head_a, log_snr_fc1, log_snr_fc2
+//! - BF16: markov_head_a (W1), log_snr_fc1, log_snr_fc2
 //! - F32: norms, bias, output_norm
 //!
-//! 内存策略: Q4_1 和 Iq1M 权重保持原始字节, matvec 时逐行反量化。
-//! drafter 总权重 ~200MB (Q4_1) + ~80MB (Iq1M) = ~280MB。
+//! 内存策略: Q4_1 / BF16 权重保持原始字节, matvec 时逐行反量化。
 
 use crate::gguf::parser::GgufFile;
 use crate::gguf::tensor_info::TensorType;
 use crate::tensor::quant::{
-    dot_q4_1_row_scalar, dot_q1_0_row_scalar,
+    dot_q4_1_row_scalar, dot_q1_0_row_scalar, dot_bf16_row_scalar,
     avx2_q4_1_available,
 };
 #[cfg(target_arch = "x86_64")]
@@ -23,7 +22,7 @@ use crate::BonsaiError;
 
 use super::config::DrafterConfig;
 
-/// 通用量化矩阵 (支持 Q4_1 / Q1_0 / Iq1M / F32)
+/// 通用量化矩阵 (支持 Q4_1 / Q1_0 / Iq1M / Bf16 / F32)
 pub struct DrafterMatrix {
     pub bytes: Vec<u8>,
     pub rows: usize,
@@ -39,6 +38,7 @@ impl DrafterMatrix {
         // GGUF dims: dims[0] = cols (内层), dims[1] = rows (外层)
         let cols = info.dims[0] as usize;
         let rows = if info.dims.len() > 1 { info.dims[1] as usize } else { 1 };
+
         Ok(Self {
             bytes: data,
             rows,
@@ -57,6 +57,15 @@ impl DrafterMatrix {
         debug_assert_eq!(y.len(), self.rows);
         let n = self.rows;
         let k = self.cols;
+
+        // ★ Q8_PATH: Q4_1/Q1_0 weight × F32 input 时, llama.cpp 自动量化 input 为 Q8_0
+        // drafter 训练时也走 Q8_0 path, 故 drafter forward 也需量化 input 以匹配训练分布
+        let x_q8 = if matches!(self.dtype, TensorType::Q4_1 | TensorType::Q1_0) {
+            crate::model::weights::maybe_quantize_x_q8(x)
+        } else {
+            std::borrow::Cow::Borrowed(x)
+        };
+        let x = x_q8.as_ref();
 
         match self.dtype {
             TensorType::Q4_1 => {
@@ -119,6 +128,34 @@ impl DrafterMatrix {
                     y[i] = dot_iq1m_row_scalar(&self.bytes, i, k, x);
                 }
             }
+            TensorType::Bf16 => {
+                // BF16 行优先: 每 element 2 字节, 高 16 位 = f32 高 16 位
+                // 大矩阵 (markov_w1 127MB, log_snr_fc2_w 52MB) 走多线程
+                if n < 64 || get_thread_pool().is_none() {
+                    for i in 0..n {
+                        y[i] = dot_bf16_row_scalar(&self.bytes, i, k, x);
+                    }
+                    return;
+                }
+                let pool = get_thread_pool().unwrap();
+                let n_threads = pool.n_threads();
+                let chunk = (n + n_threads - 1) / n_threads;
+                let bytes_addr = self.bytes.as_ptr() as usize;
+                let bytes_len = self.bytes.len();
+                let x_addr = x.as_ptr() as usize;
+                let y_addr = y.as_mut_ptr() as usize;
+                pool.scatter_wait(n_threads, move |tid| {
+                    let start = tid * chunk;
+                    let end = (start + chunk).min(n);
+                    if start >= end { return; }
+                    let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
+                    let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
+                    for i in start..end {
+                        let v = dot_bf16_row_scalar(bytes, i, k, x);
+                        unsafe { *((y_addr as *mut f32).add(i)) = v; }
+                    }
+                });
+            }
             TensorType::F32 => {
                 // F32 行优先: bytes 当 f32 读
                 for i in 0..n {
@@ -147,6 +184,14 @@ impl DrafterMatrix {
         debug_assert_eq!(y.len(), self.rows);
         let n = self.rows;
         let k = self.cols;
+
+        // ★ Q8_PATH: Q4_1/Q1_0 weight × F32 input 时, llama.cpp 自动量化 input 为 Q8_0
+        let x_q8 = if matches!(self.dtype, TensorType::Q4_1 | TensorType::Q1_0) {
+            crate::model::weights::maybe_quantize_x_q8(x)
+        } else {
+            std::borrow::Cow::Borrowed(x)
+        };
+        let x = x_q8.as_ref();
 
         match self.dtype {
             TensorType::Q4_1 => {
@@ -208,6 +253,32 @@ impl DrafterMatrix {
                     y[i] += dot_iq1m_row_scalar(&self.bytes, i, k, x);
                 }
             }
+            TensorType::Bf16 => {
+                if n < 64 || get_thread_pool().is_none() {
+                    for i in 0..n {
+                        y[i] += dot_bf16_row_scalar(&self.bytes, i, k, x);
+                    }
+                    return;
+                }
+                let pool = get_thread_pool().unwrap();
+                let n_threads = pool.n_threads();
+                let chunk = (n + n_threads - 1) / n_threads;
+                let bytes_addr = self.bytes.as_ptr() as usize;
+                let bytes_len = self.bytes.len();
+                let x_addr = x.as_ptr() as usize;
+                let y_addr = y.as_mut_ptr() as usize;
+                pool.scatter_wait(n_threads, move |tid| {
+                    let start = tid * chunk;
+                    let end = (start + chunk).min(n);
+                    if start >= end { return; }
+                    let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
+                    let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
+                    for i in start..end {
+                        let v = dot_bf16_row_scalar(bytes, i, k, x);
+                        unsafe { *((y_addr as *mut f32).add(i)) += v; }
+                    }
+                });
+            }
             TensorType::F32 => {
                 for i in 0..n {
                     let row_off = i * k * 4;
@@ -246,6 +317,15 @@ impl DrafterMatrix {
         }
         let n = self.rows;
         let k = self.cols;
+
+        // ★ Q8_PATH: Q4_1/Q1_0 weight × F32 input 时, llama.cpp 自动量化 input 为 Q8_0
+        // Q8_0 是 per-32-element block, cols 是 32 的倍数, 可直接对整个 x 量化
+        let x_q8 = if matches!(self.dtype, TensorType::Q4_1 | TensorType::Q1_0) {
+            crate::model::weights::maybe_quantize_x_q8(x)
+        } else {
+            std::borrow::Cow::Borrowed(x)
+        };
+        let x = x_q8.as_ref();
 
         match self.dtype {
             TensorType::Q4_1 => {
@@ -383,15 +463,15 @@ pub struct DrafterWeights {
     pub fc: DrafterMatrix,
     /// target hidden state norm [hidden] F32
     pub hidden_norm: F32Vec,
-    /// log-SNR FC1 weight [hidden, n_freq=128] Iq1M
+    /// log-SNR FC1 weight [hidden, n_freq=128] BF16
     pub log_snr_fc1_w: DrafterMatrix,
     /// log-SNR FC1 bias [hidden] F32
     pub log_snr_fc1_b: F32Vec,
-    /// log-SNR FC2 weight [hidden, hidden] Iq1M
+    /// log-SNR FC2 weight [hidden, hidden] BF16
     pub log_snr_fc2_w: DrafterMatrix,
     /// log-SNR FC2 bias [hidden] F32
     pub log_snr_fc2_b: F32Vec,
-    /// Markov head W1 [vocab, rank=256] Iq1M (prev-token embedding)
+    /// Markov head W1 [vocab, rank=256] BF16 (prev-token embedding)
     pub markov_w1: DrafterMatrix,
     /// Markov head W2 [vocab, rank=256] Q4_1 (output projection)
     pub markov_w2: DrafterMatrix,
@@ -413,6 +493,7 @@ impl DrafterWeights {
         let output_norm = F32Vec::from_gguf(gguf, "output_norm.weight")?;
         let output = DrafterMatrix::from_gguf(gguf, "output.weight")?;
         let fc = DrafterMatrix::from_gguf(gguf, "dspark.fc.weight")?;
+
         let hidden_norm = F32Vec::from_gguf(gguf, "dspark.hidden_norm.weight")?;
         let log_snr_fc1_w = DrafterMatrix::from_gguf(gguf, "dspark.log_snr_fc1.weight")?;
         let log_snr_fc1_b = F32Vec::from_gguf(gguf, "dspark.log_snr_fc1.bias")?;

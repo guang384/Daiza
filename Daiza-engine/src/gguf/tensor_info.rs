@@ -34,8 +34,8 @@ pub enum TensorType {
     Q8K,    // 15
     Iq2Xxs, // 24
     Iq1S,   // 28
-    Iq1M,   // 30
-    Bf16,   // 33  - bfloat16(在 dspark 文件中实测出现)
+    Iq1M,   // 29
+    Bf16,   // 30  - bfloat16(标准 ggml: GGML_TYPE_BF16=30)
     /// Bonsai 自定义二值格式:128 权重 = 2 字节 FP16 scale + 16 字节符号位
     /// = 18 字节 / 128 权重 = 1.125 bits/weight
     Q1_0,   // 41
@@ -61,8 +61,8 @@ impl TensorType {
             15 => Self::Q8K,
             24 => Self::Iq2Xxs,
             28 => Self::Iq1S,
-            30 => Self::Iq1M,
-            33 => Self::Bf16,
+            29 => Self::Iq1M,
+            30 => Self::Bf16,
             41 => Self::Q1_0,
             _ => Self::Unknown(v),
         }
@@ -85,8 +85,8 @@ impl TensorType {
             Self::Q8K => 15,
             Self::Iq2Xxs => 24,
             Self::Iq1S => 28,
-            Self::Iq1M => 30,
-            Self::Bf16 => 33,
+            Self::Iq1M => 29,
+            Self::Bf16 => 30,
             Self::Q1_0 => 41,
             Self::Unknown(v) => v,
         }

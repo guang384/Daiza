@@ -13,7 +13,7 @@
 //! prev_token = out[k]   // 链式: 下一位置用本位置采样结果作为 prev
 //! ```
 //!
-//! `W1` (markov_head_a, [vocab, rank=256] Iq1M) 提供 prev-token 的 256 维
+//! `W1` (markov_head_a, [vocab, rank=256] BF16) 提供 prev-token 的 256 维
 //! embedding; `W2` (markov_head_b, [vocab, rank=256] Q4_1) 把它投影回 vocab
 //! 空间。加法 bias 一次 resample 一个位置, 顺序链式。
 //!
@@ -22,7 +22,7 @@
 //! 由 `speculative.rs` 在 `draft_forward` 后调用, 接收 base_logits 并返回
 //! resampled 的 block_size 个 token IDs + 每位置的 confidence (供调度用)。
 
-use crate::tensor::iq1m::dequantize_iq1m_row_into;
+use crate::tensor::quant::dequantize_bf16_row_into;
 
 use super::config::DrafterConfig;
 use super::weights::DrafterWeights;
@@ -88,8 +88,8 @@ impl MarkovContext {
 
         for k in 0..bs {
             // Step 1: 抽取 prev-token 的 256 维 embedding (W1[prev_token])
-            // markov_w1: [vocab, rank] Iq1M, 行 = prev_token
-            dequantize_iq1m_row_into(
+            // markov_w1: [vocab, rank] BF16, 行 = prev_token
+            dequantize_bf16_row_into(
                 &weights.markov_w1.bytes,
                 prev_token as usize,
                 rank,
@@ -107,13 +107,18 @@ impl MarkovContext {
             // Step 3: step_logit = base_logit[k] + markov_bias (AVX2 add, 单 pass)
             // ★ P2: 用 add_avx2 单 pass 替代 copy_from_slice + saxpy_avx2 两 pass
             //   vocab=248320, 4 位置/cycle, 内存 traffic 从 4MB 降到 3MB (-25%)
+            // DAIZA_DSPARK_NO_MARKOV=1: 禁用 markov bias, 直接用 base_logits (调试用)
             let base_row = &base_logits[k * vocab..(k + 1) * vocab];
-            crate::math::simd_exp::add_avx2(
-                base_row,
-                &self.markov_bias[..vocab],
-                &mut self.step_logit[..vocab],
-                vocab,
-            );
+            if std::env::var("DAIZA_DSPARK_NO_MARKOV").is_ok() {
+                self.step_logit[..vocab].copy_from_slice(base_row);
+            } else {
+                crate::math::simd_exp::add_avx2(
+                    base_row,
+                    &self.markov_bias[..vocab],
+                    &mut self.step_logit[..vocab],
+                    vocab,
+                );
+            }
 
             // Step 4: argmax → best_id
             // ★ P6: AVX2 向量化 argmax

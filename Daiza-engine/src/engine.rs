@@ -314,7 +314,12 @@ impl Engine {
         }
 
         // 1. 构造输入
-        let chat_text = build_chat_input(prompt, system_prompt);
+        // ★ DAIZA_DSPARK_RAW=1: 用 raw prompt (不走 chat template), 对齐 llama.cpp test-dspark-real-eval
+        let chat_text = if std::env::var("DAIZA_DSPARK_RAW").is_ok() {
+            prompt.to_string()
+        } else {
+            build_chat_input(prompt, system_prompt)
+        };
         eprintln!("[debug] input text: {chat_text:?}");
         let input_ids = self.tokenizer.encode(&chat_text);
         eprintln!("[debug] input_ids count: {}", input_ids.len());
@@ -342,16 +347,21 @@ impl Engine {
             eprintln!("[dspark] target tap layers: {:?}", ctx.hidden_tap_layers);
         }
 
-        // 4. prefill
+        // 4. prefill (对齐 llama.cpp speculative-simple.cpp L210-216:
+        //    forward N-1 tokens, 最后一个 token 作为 anchor/id_last, 不 forward)
+        //    Daiza 之前是 forward N tokens + sample generated anchor + forward anchor,
+        //    与 llama.cpp 语义不一致, 导致 context 多 1 行 + start_pos 偏移 1, 接受率降。
         let n_input = input_ids.len();
         let prefill_start = std::time::Instant::now();
-        if n_input == 1 {
-            forward_single_token(&mut ctx, input_ids[0])?;
-        } else if n_input > 1 {
-            forward_batch(&mut ctx, &input_ids, 0, None)?;
+        if n_input >= 2 {
+            // prefill 前 N-1 tokens (去掉最后一个作为 anchor)
+            let prefill_ids = &input_ids[..n_input - 1];
+            forward_batch(&mut ctx, prefill_ids, 0, None)?;
         }
+        // n_input == 1: 无 prefill, anchor = input_ids[0], 稍后 forward
         let prefill_ms = prefill_start.elapsed().as_millis();
-        eprintln!("\r[prefill] {n_input}/{n_input} done in {prefill_ms}ms");
+        let n_prefill = if n_input >= 2 { n_input - 1 } else { 0 };
+        eprintln!("\r[prefill] {n_prefill}/{n_input} done in {prefill_ms}ms");
 
         // 5. DSpark decode 循环
         let mut rng = LcgRng::new(0xC0FFEE);
@@ -367,23 +377,14 @@ impl Engine {
 
         // prefill 阶段: forward_batch 已捕获 hidden_tap_batch_buf [n_batch, n_tap, hidden]
         // 累积到 history (行优先 token-major, 与 set_target_tap 期望一致)
-        if n_input > 1 {
+        if n_input >= 2 {
             target_tap_history.extend_from_slice(&ctx.hidden_tap_batch_buf);
-        } else if n_input == 1 {
-            // forward_single_token 已写入 hidden_tap_buf (1 行)
-            target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
         }
 
-        // prefill 后第一个 token: 从 target logits 采样 (anchor)
-        let anchor_raw = sample_top_k_top_p_into(
-            &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
-        );
-        let mut anchor_token = anchor_raw as u32;
-        if anchor_token == self.config.eos_token_id {
-            return Ok(String::new());
-        }
-        generated_ids.push(anchor_token);
-        // forward anchor 以获取其 hidden tap + 更新 cache
+        // anchor = 最后一个 prefill token (对齐 llama.cpp: id_last = inp.back())
+        // 不 sample, 不加入 generated_ids (anchor 不是生成的 token)
+        let mut anchor_token = input_ids[n_input - 1];
+        // forward anchor 以获取其 hidden tap + 更新 cache + 产生 logits for draft[0]
         forward_single_token(&mut ctx, anchor_token)?;
         // 累积 anchor 的 hidden tap
         target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
@@ -415,20 +416,23 @@ impl Engine {
                 let spec = self.spec_ctx.as_mut().unwrap();
                 // 位置语义 (对齐 llama.cpp dspark speculative.cpp):
                 //   context 行 = target hidden tap [L, ..., start-1] (不含 anchor)
-                //   draft[0] = anchor token at position `start` (= ctx_len)
+                //   draft[0] = anchor token at position `start` (绝对位置)
                 //   draft[k] = mask token at position start + k
                 // 因此:
                 //   ctx_len   = history_rows - 1 (排除最后 1 行 anchor 的 hidden tap)
-                //   start_pos = ctx_len          (anchor 的绝对位置 = ctx_len)
-                // 注: ctx.state.pos = anchor_pos + 1 (anchor forward 后已递增),
-                //     不能直接用 ctx.state.pos 作为 start_pos (会偏大 1)。
+                //   start_pos = anchor 的绝对位置 = ctx.state.pos - 1
+                //     (anchor forward 后 ctx.state.pos 已递增到 anchor_pos + 1)
+                // ★ 对齐 llama.cpp: drafter RoPE 用绝对位置 (L+row for context, start+k for draft)
+                //   其中 L = start - ctx_len = 上一 cycle 的 start。Daiza history 滑动窗口后
+                //   ctx_len 变小 (3-5),若 start_pos = ctx_len (相对位置) 会与 target 绝对位置
+                //   严重偏移,导致 RoPE 频率错误 → 接受率下降。
                 let history_rows = target_tap_history.len() / n_embd_cap;
-                let ctx_len = history_rows - 1;
-                let start_pos = ctx_len;
-                spec.set_target_tap(
-                    &target_tap_history[..ctx_len * n_embd_cap],
-                    ctx_len,
-                );
+            let ctx_len = history_rows - 1;
+            let start_pos = ctx.state.pos - 1;
+            spec.set_target_tap(
+                &target_tap_history[..ctx_len * n_embd_cap],
+                ctx_len,
+            );
                 let dt = spec.draft(anchor_token, start_pos).to_vec();
                 draft_tokens = dt;
             }
@@ -466,20 +470,8 @@ impl Engine {
                 let draft_logits_i = &self.spec_ctx.as_ref().unwrap().draft_logits
                     [i * cfg.vocab_size..(i + 1) * cfg.vocab_size];
 
-                // debug: 打印 target top-1 vs draft token
-                if std::env::var("DAIZA_DSPARK_DEBUG").is_ok() {
-                    let mut target_top = (0u32, f32::NEG_INFINITY);
-                    for (tid, &l) in target_logits_i.iter().enumerate() {
-                        if l > target_top.1 { target_top = (tid as u32, l); }
-                    }
-                    let dt_tok = self.tokenizer.vocab.tokens.get(dt as usize).cloned().unwrap_or_default();
-                    let tt_tok = self.tokenizer.vocab.tokens.get(target_top.0 as usize).cloned().unwrap_or_default();
-                    eprintln!("[dspark-debug] pos={} draft[{i}]={dt}({dt_tok:?}) target_argmax={tt}({tt_tok:?})",
-                        pos_before + i, tt = target_top.0);
-                }
-
                 let accepted = leviathan_check(
-                    target_logits_i, draft_logits_i, dt, &mut || rng.next_f32(),
+                    target_logits_i, draft_logits_i, dt, params, &mut || rng.next_f32(),
                 );
 
                 if !accepted {
@@ -545,6 +537,12 @@ impl Engine {
             t_bonus += bonus_start.elapsed().as_millis();
 
             total_accepted += n_accepted;
+
+            // ★ 滑动窗口 drain 已禁用: 实测 drain (keep n_accepted+2) 接受率 71.2%
+            //   反而比不 drain 77.1% 更差 (drain 后某些 cycle draft 全被拒, rounds 反而更多)。
+            //   Daiza 的累积 history 语义与 llama.cpp ctx_feat 滑动窗口不等价,
+            //   需要 drain + 绝对位置 + 完整 start_pos 对齐才能匹配, 当前不 drain 更优。
+            //   详见 project_memory lessons learned。
 
             if generated_ids.len() >= max_tokens {
                 break;
@@ -739,17 +737,40 @@ fn build_chat_input(user_prompt: &str, system_prompt: Option<&str>) -> String {
 ///
 /// 返回 true = 接受 draft_token, false = 拒绝
 ///
+/// **greedy 模式** (params.temperature == 0): 直接比较 argmax,
+///   draft_token == target_argmax 则接受, 否则拒绝。
+///   与 llama.cpp dspark (target verify temp=0) 行为一致。
+///   Q1_0 量化下 target logits 峰值被压低, softmax(p[dt]/q[dt]) 随机接受
+///   会错误拒绝正确 draft (Daiza 41.5% vs llama.cpp 95.83% 接受率的根因)。
+///
+/// **采样模式** (params.temperature > 0): 标准 Leviathan 随机接受
+///   `u < p[dt] / q[dt]`, 接受后 bonus 从 residual=max(0, p-q) 采样。
+///
 /// ★ 优化: 只计算 p[dt] 和 q[dt], 避免全量 softmax 分配 [vocab] 两次 (~2MB/call)
 fn leviathan_check(
     target_logits: &[f32],
     draft_logits: &[f32],
     draft_token: u32,
+    params: SamplingParams,
     rng: &mut dyn FnMut() -> f32,
 ) -> bool {
     debug_assert_eq!(draft_logits.len(), target_logits.len());
     let dt = draft_token as usize;
 
-    // p[dt] = exp(t[dt] - max_t) / sum_t  (只算 dt 位置, 避免全量 softmax)
+    // greedy 模式: argmax 比较 (与 llama.cpp dspark target verify temp=0 一致)
+    if params.temperature <= 0.0 {
+        let mut target_argmax = 0usize;
+        let mut target_max = f32::NEG_INFINITY;
+        for (i, &l) in target_logits.iter().enumerate() {
+            if l > target_max {
+                target_max = l;
+                target_argmax = i;
+            }
+        }
+        return target_argmax == dt;
+    }
+
+    // 采样模式: 标准 Leviathan 随机接受 u < p[dt]/q[dt]
     let (p_dt, _) = softmax_single(target_logits, dt);
     let (q_dt, _) = softmax_single(draft_logits, dt);
 

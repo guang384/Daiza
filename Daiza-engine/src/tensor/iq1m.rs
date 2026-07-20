@@ -568,6 +568,30 @@ pub fn dequantize_iq1m(data: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
+/// 反量化整个 IQ1_M 张量到 F32 Vec (按物理存储顺序, 支持任意 cols)
+///
+/// 当 cols 不是 256 的倍数时, 行边界与 block 边界不对齐, 不能用
+/// `dequantize_iq1m_row_into` 按行反量化。此函数按整个张量的物理存储
+/// 顺序反量化所有 block, 然后截断到 n_elements。
+///
+/// - `data`: 整个 IQ1_M 张量的字节
+/// - `n_elements`: 张量总元素数 (rows * cols)
+/// - 返回: F32 Vec, 长度 = n_elements, 按 row-major 存储
+pub fn dequantize_iq1m_tensor(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let blocks = n_elements.div_ceil(IQ1M_GROUP_SIZE);
+    let mut out: Vec<f32> = Vec::with_capacity(blocks * IQ1M_GROUP_SIZE);
+    for b in 0..blocks {
+        let bs = b * IQ1M_BLOCK_BYTES;
+        if bs + IQ1M_BLOCK_BYTES > data.len() {
+            break;
+        }
+        let block = &data[bs..bs + IQ1M_BLOCK_BYTES];
+        dequantize_block_into(block, &mut out);
+    }
+    out.truncate(n_elements);
+    out
+}
+
 /// 反量化 IQ1_M 单行, 写入 caller 提供的 slice (用于 matvec, 避免分配)
 ///
 /// - `data`: 整个 IQ1_M 张量的字节

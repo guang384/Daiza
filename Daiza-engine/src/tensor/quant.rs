@@ -1071,6 +1071,50 @@ pub fn dequantize_q4_1_row_into(data: &[u8], row_idx: usize, n_cols: usize, out:
     }
 }
 
+/// BF16 按行反量化: 读取 row_idx 行的 n_cols 个 BF16 元素, 转为 F32 写入 out
+///
+/// BF16 布局: sign(1) | exponent(8, bias=127) | mantissa(7) — 等于 f32 的高 16 位
+pub fn dequantize_bf16_row_into(data: &[u8], row_idx: usize, n_cols: usize, out: &mut [f32]) {
+    debug_assert!(out.len() >= n_cols);
+    let row_byte_offset = row_idx * n_cols * 2;
+    if row_byte_offset + n_cols * 2 > data.len() {
+        for v in out[..n_cols].iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    for j in 0..n_cols {
+        let bits = u16::from_le_bytes([
+            data[row_byte_offset + j * 2],
+            data[row_byte_offset + j * 2 + 1],
+        ]);
+        out[j] = f32::from_bits((bits as u32) << 16);
+    }
+}
+
+/// BF16 matvec 标量实现: y = W_row · x
+///
+/// 用于 drafter 的 BF16 矩阵 (markov_w1, log_snr_fc1_w, log_snr_fc2_w)。
+/// 大矩阵的多线程并行由 `DrafterMatrix::matvec_into_slice` 负责。
+#[inline]
+pub fn dot_bf16_row_scalar(data: &[u8], row_idx: usize, n_cols: usize, x: &[f32]) -> f32 {
+    debug_assert!(x.len() >= n_cols);
+    let row_byte_offset = row_idx * n_cols * 2;
+    let mut acc = 0.0f32;
+    if row_byte_offset + n_cols * 2 > data.len() {
+        return 0.0;
+    }
+    for j in 0..n_cols {
+        let bits = u16::from_le_bytes([
+            data[row_byte_offset + j * 2],
+            data[row_byte_offset + j * 2 + 1],
+        ]);
+        let w = f32::from_bits((bits as u32) << 16);
+        acc += w * x[j];
+    }
+    acc
+}
+
 /// Q4_1 matvec 标量实现 (正确性优先, drafter 权重小性能不敏感)
 ///
 /// y[i] = sum_g sum_{j=0..32} (m_g + d_g * q_j) * x[g*32 + j],  q_j ∈ [0, 15]
@@ -1384,5 +1428,41 @@ pub fn dot_q4_1_row_batch(
     for t in 0..n_batch {
         let xt = &x[t * x_stride..t * x_stride + n_cols];
         y[t * y_stride + row_idx] = dot_q4_1_row_scalar(data, row_idx, n_cols, xt);
+    }
+}
+
+/// ★ Q8_0 量化-反量化: 模拟 llama.cpp 的 F32→Q8_0→F32 路径
+///
+/// llama.cpp 在 Q1_0/Q4_0/Q4_1 等量化 weight × F32 input 时, 会自动调用
+/// `quantize_row_q8_0` 把 F32 input 量化为 Q8_0 (per-32-element block),
+/// 然后用量化后的 Q8_0 做点积。这引入 ~0.5% 的量化误差。
+///
+/// Daiza 原本直接用 F32 input 做点积 (无量化误差), 导致 target hidden state
+/// 比 llama.cpp "更精确", 但 drafter 是用 llama.cpp (Q8_0 path) 训练的,
+/// 看到的 tap 分布与训练时不匹配, 导致接受率从 95% 降到 75%。
+///
+/// 本函数把 F32 x 量化为 Q8_0 再反量化回 F32, 引入与 llama.cpp 相同的量化误差,
+/// 使 target tap 与 drafter 训练分布一致。
+///
+/// Q8_0 格式: 32 元素/block, `d = amax / 127`, `qs[i] = round(x[i] / d)`,
+/// 反量化 `x' = qs[i] * d`。
+pub fn quantize_dequantize_q8_0_into(x: &[f32], y: &mut [f32]) {
+    debug_assert_eq!(x.len(), y.len());
+    debug_assert!(x.len() % 32 == 0, "Q8_0 requires len % 32 == 0, got {}", x.len());
+    let n_blocks = x.len() / 32;
+    for b in 0..n_blocks {
+        let off = b * 32;
+        let mut amax = 0.0f32;
+        for j in 0..32 {
+            let ax = x[off + j].abs();
+            if ax > amax {
+                amax = ax;
+            }
+        }
+        let d = amax / 127.0;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        for j in 0..32 {
+            y[off + j] = (x[off + j] * id).round() * d;
+        }
     }
 }

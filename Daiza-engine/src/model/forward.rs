@@ -184,6 +184,14 @@ pub fn forward_single_token(
             && blk_idx == ctx.hidden_tap_layers[tap_idx] {
             let off = tap_idx * hidden;
             ctx.hidden_tap_buf[off..off + hidden].copy_from_slice(&ctx.h_buf[..hidden]);
+            // ★ DAIZA_DUMP_TAP: dump 当前 token 在每个 tap layer 的前 16 个值
+            //   用于与 llama.cpp 逐值对比, 判断 Q1_0 target model 实现是否一致
+            if std::env::var("DAIZA_DUMP_TAP").is_ok() {
+                let h0 = &ctx.h_buf[..hidden];
+                let tap_layer = ctx.hidden_tap_layers[tap_idx];
+                eprintln!("[dump-tap-single] blk_idx={blk_idx} tap_idx={tap_idx} layer={tap_layer} first16: {first16:?}",
+                    first16 = &h0[..16.min(hidden)]);
+            }
             tap_idx += 1;
         }
 
@@ -693,6 +701,14 @@ pub fn forward_batch(
                     let src = &ctx.h_buf[t * hidden..(t + 1) * hidden];
                     let dst_off = (t * n_tap + tap_idx) * hidden;
                     ctx.hidden_tap_batch_buf[dst_off..dst_off + hidden].copy_from_slice(src);
+                }
+                // ★ DAIZA_DUMP_TAP: dump 最后 token 在每个 tap layer 的前 16 个值
+                //   用于与 llama.cpp 逐值对比, 判断 Q1_0 target model 实现是否一致
+                if std::env::var("DAIZA_DUMP_TAP").is_ok() {
+                    let hL = &ctx.h_buf[(n_batch - 1) * hidden..n_batch * hidden];
+                    eprintln!("[dump-tap] blk_idx={blk_idx} tap_idx={tap_idx} token[last={n_batch_minus_1}] first16: {first16:?}",
+                        n_batch_minus_1 = n_batch - 1,
+                        first16 = &hL[..16.min(hidden)]);
                 }
             }
         }

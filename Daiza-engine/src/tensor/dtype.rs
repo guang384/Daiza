@@ -19,6 +19,11 @@ pub const Q4_1_GROUP_SIZE: usize = 32;
 /// Q4_1 一组的字节数:2 字节 scale + 2 字节 min + 16 字节 packed(32 × 4 bit)
 pub const Q4_1_BLOCK_BYTES: usize = 20;
 
+/// IQ1_M 一组的元素数:256 权重共享 56 字节 block (1.75 bpw)
+pub const IQ1M_GROUP_SIZE_DTYPE: usize = 256;
+/// IQ1_M 一组的字节数:qs[32] + qh[16] + scales[8] = 56
+pub const IQ1M_BLOCK_BYTES_DTYPE: usize = 56;
+
 /// 给定 dtype 和元素总数,返回该张量在文件中的字节数
 pub fn byte_size(dtype: TensorType, n_elements: u64) -> usize {
     match dtype {
@@ -42,6 +47,11 @@ pub fn byte_size(dtype: TensorType, n_elements: u64) -> usize {
                 _ => unreachable!(),
             };
             (groups as usize) * per_block
+        }
+        TensorType::Iq1M => {
+            // 256 weights/block: qs[32] + qh[16] + scales[8] = 56 bytes (1.75 bpw)
+            let groups = n_elements.div_ceil(IQ1M_GROUP_SIZE_DTYPE as u64);
+            (groups as usize) * IQ1M_BLOCK_BYTES_DTYPE
         }
         _ => {
             // 学习项目:暂只支持上面几种,其他在加载时报错

@@ -14,6 +14,7 @@ use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::load_as_f32;
 use crate::tensor::quant::{
     avx2_q1_0_available, dot_q1_0_row_batch, dot_q1_0_row_scalar,
+    quantize_dequantize_q8_0_into,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::tensor::quant::{
@@ -21,6 +22,29 @@ use crate::tensor::quant::{
     dot_q1_0_row_dual_avx2, dot_q1_0_row_triple_avx2, dot_q1_0_row_quad_avx2,
 };
 use crate::BonsaiError;
+
+/// ★ Q8_0 量化路径开关: 模拟 llama.cpp 的 F32→Q8_0 量化误差
+///
+/// llama.cpp 在 Q1_0 weight × F32 input 时, 自动把 input 量化为 Q8_0 (per-32-block),
+/// 引入 ~0.5% 量化误差。Daiza 原本直接用 F32 input, 导致 target tap 比 llama.cpp "更精确",
+/// 但 drafter 是用 llama.cpp (Q8_0 path) 训练的, 看到的 tap 分布与训练时不匹配,
+/// 接受率从 95% 降到 75%。启用 DAIZA_Q8_PATH=1 后, Daiza 也走 Q8_0 量化路径, 使分布一致。
+fn q8_path_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("DAIZA_Q8_PATH").is_ok())
+}
+
+/// 如果 Q8_PATH 启用, 把 x 量化为 Q8_0 再反量化回 F32 (引入量化误差), 返回 Cow::Owned
+/// 否则返回 Cow::Borrowed(x), 零开销
+pub(crate) fn maybe_quantize_x_q8<'a>(x: &'a [f32]) -> std::borrow::Cow<'a, [f32]> {
+    if !q8_path_enabled() {
+        return std::borrow::Cow::Borrowed(x);
+    }
+    let mut x_q = vec![0.0f32; x.len()];
+    quantize_dequantize_q8_0_into(x, &mut x_q);
+    std::borrow::Cow::Owned(x_q)
+}
 
 /// Q1_0 编码的矩阵(保留原始字节,按需反量化单行)
 pub struct Q1_0Matrix {
@@ -66,6 +90,10 @@ impl Q1_0Matrix {
         let n = self.rows;
         debug_assert_eq!(x.len(), k);
         debug_assert_eq!(y.len(), n);
+
+        // ★ Q8_PATH: 模拟 llama.cpp 的 F32→Q8_0 量化误差, 使 target tap 与 drafter 训练分布一致
+        let x_q8 = maybe_quantize_x_q8(x);
+        let x = x_q8.as_ref();
 
         let n_threads = crate::model::workspace::thread_count();
         // ★ P2-1: runtime AVX2 check 提到循环外, 避免每行 dot_q1_0_row 内部重复检测
@@ -203,6 +231,10 @@ impl Q1_0Matrix {
         let n = self.rows;
         debug_assert_eq!(x.len(), k);
         debug_assert_eq!(y.len(), n);
+
+        // ★ Q8_PATH: 模拟 llama.cpp 的 F32→Q8_0 量化误差, 使 target tap 与 drafter 训练分布一致
+        let x_q8 = maybe_quantize_x_q8(x);
+        let x = x_q8.as_ref();
 
         let n_threads = crate::model::workspace::thread_count();
         // ★ P2-1: runtime AVX2 check 提到循环外
@@ -345,6 +377,11 @@ impl Q1_0Matrix {
             self.matvec_into_slice(x, &mut y[..n]);
             return;
         }
+
+        // ★ Q8_PATH: 模拟 llama.cpp 的 F32→Q8_0 量化误差, 使 target tap 与 drafter 训练分布一致
+        // Q8_0 是 per-32-element block, n_cols=5120 是 32 的倍数, 可直接对整个 x 量化
+        let x_q8 = maybe_quantize_x_q8(x);
+        let x = x_q8.as_ref();
 
         let n_threads = crate::model::workspace::thread_count();
         // ★ P2-1: runtime AVX2 check 提到循环外

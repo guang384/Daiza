@@ -64,7 +64,7 @@ pub struct DrafterContext {
     pub rope_freqs: Vec<f32>,
     /// ★ log_snr 缓存标志: ws_snr_embed 只依赖 cfg (max/min_log_snr, fc1/fc2 权重),
     /// 跨 draft_forward call 完全不变。首次 compute_log_snr 后置 true, 后续直接复用。
-    /// FC2 是 Iq1M 标量 matvec [5120,5120]×4 = 105M FMA, 缓存后节省 ~30-50ms/call。
+    /// FC2 是 BF16 标量 matvec [5120,5120]×4 = 105M FMA, 缓存后节省 ~30-50ms/call。
     pub snr_computed: bool,
     /// ★ Confidence head 输入: RMSNorm 之前的 drafter hidden state [bs * hidden]
     /// 在 output RMSNorm 之前 copy ws_hidden → ws_confidence_hidden, 供 confidence head 用。
@@ -135,7 +135,7 @@ impl DrafterContext {
     /// log_snr: pos=0 (anchor) 用 max_log_snr, pos>0 (mask) 用 min_log_snr
     ///
     /// ★ 缓存优化: 输出 ws_snr_embed 只依赖 cfg (固定), 跨 draft_forward call 不变。
-    ///   首次调用计算并缓存, 后续直接返回。FC2 是 Iq1M 标量 [5120,5120]×4 = 105M FMA,
+    ///   首次调用计算并缓存, 后续直接返回。FC2 是 BF16 标量 [5120,5120]×4 = 105M FMA,
     ///   缓存后节省 ~30-50ms/call (70 calls = 2-3.5s 总节省)。
     fn compute_log_snr(&mut self) {
         // ★ 缓存: ws_snr_embed 只依赖 cfg (max/min_log_snr, fc1/fc2 权重, bias),
@@ -232,7 +232,8 @@ impl DrafterContext {
 
         // ★ K/V cache 回退保护: 若 ctx_len < cached_kv_len (异常, 理论不发生),
         // 重置缓存标志, 全量重算 (与 fc cache 的回退保护一致)。
-        if ctx_len < self.cached_kv_len {
+        // ★ DAIZA_DSPARK_NO_KV_CACHE=1: 强制禁用 K/V cache 复用 (A/B 测试用)
+        if ctx_len < self.cached_kv_len || std::env::var("DAIZA_DSPARK_NO_KV_CACHE").is_ok() {
             self.cached_kv_len = 0;
         }
 
@@ -251,7 +252,8 @@ impl DrafterContext {
         let t_emb = t0.map(|t| t.elapsed().as_millis());
 
         // 2. Log-SNR conditioning: snr_embed 加到 embedding (AVX2 saxpy)
-        let t_snr = if log_snr_conditioning {
+        //    DAIZA_DSPARK_NO_SNR=1 禁用 (调试用, 隔离 snr 是否有 bug)
+        let t_snr = if log_snr_conditioning && std::env::var("DAIZA_DSPARK_NO_SNR").is_err() {
             let t = if profile { Some(std::time::Instant::now()) } else { None };
             self.compute_log_snr();
             crate::math::simd_exp::saxpy_avx2(1.0, &self.ws_snr_embed[..bs * h], &mut self.ws_embd[..bs * h], bs * h);
@@ -274,7 +276,7 @@ impl DrafterContext {
             debug_assert_eq!(fc.rows, h);
             let hidden_norm = &self.weights.hidden_norm.data;
 
-            if ctx_len < self.cached_ctx_len {
+            if ctx_len < self.cached_ctx_len || std::env::var("DAIZA_DSPARK_NO_FC_CACHE").is_ok() {
                 // ctx_len 回退 (异常): 重置缓存, 全量重投影
                 self.cached_ctx_len = 0;
             }
@@ -433,9 +435,12 @@ impl DrafterContext {
         }
 
         // Step 3: Q/K per-head RMSNorm + RoPE
-        // 位置语义 (对齐 DeepSpec create_position_ids):
-        //   context 行 i 位置 = i (与 target 绝对位置一致)
+        // 位置语义 (对齐 llama.cpp speculative.cpp L1183-1191):
+        //   context 行 i 位置 = (start_pos - ctx_len) + i  (= L + i, 绝对位置)
         //   draft[k] 位置 = start_pos + k
+        // ★ BUG 修复 (2026-07-19): 之前 context 行用相对位置 i, 与 llama.cpp 不一致。
+        //   llama.cpp 用 L+i (L = 上一 cycle 的 start = start_pos - ctx_len), 绝对位置。
+        //   第一个 cycle L=0 两者一致, 后续 cycle L>0 导致 RoPE 旋转错误, 接受率 75% vs 95%。
         // ★ drafter 使用全维度 RoPE (head_dim=128, GPT-NeoX style), 非 target 的 M-RoPE partial。
         //   实测: 用 M-RoPE partial 接受率 36%→3%, 说明 drafter 训练时就是全维度标准 RoPE。
         // ★ 优化: Q norm + RoPE 只对 draft 行 (前 ctx_len 行的 Q 未计算, 是 garbage)
@@ -447,9 +452,12 @@ impl DrafterContext {
         let rope_cos = &mut self.rope_cos;
         let rope_sin = &mut self.rope_sin;
         let k_start = if kv_cache_valid { cached_kv_len } else { 0 };
+        // ★ context 行 position = L + row = (start_pos - ctx_len) + row (绝对位置, 对齐 llama.cpp)
+        //   L = start_pos - ctx_len = 上一 cycle 的 start (已 commit 的 KV cache 长度)
+        let ctx_pos_base = start_pos.wrapping_sub(ctx_len);
         // K norm + RoPE: 只对 [k_start..n_total] 行; draft 行同时算 Q norm+RoPE
         for row in k_start..n_total {
-            let pos = if row < ctx_len { row } else { start_pos + (row - ctx_len) };
+            let pos = if row < ctx_len { ctx_pos_base + row } else { start_pos + (row - ctx_len) };
             compute_rope_into(rope_cos, rope_sin, rope_freqs, pos);
 
             for kvh in 0..n_kvh {
