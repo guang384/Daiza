@@ -73,19 +73,39 @@ pub fn get_thread_pool() -> Option<&'static ThreadPool> {
 // (调用方保证 scatter_wait 阻塞至所有 worker 完成, 故 F 生命周期安全)
 
 /// 共享状态 (Arc 包裹, worker 和 main 共享)
+///
+/// ★ Cache line 优化: 6 个 atomic 原本挤在同一 cache line, 每 barrier 产生
+/// ~26 次跨核 cache line transfer (~50ns/次 × 257 barriers = ~13ms/token)。
+/// 拆成 4 个 cache line, 按"写者"分组:
+///   Line 1 (main 写, worker 读): func, ctx, n_dispatch
+///   Line 2 (main 写 Release, worker 读 Acquire): generation
+///   Line 3 (worker 写, main 读): done
+///   Line 4 (Drop 写): shutdown
+#[repr(C, align(64))]
 struct Shared {
-    /// 任务函数指针 (trampoline<F> as usize, worker transmute 回 fn)
+    // --- Line 1: main 写, worker 读 (dispatch 时一次写入) ---
     func: AtomicUsize,
-    /// 闭包上下文 (raw pointer to F on caller's stack)
     ctx: AtomicPtr<()>,
-    /// 本轮激活的 worker 数 (worker tid < n_dispatch 时执行)
     n_dispatch: AtomicUsize,
-    /// 代际计数器 (每次 scatter_wait 递增, Release/Acquire 同步)
+    // ★ Work-stealing: 下一个待抢的 chunk 起始 (worker fetch_add 抢)
+    next_chunk: AtomicUsize,
+    // ★ Work-stealing: 总工作单元数 (抢到 >= total 即结束)
+    total_work: AtomicUsize,
+    // ★ Work-stealing: chunk 大小
+    chunk_size: AtomicUsize,
+    _pad1: [u8; 64 - 48], // 6×8=48B, 补到 64B
+
+    // --- Line 2: main 写 Release, worker 读 Acquire (hot signal) ---
     generation: AtomicU64,
-    /// worker 完成计数 (worker fetch_add Release, main load Acquire)
+    _pad2: [u8; 64 - 8],
+
+    // --- Line 3: worker 写 Release, main 读 Acquire (hot signal) ---
     done: AtomicUsize,
-    /// 关闭标志 (Drop 时设为 true)
+    _pad3: [u8; 64 - 8],
+
+    // --- Line 4: shutdown (cold path) ---
     shutdown: AtomicBool,
+    _pad4: [u8; 64 - 8],
 }
 
 /// 类型擦除 trampoline: 把 *const () 转回 &F 并调用 F(i)
@@ -97,9 +117,19 @@ unsafe fn trampoline<F: Fn(usize)>(ctx: *const (), i: usize) {
     (&*(ctx as *const F))(i)
 }
 
-/// Worker 主循环: 检查 generation, 有任务则执行, 无任务则 park 睡眠
+/// Worker 主循环: spin-first + park fallback
+///
+/// ★ Spin-first 优化: worker 完成任务后先 spin SPIN_ROUNDS 轮检查 generation,
+/// 若期间有新任务立即执行 (零唤醒开销), 否则 park 睡眠 (节能)。
+///
+/// SPIN_ROUNDS 选择 (权衡):
+/// - 太小 (如 64): 几乎无收益, 仍走 park 路径
+/// - 太大 (如 6.5M = llama.cpp): 14 核持续 spin 触发 CPU 频率降级 (见 P0-F 教训)
+/// - 4096 cycles ≈ 1.3μs at 3GHz: 远短于典型 barrier 间隔 (~10-100μs),
+///   能捕获短间隔 barrier, 又不持续占核触发降频
 #[allow(unsafe_code)]
 fn worker_loop(shared: Arc<Shared>, tid: usize) {
+    const SPIN_ROUNDS: usize = 4096;
     let mut last_gen: u64 = 0;
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
@@ -121,9 +151,27 @@ fn worker_loop(shared: Arc<Shared>, tid: usize) {
                 shared.done.fetch_add(1, Ordering::Release);
             }
         } else {
-            // 无新任务, park 等待唤醒 (不消耗 CPU)
-            // park 语义: 若 main 已先 unpark, park 立即返回, 不会错过任务
-            std::thread::park();
+            // ★ Spin-first: 先 spin SPIN_ROUNDS 轮, 期间检查 generation
+            // 若 spin 期间有新任务, 立即执行 (避免 park/unpark ~10μs 唤醒开销)
+            // 若 spin 期满仍无任务, park 睡眠 (节能, 避免持续 spin 触发 CPU 降频)
+            let mut spun = 0;
+            while spun < SPIN_ROUNDS {
+                let g = shared.generation.load(Ordering::Acquire);
+                if g != last_gen {
+                    break; // 有新任务, 跳出 spin 回到循环顶部执行
+                }
+                std::hint::spin_loop();
+                spun += 1;
+            }
+            if spun >= SPIN_ROUNDS {
+                // spin 期满无任务, park 等待唤醒 (不消耗 CPU)
+                // park 语义: 若 main 已先 unpark, park 立即返回, 不会错过任务
+                // 重新检查一次 generation 防止 TOCTOU (park 前 main 可能已 dispatch)
+                let g = shared.generation.load(Ordering::Acquire);
+                if g == last_gen {
+                    std::thread::park();
+                }
+            }
         }
     }
 }
@@ -151,9 +199,16 @@ impl ThreadPool {
             func: AtomicUsize::new(0),
             ctx: AtomicPtr::new(std::ptr::null_mut()),
             n_dispatch: AtomicUsize::new(0),
+            next_chunk: AtomicUsize::new(0),
+            total_work: AtomicUsize::new(0),
+            chunk_size: AtomicUsize::new(0),
+            _pad1: [0; 64 - 48],
             generation: AtomicU64::new(0),
+            _pad2: [0; 64 - 8],
             done: AtomicUsize::new(0),
+            _pad3: [0; 64 - 8],
             shutdown: AtomicBool::new(false),
+            _pad4: [0; 64 - 8],
         });
 
         let mut threads = Vec::with_capacity(n_workers);
@@ -220,6 +275,109 @@ impl ThreadPool {
             }
         }
     }
+
+    /// ★ Work-stealing dispatch: 把 total_work 个工作单元按 chunk_size 切分,
+    /// worker + 主线程通过 atomic fetch_add 抢 chunk, 直到全部抢完。
+    ///
+    /// 与 `scatter_wait` 的区别:
+    /// - scatter_wait: 静态分块 (tid × chunk), 快线程完成自己的 chunk 后等待慢线程
+    /// - scatter_wait_stealing: 动态抢 chunk, 快线程可多抢, 改善负载均衡
+    ///
+    /// 适用场景: 工作单元负载不均 (如 matvec_multi 跨矩阵边界), 或某 worker 被抢占。
+    ///
+    /// # Safety
+    /// 本函数阻塞直到所有 chunk 完成, F 生命周期安全。
+    pub fn scatter_wait_stealing<F>(&self, total_work: usize, chunk_size: usize, f: F)
+    where
+        F: Fn(usize, usize) + Send + Sync,
+    {
+        if total_work == 0 {
+            return;
+        }
+        if self.n_workers == 0 {
+            // 无 worker, 主线程顺序执行所有 chunk
+            let mut start = 0;
+            while start < total_work {
+                let end = (start + chunk_size).min(total_work);
+                f(start, end);
+                start = end;
+            }
+            return;
+        }
+
+        let n_dispatch = self.n_workers;
+
+        // 重置完成计数
+        self.shared.done.store(0, Ordering::Relaxed);
+
+        // 设置 work-stealing 参数
+        self.shared.next_chunk.store(0, Ordering::Relaxed);
+        self.shared.total_work.store(total_work, Ordering::Relaxed);
+        self.shared.chunk_size.store(chunk_size, Ordering::Relaxed);
+
+        // 设置闭包 (worker 内 steal_loop 会调用)
+        // 用 StealCtx 把 shared 指针和 f 指针打包, 通过 ctx 传给 worker
+        let steal_ctx = StealCtx {
+            shared: self.shared.as_ref() as *const Shared,
+            f: &f as *const F,
+        };
+        let ctx_ptr = &steal_ctx as *const StealCtx<F> as *const ();
+        let tramp = steal_trampoline::<F> as *const () as usize;
+        self.shared.ctx.store(ctx_ptr as *mut (), Ordering::Relaxed);
+        self.shared.func.store(tramp, Ordering::Relaxed);
+        self.shared.n_dispatch.store(n_dispatch, Ordering::Relaxed);
+
+        // 递增 generation (Release: 让 worker 看到 ctx/func/n_dispatch/next_chunk 写入)
+        self.shared.generation.fetch_add(1, Ordering::Release);
+
+        // 唤醒 worker
+        for i in 0..n_dispatch {
+            self.threads[i].unpark();
+        }
+
+        // 主线程也参与抢 chunk (像 llama.cpp)
+        steal_loop(&self.shared, &f);
+
+        // 等待所有 worker 完成
+        while self.shared.done.load(Ordering::Acquire) < n_dispatch {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// Work-stealing 循环: 反复 fetch_add 抢 chunk, 直到 next_chunk >= total_work
+#[inline]
+fn steal_loop<F: Fn(usize, usize)>(shared: &Shared, f: &F) {
+    let total = shared.total_work.load(Ordering::Relaxed);
+    let chunk = shared.chunk_size.load(Ordering::Relaxed);
+    if chunk == 0 || total == 0 {
+        return;
+    }
+    loop {
+        // Acquire: 与 main 的 Release store 同步, 确保读到正确的 total/chunk
+        let start = shared.next_chunk.fetch_add(chunk, Ordering::Relaxed);
+        if start >= total {
+            return;
+        }
+        let end = (start + chunk).min(total);
+        f(start, end);
+    }
+}
+
+/// Work-stealing context: 把 shared 指针和闭包指针打包, 通过 ctx 传给 worker
+#[repr(C)]
+struct StealCtx<F> {
+    shared: *const Shared,
+    f: *const F,
+}
+
+/// Work-stealing trampoline: worker 调用此函数, 内部抢完所有 chunk 后返回
+#[allow(unsafe_code)]
+unsafe fn steal_trampoline<F: Fn(usize, usize)>(ctx: *const (), _tid: usize) {
+    let sc = &*(ctx as *const StealCtx<F>);
+    let shared = &*sc.shared;
+    let f = &*sc.f;
+    steal_loop(shared, f);
 }
 
 impl Drop for ThreadPool {

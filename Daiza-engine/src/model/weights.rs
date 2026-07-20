@@ -139,11 +139,10 @@ impl Q1_0Matrix {
             let bytes_len = self.bytes.len();
             let x_addr = x.as_ptr() as usize;
             let y_addr = y.as_mut_ptr() as usize;
-            let chunk = (n + n_threads - 1) / n_threads;
+            // ★ Work-stealing: chunk_size=256 改善负载均衡
+            let steal_chunk = 256;
 
-            pool.scatter_wait(n_threads, move |tid| {
-                let start = tid * chunk;
-                let end = (start + chunk).min(n);
+            pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
                 #[cfg(target_arch = "x86_64")]
@@ -279,11 +278,10 @@ impl Q1_0Matrix {
             let bytes_len = self.bytes.len();
             let x_addr = x.as_ptr() as usize;
             let y_addr = y.as_mut_ptr() as usize;
-            let chunk = (n + n_threads - 1) / n_threads;
+            // ★ Work-stealing: chunk_size=256 改善负载均衡
+            let steal_chunk = 256;
 
-            pool.scatter_wait(n_threads, move |tid| {
-                let start = tid * chunk;
-                let end = (start + chunk).min(n);
+            pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
                 #[cfg(target_arch = "x86_64")]
@@ -610,11 +608,11 @@ impl Q1_0Matrix {
         // 持久线程池: 单次 barrier 分发所有矩阵的行
         if let Some(pool) = crate::model::workspace::get_thread_pool() {
             let x_addr = x.as_ptr() as usize;
-            let chunk = (total_rows + n_threads - 1) / n_threads;
+            // ★ Work-stealing: chunk_size=256 让快线程多抢 chunk, 改善负载均衡
+            // (原 static chunk: tid × (total/N), 慢线程拖整 barrier)
+            let steal_chunk = 256;
 
-            pool.scatter_wait(n_threads, move |tid| {
-                let start = tid * chunk;
-                let end = (start + chunk).min(total_rows);
+            pool.scatter_wait_stealing(total_rows, steal_chunk, move |start, end| {
                 if start >= end {
                     return;
                 }
