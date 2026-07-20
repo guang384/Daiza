@@ -335,10 +335,20 @@ pub fn forward_batch(
     let block_start_ts = std::time::Instant::now();
 
     // 预计算所有 batch token 的 cos/sin(避免与 kv cache 的 borrow 冲突)
+    // ★ 优化: 预分配 buffer 复用, 消除 2×n_batch 次 Vec heap 分配 (n_batch=26 → 52 次 alloc)
     let t0 = if profile { Some(std::time::Instant::now()) } else { None };
-    let cos_sin_batch: Vec<_> = (0..n_batch)
-        .map(|t| ctx.state.cos_sin_at(start_pos + t))
+    let rope_dim = cfg.rope_dim;
+    debug_assert!(rope_dim <= 128, "rope_dim {rope_dim} > 128, 需扩大 buffer");
+    let mut cos_sin_batch: Vec<([f32; 128], [f32; 128])> = (0..n_batch)
+        .map(|_| ([0.0f32; 128], [0.0f32; 128]))
         .collect();
+    for t in 0..n_batch {
+        let (cos_arr, sin_arr) = &mut cos_sin_batch[t];
+        math::rope_cos_sin_mrope_text_into(
+            start_pos + t, &ctx.state.rope_freqs, &ctx.state.rope_sections,
+            &mut cos_arr[..rope_dim], &mut sin_arr[..rope_dim],
+        );
+    }
     if let Some(t) = t0 { p_cos_sin = t.elapsed(); }
 
     for blk_idx in 0..cfg.block_count {
@@ -350,6 +360,9 @@ pub fn forward_batch(
         if is_full {
             let kv = ctx.state.kv_caches[blk_idx].as_mut().unwrap();
             let w = block_w.as_full_attention();
+            // ★ 优化: scale 提到 token 循环外 (原每 token 重新计算 1/sqrt(head_dim))
+            let attn_scale = 1.0 / (head_dim as f32).sqrt();
+            let group_size = n_q_heads / n_kv_heads;
 
             // 3a. Batch rmsnorm
             let ts = if profile { Some(std::time::Instant::now()) } else { None };
@@ -384,10 +397,9 @@ pub fn forward_batch(
                 // ★ P1-5: 不再 copy K/V 到 workspace, K norm+RoPE 直接在 k_buf 上 in-place
 
                 // QK-norm + RoPE 融合 (减少循环开销)
-                let (cos, sin) = &cos_sin_batch[t];
-                let cos = &cos[..];
-                let sin = &sin[..];
-                let rope_dim = cfg.rope_dim;
+                let (cos_arr, sin_arr) = &cos_sin_batch[t];
+                let cos = &cos_arr[..rope_dim];
+                let sin = &sin_arr[..rope_dim];
 
                 for h_i in 0..n_q_heads {
                     let hs = h_i * head_dim;
@@ -411,12 +423,11 @@ pub fn forward_batch(
 
                 // Attention scores + V weighted sum
                 let n_cached = kv.len;
-                let scale = 1.0 / (head_dim as f32).sqrt();
+                // ★ 优化: scale/group_size 已提到 block 循环外
                 // ★ P1-5: 直接写 attn_out_buf[t..], 省末尾 attn_out copy
                 let out_t = &mut attn_out_buf[t * attn_out_dim..(t + 1) * attn_out_dim];
                 out_t[..attn_out_dim].fill(0.0);
                 let scores = &mut ctx.workspace.attn_scores[..n_cached];
-                let group_size = n_q_heads / n_kv_heads;
 
                 for qh in 0..n_q_heads {
                     let kvh = qh / group_size;
@@ -424,7 +435,7 @@ pub fn forward_batch(
                     for c in 0..n_cached {
                         let k_t_c = kv.k_at(c);
                         let k_head = &k_t_c[kvh * head_dim..(kvh + 1) * head_dim];
-                        scores[c] = crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * scale;
+                        scores[c] = crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * attn_scale;
                     }
                     math::softmax_inplace(scores);
                     let out_head = &mut out_t[qh * head_dim..(qh + 1) * head_dim];
@@ -448,6 +459,10 @@ pub fn forward_batch(
             let ssm = ctx.state.ssm_states[blk_idx].as_mut().unwrap();
             let w = block_w.as_ssm();
             let ssm_qkv_dim = w.attn_qkv.rows;
+            // ★ 优化: q_scale/pool/n_threads 提到 token 循环外 (原每 token 重新计算/查询)
+            let ssm_q_scale = 1.0 / (ssm_state_size as f32).sqrt();
+            let ssm_pool = crate::model::workspace::get_thread_pool();
+            let ssm_n_threads = crate::model::workspace::thread_count().min(ssm_num_v_heads);
 
             // 3a. Batch rmsnorm
             let ts = if profile { Some(std::time::Instant::now()) } else { None };
@@ -540,10 +555,9 @@ pub fn forward_batch(
                     }
                 }
 
-                // q scale: q *= 1/sqrt(head_dim)
-                let q_scale = 1.0 / (state_size as f32).sqrt();
+                // q scale: q *= 1/sqrt(head_dim) (★ q_scale 已提到 block 循环外)
                 for qi in ctx.workspace.ssm_q.iter_mut() {
-                    *qi *= q_scale;
+                    *qi *= ssm_q_scale;
                 }
 
                 // Gated Delta Rule scan + output gate per v_head
@@ -554,8 +568,9 @@ pub fn forward_batch(
                 // Output gate silu (单次 SIMD pass, 需在并行 gate 前完成)
                 crate::math::simd_exp::silu_inplace_simd(gate_t);
 
-                let pool = crate::model::workspace::get_thread_pool();
-                let n_threads = crate::model::workspace::thread_count().min(num_v_heads);
+                // ★ pool/n_threads 已提到 block 循环外
+                let pool = ssm_pool;
+                let n_threads = ssm_n_threads;
 
                 if n_threads <= 1 || pool.is_none() {
                     // 串行 fallback(单线程或无线程池)

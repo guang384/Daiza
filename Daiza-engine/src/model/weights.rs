@@ -527,12 +527,36 @@ impl Q1_0Matrix {
                 debug_assert!(n_batch <= 64);
                 #[cfg(target_arch = "x86_64")]
                 if use_avx2 {
-                    for i in start..end {
-                        unsafe {
-                            dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                    // ★ batch4 分块: 4-token 共享权重读取 (vs 2-token 的 n_batch/2 次)
+                    //   权重 DRAM 读取次数: ceil(n_batch/4) vs ceil(n_batch/2) (减半)
+                    //   对 prefill (n_batch=26, DRAM bound) 显著减少带宽压力
+                    let mut t_start = 0usize;
+                    while t_start + 4 <= n_batch {
+                        let mut tmp4 = [0.0f32; 4];
+                        for i in start..end {
+                            unsafe {
+                                let x_off = t_start * n_cols;
+                                let x_slice = std::slice::from_raw_parts(x.as_ptr().add(x_off), 4 * n_cols);
+                                dot_q1_0_row_batch4_avx2(bytes, i, n_cols, x_slice, &mut tmp4);
+                            }
+                            for (j, &v) in tmp4.iter().enumerate() {
+                                unsafe { *((y_addr as *mut f32).add((t_start + j) * n + i)) = v; }
+                            }
                         }
-                        for t in 0..n_batch {
-                            unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
+                        t_start += 4;
+                    }
+                    // 余数走 batch_avx2 (2-token 分块)
+                    if t_start < n_batch {
+                        let rem = n_batch - t_start;
+                        for i in start..end {
+                            unsafe {
+                                let x_off = t_start * n_cols;
+                                let x_slice = std::slice::from_raw_parts(x.as_ptr().add(x_off), rem * n_cols);
+                                dot_q1_0_row_batch_avx2(bytes, i, n_cols, x_slice, n_cols, rem, &mut tmp[..rem], 1);
+                            }
+                            for t in 0..rem {
+                                unsafe { *((y_addr as *mut f32).add((t_start + t) * n + i)) = tmp[t]; }
+                            }
                         }
                     }
                     return;
@@ -845,12 +869,34 @@ impl Q1_0Matrix {
                 debug_assert!(n_batch <= 64);
                 #[cfg(target_arch = "x86_64")]
                 if use_avx2 {
-                    for i in start..end {
-                        unsafe {
-                            dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                    // ★ batch4 分块: 4-token 共享权重读取 (vs 2-token 的 n_batch/2 次)
+                    let mut t_start = 0usize;
+                    while t_start + 4 <= n_batch {
+                        let mut tmp4 = [0.0f32; 4];
+                        for i in start..end {
+                            unsafe {
+                                let x_off = t_start * n_cols;
+                                let x_slice = std::slice::from_raw_parts(x.as_ptr().add(x_off), 4 * n_cols);
+                                dot_q1_0_row_batch4_avx2(bytes, i, n_cols, x_slice, &mut tmp4);
+                            }
+                            for (j, &v) in tmp4.iter().enumerate() {
+                                unsafe { *((y_addr as *mut f32).add((t_start + j) * n + i)) += v; }
+                            }
                         }
-                        for t in 0..n_batch {
-                            unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
+                        t_start += 4;
+                    }
+                    // 余数走 batch_avx2 (2-token 分块)
+                    if t_start < n_batch {
+                        let rem = n_batch - t_start;
+                        for i in start..end {
+                            unsafe {
+                                let x_off = t_start * n_cols;
+                                let x_slice = std::slice::from_raw_parts(x.as_ptr().add(x_off), rem * n_cols);
+                                dot_q1_0_row_batch_avx2(bytes, i, n_cols, x_slice, n_cols, rem, &mut tmp[..rem], 1);
+                            }
+                            for t in 0..rem {
+                                unsafe { *((y_addr as *mut f32).add((t_start + t) * n + i)) += tmp[t]; }
+                            }
                         }
                     }
                     return;
