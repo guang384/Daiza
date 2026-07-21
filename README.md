@@ -371,7 +371,8 @@ MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](
 - [x] 多模态视觉输入(`Bonsai-27B-mmproj-Q8_0.gguf`)
 - [x] ViT encoder AVX2 向量化 + 线程池并行(173s/图 → 7.9s/图,22× 加速)
 - [x] Vision prefill batched(逐 token 注入 → 分批 64 个,132s → 100s,text-only 零退化)
-- [ ] KV cache 量化(4-bit)
+
+> 路线图已完成。进一步加速需算法变更(drafter early exit / 减小 block_size / 共享 target tap 投影)或硬件升级(DDR5 双通道 / HBM),超出纯代码优化范围。KV cache 4-bit 量化经调研后判定不值得实施(KV cache 读取占带宽 <0.01%,4-bit 量化收益 <1%,且违反"不得降低模型精度"硬约束)。
 
 ## 📚 参考资料
 
