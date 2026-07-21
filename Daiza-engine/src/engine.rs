@@ -408,6 +408,22 @@ impl Engine {
         // bonus 采样复用 buffer (p, q, residual, 各 vocab_size = ~1MB, 跨 cycle 复用)
         let mut bonus_buf = BonusBuffers::new();
 
+        // ★ 自动降级 (DAIZA_DSPARK_FALLBACK, 默认开启; =0 关闭)
+        // 探测期收集若干 cycle 的真实数据, 判定 DSpark 是否慢于原生 decode。
+        // 判定依据: probe 窗口内 dspark ms/token 是否 > target 单 forward 实测耗时
+        // (同进程同热状态对比, 免疫系统波动)。sequential verify 下 forwards/token 恒 = 1.0,
+        // 故 DSpark 比原生慢 ⟺ draft overhead > 0 (恒成立)。
+        let fallback_enabled = !matches!(
+            std::env::var("DAIZA_DSPARK_FALLBACK").as_deref(),
+            Ok("0") | Ok("false") | Ok("no")
+        );
+        const PROBE_CYCLES: usize = 6;
+        let mut probe_done = !fallback_enabled;
+        let mut probe_cycles = 0usize;
+        let mut probe_gen_start = 0usize;
+        let mut probe_time_start = 0u128;
+        let mut fell_back = false;
+
         while generated_ids.len() < max_tokens {
             // --- Phase 1: Draft ---
             let draft_start = std::time::Instant::now();
@@ -551,8 +567,54 @@ impl Engine {
             //   需要 drain + 绝对位置 + 完整 start_pos 对齐才能匹配, 当前不 drain 更优。
             //   详见 project_memory lessons learned。
 
+            // ★ 自动降级判定: 探测窗口满后, 比较 DSpark 实测 ms/token vs 原生 decode 下界
+            if !probe_done {
+                if probe_cycles == 0 {
+                    probe_gen_start = generated_ids.len();
+                    probe_time_start = decode_start.elapsed().as_millis();
+                }
+                probe_cycles += 1;
+                if probe_cycles >= PROBE_CYCLES {
+                    let win_gen = generated_ids.len() - probe_gen_start;
+                    let win_ms = decode_start.elapsed().as_millis() - probe_time_start;
+                    let dspark_ms_per_tok = if win_gen > 0 { win_ms as f64 / win_gen as f64 } else { f64::MAX };
+                    let native_ms_per_tok = if n_target_forwards > 0 {
+                        (t_verify + t_bonus) as f64 / n_target_forwards as f64
+                    } else { f64::MAX };
+                    eprintln!("[dspark-fallback] probe: dspark={dspark_ms_per_tok:.1}ms/tok \
+                        vs native~{native_ms_per_tok:.1}ms/tok (window {win_gen}t/{win_ms}ms)");
+                    if dspark_ms_per_tok > native_ms_per_tok {
+                        eprintln!("[dspark-fallback] DSpark slower than native decode → \
+                            falling back to greedy single-token decode for remaining tokens");
+                        fell_back = true;
+                        break;
+                    }
+                    probe_done = true;
+                }
+            }
+
             if generated_ids.len() >= max_tokens {
                 break;
+            }
+        }
+
+        // ★ 降级路径: 从当前 ctx 状态 (KV/SSM 已推进, logits_buf 持有下一 token 分布)
+        //   无缝切换为原生 greedy decode, 继续生成剩余 token。零重复计算。
+        if fell_back {
+            while generated_ids.len() < max_tokens {
+                let next_id = sample_top_k_top_p_into(
+                    &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
+                );
+                if next_id as u32 == self.config.eos_token_id {
+                    break;
+                }
+                generated_ids.push(next_id as u32);
+                forward_single_token(&mut ctx, next_id as u32)?;
+                if stream_output {
+                    if let Some(s) = self.tokenizer.vocab.tokens.get(next_id as usize) {
+                        eprint!("\r[dspark→native] -> {s}    ");
+                    }
+                }
             }
         }
         if stream_output {
