@@ -140,25 +140,25 @@ cd Daiza-engine
 # Release 构建(推荐,启用 LTO + 自动向量化)
 cargo build --release --bin daiza-cli
 
-# 运行推理 (chat 模式,默认 64 token) — 推荐使用 --model 显式指定
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "你好" 64
-
-# 向后兼容: 也可用位置参数 (第一个参数为 gguf 路径)
-.\target\release\daiza-cli.exe "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "你好" 64
+# 运行推理 (chat 模式,默认 64 token)
+.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --prompt "你好" --max-tokens 64
 
 # Raw 模式(跳过 chat 模板,用于调试)
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "The capital of China is" 8 --raw
+.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --prompt "The capital of China is" --max-tokens 8 --raw
 
 # 启用 DSpark 投机解码(需先下载 drafter 权重)
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "请用中文写一首关于春天的诗,8句" 200 `
+.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
+    --prompt "请用中文写一首关于春天的诗,8句" --max-tokens 200 `
     --dspark "..\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf"
 
 # Greedy 模式(temperature=0, 用于正确性验证)
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "你好" 100 `
+.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
+    --prompt "你好" --max-tokens 100 `
     --dspark "..\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf" --greedy
 
 # 多模态:加载 mmproj 视觉塔并对图像问答 (--image 可多次指定)
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "描述这张图" 128 `
+.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
+    --prompt "描述这张图" --max-tokens 128 `
     --mmproj "..\Bonsai-27B-gguf\Bonsai-27B-mmproj-Q8_0.gguf" --image my_image.jpg
 
 # 检查模型元信息

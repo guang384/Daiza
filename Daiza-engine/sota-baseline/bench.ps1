@@ -81,7 +81,7 @@ for ($round = 1; $round -le $Runs; $round++) {
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $Bin
-    $psi.Arguments = "`"$GgufPath`" `"$Prompt`" $MaxTokens --raw --greedy"
+    $psi.Arguments = "--model `"$GgufPath`" --prompt `"$Prompt`" --max-tokens $MaxTokens --raw --greedy"
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true

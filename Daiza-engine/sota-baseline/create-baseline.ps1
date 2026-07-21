@@ -38,7 +38,7 @@ $Prompt = "The capital of China is Beijing, and"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = $BaselineBin
-$psi.Arguments = "`"$GgufPath`" `"$Prompt`" 64 --raw --greedy"
+$psi.Arguments = "--model `"$GgufPath`" --prompt `"$Prompt`" --max-tokens 64 --raw --greedy"
 $psi.UseShellExecute = $false
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
