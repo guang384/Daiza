@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-2-green.svg)](#)
 
-一个学习项目:从零实现 GGUF 解析、Q1_0 反量化、混合注意力(SSM + Full Attention)、GPT-2 BPE 分词,最终在纯 CPU 上完成 Bonsai 27B 的完整推理。仅依赖 `memmap2`(GGUF 权重按需 page-in)与 `image`(PNG/JPEG 解码),其余全部从零实现。
+一个学习项目:从零实现 GGUF 解析、Q1_0 反量化、混合注意力(SSM + Full Attention)、GPT-2 BPE 分词,最终在纯 CPU 上完成 Bonsai 27B 的完整推理。
 
 ---
 
@@ -119,7 +119,7 @@ Get-ChildItem .\Bonsai-27B-gguf\*.gguf | Select-Object Name, @{N='Size(GB)';E={[
 
 # 使用引擎 inspect 模式验证 GGUF 完整性
 cd Daiza-engine
-.\target\release\daiza-cli.exe "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
+.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
 ```
 
 预期输出包含 `tensor_count : 851`、`block_count : 64`、`Q1_0 tensors: 498`。
@@ -324,11 +324,9 @@ qwen3vl_merger 投影器:
 | prefill (602 expanded tokens) | ~103s | ~165ms/tok,vision 分批 batched 注入 (MAX_VISION_BATCH=64) |
 | decode (48 tokens) | ~8.3s | 173ms/tok,与 text-only 一致 |
 
-ViT encode 优化路径: 173s (标量) → 102s (线程池并行) → 60.2s (2D tiled batched matmul) → 14.8s (AVX2 8-row dot product kernel) → 10.2s (AVX2 attention kernel) → 7.92s (proj batched). 总加速 **22×**.
+ViT encode 从标量 173s 优化到 8.2s(**22× 加速**):线程池并行 → 2D tiled batched matmul → AVX2 8-row dot product kernel → AVX2 attention kernel → projector batched.
 
-Vision prefill 优化路径: 132s (逐 token 注入,576 × forward_single_token) → 100s (分批 batched 注入,9 × forward_batch_with_vision, MAX_VISION_BATCH=64). 每批读 13GB 权重 1 次 vs 逐 token 读 576 次. 总加速 **1.32×**,text-only decode 零退化.
-
-text-only 推理在加载 mmproj 后零退化(5 轮交错 benchmark 验证)。
+Vision prefill 从逐 token 注入 (132s) 改为分批 batched 注入 (MAX_VISION_BATCH=64, 100s),text-only decode 零退化。
 
 ## ⚙️ 生成参数(白皮书建议)
 
@@ -355,7 +353,6 @@ text-only 推理在加载 mmproj 后零退化(5 轮交错 benchmark 验证)。
 - decode 阶段:block 总耗时 ~155ms (attn 34ms + ssm 115ms + mlp 92ms) + lm_head 6ms
 - 内存占用:~13 GB (Q1_0 权重) + ~1.3 GB (KV/SSM/激活) + ~1.6 GB (mmproj,可选)
 - DSpark 加速比:在 k=4 架构约束和 LPDDR5X 带宽瓶颈下,理论极限仅 1.10x (100% accept rate),短序列实测与纯 target 持平
-- Vision 加载 mmproj 对 text-only decode 零退化 (5 轮交错 benchmark 验证)
 
 **说明**:这是学习项目。当前性能已接近 LPDDR5X 单通道带宽极限 (~22 GB/s 实测 vs 60 GB/s 理论),
 MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](https://github.com/PrismML-Eng/llama.cpp)。
