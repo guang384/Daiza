@@ -297,16 +297,18 @@ impl Engine {
         let weights = self.weights.as_ref().unwrap();
         let mut ctx = make_context(weights, cfg);
 
-        // 6. prefill: text tokens 用 forward_batch (batched), vision embeddings 逐个注入
+        // 6. prefill: text tokens 用 forward_batch (batched), vision embeddings 分批注入
         //    ★ 策略:
         //      - text tokens: 收集成 batch (≤32), 用 forward_batch 一次读 13GB 权重
         //      - image_token: 展开为 n_vision_per_image 个 vision embeddings,
-        //        用 forward_single_token_with_embedding 逐个注入 (不在热路径, 一次性成本)
-        //    ★ 不使用 forward_batch_with_vision, 因 batched Q1_0 kernel tmp buffer 上限 64,
-        //      而 n_vision_per_image=576 远超上限
+        //        分批注入 (每批 MAX_VISION_BATCH=64 个), 用 forward_batch_with_vision
+        //      - 每 64 个 vision embeddings 一次 forward_batch, 读 13GB 权重 1 次
+        //        vs 逐个注入 576 次 forward_single_token, 读 13GB 权重 576 次
+        //    ★ n_batch=64 走 batch4 kernel (16 组 × 4 token), tmp[64] 够用
         let n_input = input_ids.len();
         let prefill_start = std::time::Instant::now();
         const MAX_TEXT_BATCH: usize = 32;
+        const MAX_VISION_BATCH: usize = 64;
         let mut text_batch: Vec<u32> = Vec::with_capacity(MAX_TEXT_BATCH);
         let mut vision_offset = 0usize; // 以 hidden-dim 为单位的偏移
         let hidden = self.config.hidden;
@@ -323,16 +325,33 @@ impl Engine {
             Ok(())
         };
 
+        // 分批注入 vision embeddings (每批 MAX_VISION_BATCH 个)
+        let flush_vision_batch = |ctx: &mut ForwardContext<'_>, emb: &[f32]| -> crate::Result<()> {
+            let n = emb.len() / hidden;
+            debug_assert_eq!(emb.len(), n * hidden);
+            // 构造 n 个 image_token, 每个替换为 1 个 vision embedding (n_vision_per_image=1)
+            let token_ids: Vec<u32> = vec![image_token_id; n];
+            let inject = VisionInject {
+                image_token_id,
+                vision_embeddings: emb,
+                n_vision_per_image: 1,
+            };
+            forward_batch_with_vision(ctx, &token_ids, ctx.state.pos, None, Some(inject))
+        };
+
         for &tid in &input_ids {
             if tid == image_token_id {
                 // 先 flush 累积的 text batch
                 flush_text_batch(&mut text_batch, &mut ctx)?;
-                // 逐个注入 n_vision_per_image 个 vision embeddings
-                for vi in 0..n_vision_per_image {
+                // 分批注入 n_vision_per_image 个 vision embeddings
+                let mut vi = 0;
+                while vi < n_vision_per_image {
+                    let batch_size = MAX_VISION_BATCH.min(n_vision_per_image - vi);
                     let emb_start = (vision_offset + vi) * hidden;
-                    let emb_end = emb_start + hidden;
+                    let emb_end = emb_start + batch_size * hidden;
                     let emb = &vision_embeddings[emb_start..emb_end];
-                    forward_single_token_with_embedding(&mut ctx, emb)?;
+                    flush_vision_batch(&mut ctx, emb)?;
+                    vi += batch_size;
                 }
                 vision_offset += n_vision_per_image;
             } else {

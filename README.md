@@ -296,10 +296,12 @@ qwen3vl_merger 投影器:
 | preprocess | ~9ms | resize + patchify |
 | ViT encode (27 层) | ~7.8s | AVX2 batched matmul + 8-row dot product kernel + AVX2 attention (hoist q_i) |
 | projector | ~0.13s | batched matmul + AVX2 |
-| prefill (600 expanded tokens) | ~132s | ~220ms/tok,与 text-only 一致 |
+| prefill (600 expanded tokens) | ~100s | ~165ms/tok,vision 分批 batched 注入 (MAX_VISION_BATCH=64) |
 | decode (32 tokens) | ~5.7s | 178ms/tok,与 text-only 一致 |
 
 ViT encode 优化路径: 173s (标量) → 102s (线程池并行) → 60.2s (2D tiled batched matmul) → 14.8s (AVX2 8-row dot product kernel) → 10.2s (AVX2 attention kernel) → 7.92s (proj batched). 总加速 **22×**.
+
+Vision prefill 优化路径: 132s (逐 token 注入,576 × forward_single_token) → 100s (分批 batched 注入,9 × forward_batch_with_vision, MAX_VISION_BATCH=64). 每批读 13GB 权重 1 次 vs 逐 token 读 576 次. 总加速 **1.32×**,text-only decode 零退化.
 
 text-only 推理在加载 mmproj 后零退化(5 轮交错 benchmark 验证)。
 
@@ -368,7 +370,7 @@ MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](
 - [x] DSpark 投机解码(`Bonsai-27B-dspark-Q4_1.gguf`)
 - [x] 多模态视觉输入(`Bonsai-27B-mmproj-Q8_0.gguf`)
 - [x] ViT encoder AVX2 向量化 + 线程池并行(173s/图 → 7.9s/图,22× 加速)
-- [ ] Vision prefill batched(当前逐 token 注入,可分块 batched)
+- [x] Vision prefill batched(逐 token 注入 → 分批 64 个,132s → 100s,text-only 零退化)
 - [ ] KV cache 量化(4-bit)
 
 ## 📚 参考资料
