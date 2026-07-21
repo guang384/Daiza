@@ -4,9 +4,9 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![Dependencies](https://img.shields.io/badge/dependencies-1-green.svg)](#)
+[![Dependencies](https://img.shields.io/badge/dependencies-2-green.svg)](#)
 
-一个学习项目:从零实现 GGUF 解析、Q1_0 反量化、混合注意力(SSM + Full Attention)、GPT-2 BPE 分词,最终在纯 CPU 上完成 Bonsai 27B 的完整推理。仅依赖 `memmap2` 用于权重文件按需 page-in,其余全部从零实现。
+一个学习项目:从零实现 GGUF 解析、Q1_0 反量化、混合注意力(SSM + Full Attention)、GPT-2 BPE 分词,最终在纯 CPU 上完成 Bonsai 27B 的完整推理。仅依赖 `memmap2`(GGUF 权重按需 page-in)与 `image`(PNG/JPEG 解码),其余全部从零实现。
 
 ---
 

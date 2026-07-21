@@ -14,7 +14,7 @@ target/release_baseline*/
 target/release_*/
 
 # 临时调试脚本与 token dump (实验残留, 不入 git)
-bench_*.ps1
+# 注意: sota-baseline/bench.ps1 是正式 benchmark 工具, 需要入库
 *_tokens.txt
 *_dump.txt
 debug_*.txt
