@@ -203,6 +203,25 @@ let output = engine.generate_with_image(
 println!("{output}");
 ```
 
+DSpark 投机解码示例:
+
+```rust
+use daiza_engine::engine::Engine;
+use daiza_engine::math::SamplingParams;
+
+let mut engine = Engine::load("../Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf")?;
+// 加载 DSpark drafter (6 层 block-parallel drafter + Markov head)
+engine.load_drafter(std::path::Path::new("../Bonsai-27B-gguf/Bonsai-27B-dspark-Q4_1.gguf"))?;
+
+let output = engine.generate_with_params(
+    "请用中文写一首关于春天的诗,8句",
+    200,
+    SamplingParams::default(),
+    Some("You are a helpful assistant."),
+)?;
+println!("{output}");
+```
+
 ## 📐 架构关键点
 
 ### Q1_0 量化格式
@@ -347,16 +366,19 @@ text-only 推理在加载 mmproj 后零退化(5 轮交错 benchmark 验证)。
 ## 📊 性能参考(纯 CPU,单 token decode)
 
 测试硬件:Intel Core Ultra 5 225H (Meteor Lake, 14 核, AVX2 + FMA, LPDDR5X-7467)
+测试条件:CPU turbo 频率,greedy/默认采样,短 prompt (≤30 tokens) + 48-64 tokens 生成
 
 | 模式 | 吞吐量 | 接受率 | 说明 |
 |------|--------|--------|------|
-| 纯 target (无 DSpark) | ~4.4 tok/s | — | 64 层前向 ~227ms/tok |
-| DSpark 推测解码 | ~5.5 tok/s | ~36% | drafter 53ms/call + target verify,~1.25× 加速 |
+| 纯基础模型 (无 DSpark) | ~6.24 tok/s | — | 64 层前向 ~160ms/tok |
+| DSpark 推测解码 | ~6.18 tok/s | ~100% (短序列) | drafter 53ms/call + target verify,与纯 target 持平 |
+| Vision (text-only,加载 mmproj) | ~6.22 tok/s | — | 加载 mmproj 对 text-only decode 零退化 |
+| Vision (with image) | ~5.78 tok/s | — | decode 173ms/tok,vision 一次性成本 (enc 8.2s + prefill 103s) |
 
-- 单 block 前向:~220ms(SSM 层)/ ~530ms(全注意力层)
-- 完整 64 层前向:~14s(纯 SSM 层)/ ~34s(包含全注意力)
-- 内存占用:~13 GB(权重)+ ~1.3 GB(KV/SSM/激活)
-- DSpark 加速比:target forward 197ms/tok → DSpark 179ms/tok (~10% 加速)
+- decode 阶段:block 总耗时 ~155ms (attn 34ms + ssm 115ms + mlp 92ms) + lm_head 6ms
+- 内存占用:~13 GB (Q1_0 权重) + ~1.3 GB (KV/SSM/激活) + ~1.6 GB (mmproj,可选)
+- DSpark 加速比:在 k=4 架构约束和 LPDDR5X 带宽瓶颈下,理论极限仅 1.10x (100% accept rate),短序列实测与纯 target 持平
+- Vision 加载 mmproj 对 text-only decode 零退化 (5 轮交错 benchmark 验证)
 
 **说明**:这是学习项目。当前性能已接近 LPDDR5X 单通道带宽极限 (~22 GB/s 实测 vs 60 GB/s 理论),
 MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](https://github.com/PrismML-Eng/llama.cpp)。
