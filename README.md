@@ -12,7 +12,7 @@
 
 ## ✨ 特性
 
-- **最小依赖**:仅依赖 `memmap2`(用于 GGUF 权重按需 page-in),其余全部(GGUF 解析、FP16/BF16、BPE、GEMV、SSM、RoPE、AVX2 内核)从零实现
+- **最小依赖**:仅依赖 `memmap2`(GGUF 权重按需 page-in)+ `image`(PNG/JPEG 解码),其余全部(GGUF 解析、FP16/BF16、BPE、GEMV、SSM、RoPE、AVX2 内核)从零实现
 - **纯 CPU**:AVX2 + FMA 手写向量化内核(`target-cpu=native`)
 - **Q1_0 反量化**:1.125 bits/weight 二值化格式,每 128 权重共享一个 FP16 scale
 - **混合注意力架构**:64 层 = 48 SSM 块 + 16 全注意力块(节拍 `(i+1) % 4 == 0`)
@@ -21,6 +21,7 @@
 - **Qwen3.6 chat 模板**:支持 `<|im_start|>` 格式与 `mind` 思考模式标记
 - **DSpark 推测解码**:6 层 block-parallel drafter + Markov head + Leviathan rejection sampling,~5.5 tok/s
 - **多线程并行**:持久线程池 (park/unpark 零分配),14 线程 GEMM 并行
+- **Qwen3-VL 多模态**:CLIP ViT (27 层) + qwen3vl_merger 投影器,支持图像输入,text-only decode 零退化
 
 ## 📦 目录结构
 
@@ -31,23 +32,24 @@ Daiza/
 ├── Bonsai-27B-gguf/          # 模型权重(外部,不入库)
 │   ├── Bonsai-27B-Q1_0.gguf       # 主权重(必需)
 │   ├── Bonsai-27B-dspark-Q4_1.gguf  # DSpark 投机解码 drafter
-│   ├── Bonsai-27B-mmproj-Q8_0.gguf  # 视觉塔(计划支持)
+│   ├── Bonsai-27B-mmproj-Q8_0.gguf  # 视觉塔(多模态)
 │   └── bonsai-27b-whitepaper.pdf
 └── Daiza-engine/             # Rust 推理引擎
     ├── Cargo.toml
     ├── .cargo/config.toml    # target-cpu=native
     └── src/
         ├── lib.rs            # 模块入口 + BonsaiError
-        ├── main.rs           # CLI 入口
-        ├── engine.rs         # 顶层 Engine:加载→前向→采样→解码 + DSpark 调度
+        ├── main.rs           # CLI 入口(--dspark / --mmproj / --image)
+        ├── engine.rs         # 顶层 Engine:加载→前向→采样→解码 + DSpark + Vision 调度
         ├── gguf/             # GGUF v3 二进制格式解析(parser/metadata/tensor_info)
-        ├── tensor/           # 张量类型 + Q1_0/Q4_1/Iq1M/F32/F16/BF16 反量化 + AVX2 GEMM 内核
-        ├── math/             # RMSNorm/RoPE/Softmax/SIMD 超越函数(exp/silu/sigmoid)/采样
+        ├── tensor/           # 张量类型 + Q1_0/Q4_1/Q8_0/Iq1M/F32/F16/BF16 反量化 + AVX2 GEMM 内核
+        ├── math/             # RMSNorm/LayerNorm/RoPE/Softmax/GELU/SIMD 超越函数/采样
         ├── model/            # Bonsai 27B 架构
         │   ├── config.rs / weights.rs / block.rs / attention.rs / ssm.rs / mlp.rs
-        │   ├── forward.rs    # 单 token 前向 + prefill batch + DSpark tap 特征
+        │   ├── forward.rs    # 单 token 前向 + prefill batch + vision embedding 注入
         │   ├── workspace.rs  # 持久线程池(park/unpark 零分配)+ Workspace 复用
-        │   └── dspark/       # DSpark 推测解码(drafter/markov/speculative/weights/config)
+        │   ├── dspark/       # DSpark 推测解码(drafter/markov/speculative/weights/config)
+        │   └── vision/       # Qwen3-VL 多模态(config/weights/preprocess/rope/encoder/projector)
         ├── cache/            # KV cache(16 层)+ SSM state(48 层)
         └── tokenizer/        # GPT-2 BPE + Qwen35 预分词
 ```
@@ -72,7 +74,7 @@ pip install -U "huggingface_hub[cli]"
 |------|------|------|------|
 | `Bonsai-27B-Q1_0.gguf` | 3.9 GB | **主权重**(1.125 bits/weight,语言模型) | ✅ 已支持 |
 | `Bonsai-27B-dspark-Q4_1.gguf` | 1.8 GB | DSpark 投机解码 drafter | ✅ 已支持 |
-| `Bonsai-27B-mmproj-Q8_0.gguf` | 0.63 GB | 视觉塔(多模态输入) | 🔜 计划支持 |
+| `Bonsai-27B-mmproj-Q8_0.gguf` | 0.63 GB | 视觉塔(多模态输入) | ✅ 已支持 |
 
 **一键下载全部**:
 
@@ -152,6 +154,10 @@ cargo build --release --bin daiza-cli
 .\target\release\daiza-cli.exe "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "你好" 100 `
     --dspark "..\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf" --greedy
 
+# 多模态:加载 mmproj 视觉塔并对图像问答 (--image 可多次指定)
+.\target\release\daiza-cli.exe "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" "描述这张图" 128 `
+    --mmproj "..\Bonsai-27B-gguf\Bonsai-27B-mmproj-Q8_0.gguf" --image my_image.jpg
+
 # 检查模型元信息
 .\target\release\daiza-cli.exe "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
 ```
@@ -172,6 +178,26 @@ let output = engine.generate_with_params(
     "你好",
     256,
     params,
+    Some("You are a helpful assistant."),
+)?;
+println!("{output}");
+```
+
+多模态推理示例:
+
+```rust
+use std::path::PathBuf;
+use daiza_engine::engine::Engine;
+use daiza_engine::math::SamplingParams;
+
+let mut engine = Engine::load("../Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf")?;
+engine.load_mmproj(std::path::Path::new("../Bonsai-27B-gguf/Bonsai-27B-mmproj-Q8_0.gguf"))?;
+
+let output = engine.generate_with_image(
+    "描述这张图",
+    &[PathBuf::from("my_image.jpg")],
+    128,
+    SamplingParams::default(),
     Some("You are a helpful assistant."),
 )?;
 println!("{output}");
@@ -231,6 +257,51 @@ mind
 ```
 
 模型进入思考模式,输出 `mind ... </mind>` 包裹的思考内容,然后给出最终回复。EOS token(`<|im_end|>`, id=248046)终止生成。
+
+### Qwen3-VL 多模态管线
+
+参考 [llama.cpp qwen3vl.cpp](https://github.com/PrismML-Eng/llama.cpp) 实现,加载时一次性把 Q8_0/F16 反量化为 F32 (~1.6GB),运行时纯 F32 路径。
+
+```
+image → resize(768×768,Lanczos3) → normalize → patchify(16×16, 2304 patches × 768 dim)
+       ↓
+门控 patch embedding: Conv2D(W) + Conv2D(W.1) + bias → [2304, 1152]
+       ↓
++ learned position_embd [1152, 2304]
+       ↓
+27 层 ViT block:
+  LN1(bias) → QKV proj (fused 3456) → M-RoPE(Q,K) → bidirectional attn → out_proj → +residual
+  → LN2(bias) → ffn_up(1152→4304) → GELU → ffn_down(4304→1152) → +residual
+       ↓
+post_ln → [2304, 1152]
+       ↓
+qwen3vl_merger 投影器:
+  spatial_merge(2×2 块合并, 2304→576 patches, reshape 到 [4608, 576])
+  → Linear(4608→4608) → GELU → Linear(4608→5120)
+       ↓
+[576, 5120] vision embeddings (与 text model hidden_dim=5120 一致)
+```
+
+**关键细节**:
+- M-RoPE sections `[head_dim/4]×4 = [18,18,18,18]`,位置 IDs 为 4D `(t=0, h=py, w=px, extra=0)`,只应用在 Q/K
+- 门控 patch embedding:两个相同形状 `[16,16,3,1152]` 的 Conv2D 权重相加
+- attention bidirectional(无 causal mask),所有 patch 互相可见
+- LayerNorm 带 bias(ViT 风格,非 RMSNorm),GELU 用 tanh 近似
+- **vision 注入只在 prefill 阶段**,text-only decode 走 `forward_single_token` 零退化
+
+**性能** (768×768 测试图,Intel Core Ultra 5 225H):
+
+| 阶段 | 时间 | 说明 |
+|------|------|------|
+| preprocess | ~9ms | resize + patchify |
+| ViT encode (27 层) | ~7.8s | AVX2 batched matmul + 8-row dot product kernel + AVX2 attention (hoist q_i) |
+| projector | ~0.13s | batched matmul + AVX2 |
+| prefill (600 expanded tokens) | ~132s | ~220ms/tok,与 text-only 一致 |
+| decode (32 tokens) | ~5.7s | 178ms/tok,与 text-only 一致 |
+
+ViT encode 优化路径: 173s (标量) → 102s (线程池并行) → 60.2s (2D tiled batched matmul) → 14.8s (AVX2 8-row dot product kernel) → 10.2s (AVX2 attention kernel) → 7.92s (proj batched). 总加速 **22×**.
+
+text-only 推理在加载 mmproj 后零退化(5 轮交错 benchmark 验证)。
 
 ## ⚙️ 生成参数(白皮书建议)
 
@@ -295,7 +366,9 @@ MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](
 - [x] Chat 模板与思考模式
 - [x] 多线程并行(持久线程池 + AVX2 手写内核)
 - [x] DSpark 投机解码(`Bonsai-27B-dspark-Q4_1.gguf`)
-- [ ] 多模态视觉输入(`Bonsai-27B-mmproj-Q8_0.gguf`)
+- [x] 多模态视觉输入(`Bonsai-27B-mmproj-Q8_0.gguf`)
+- [x] ViT encoder AVX2 向量化 + 线程池并行(173s/图 → 7.9s/图,22× 加速)
+- [ ] Vision prefill batched(当前逐 token 注入,可分块 batched)
 - [ ] KV cache 量化(4-bit)
 
 ## 📚 参考资料
@@ -304,6 +377,8 @@ MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](
 - [Bonsai-27B-gguf Hugging Face 仓库](https://huggingface.co/prism-ml/Bonsai-27B-gguf)
 - [GGUF 格式规范](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md)
 - [Qwen3 模型架构](https://github.com/QwenLM/Qwen3)
+- [llama.cpp PrismML fork (qwen3vl 参考)](https://github.com/PrismML-Eng/llama.cpp)
+- [Qwen3-VL 多模态架构](https://github.com/QwenLM/Qwen3-VL)
 
 ## 📄 许可证
 

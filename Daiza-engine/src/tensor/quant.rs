@@ -1594,3 +1594,83 @@ pub fn quantize_dequantize_q8_0_into(x: &[f32], y: &mut [f32]) {
         }
     }
 }
+
+/// 反量化 Q8_0 raw bytes → F32 vec (用于 mmproj ViT 权重加载)
+///
+/// Q8_0 格式 (per 32-element block):
+/// ```text
+/// ┌─────────────┬──────────────────────────┐
+/// │ FP16 scale  │  32 个 int8 quantized值    │
+/// │  2 字节     │  32 字节                  │
+/// └─────────────┴──────────────────────────┘
+/// 共 34 字节 / 32 元素
+/// ```
+///
+/// 反量化: `x[i] = qs[i] * d` (d 从 FP16 scale 转换)
+pub fn dequantize_q8_0(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const Q8_0_BLOCK_BYTES: usize = 34;
+    const Q8_0_BLOCK_SIZE: usize = 32;
+    let n_blocks = n_elements.div_ceil(Q8_0_BLOCK_SIZE);
+    let mut out = Vec::with_capacity(n_elements);
+    for b in 0..n_blocks {
+        let block_start = b * Q8_0_BLOCK_BYTES;
+        if block_start + 2 > data.len() {
+            break;
+        }
+        let scale_bits = u16::from_le_bytes([data[block_start], data[block_start + 1]]);
+        let d = f16_to_f32(scale_bits);
+        let qs_start = block_start + 2;
+        for j in 0..Q8_0_BLOCK_SIZE {
+            if out.len() >= n_elements {
+                return out;
+            }
+            if qs_start + j >= data.len() {
+                out.push(0.0);
+                continue;
+            }
+            let q = data[qs_start + j] as i8 as f32; // int8 是 signed
+            out.push(q * d);
+        }
+    }
+    while out.len() < n_elements {
+        out.push(0.0);
+    }
+    out
+}
+
+/// 反量化单行 Q8_0,写入 caller 提供的 slice
+pub fn dequantize_q8_0_row_into(data: &[u8], row_idx: usize, n_cols: usize, out: &mut [f32]) {
+    const Q8_0_BLOCK_BYTES: usize = 34;
+    const Q8_0_BLOCK_SIZE: usize = 32;
+    debug_assert!(out.len() >= n_cols);
+    let blocks_per_row = n_cols.div_ceil(Q8_0_BLOCK_SIZE);
+    let row_byte_offset = row_idx * (blocks_per_row * Q8_0_BLOCK_BYTES);
+    let row_bytes = &data[row_byte_offset..];
+
+    let mut out_idx = 0;
+    for g in 0..blocks_per_row {
+        let bs = g * Q8_0_BLOCK_BYTES;
+        if bs + 2 > row_bytes.len() {
+            break;
+        }
+        let scale_bits = u16::from_le_bytes([row_bytes[bs], row_bytes[bs + 1]]);
+        let d = f16_to_f32(scale_bits);
+        for j in 0..Q8_0_BLOCK_SIZE {
+            if out_idx >= n_cols {
+                return;
+            }
+            let off = bs + 2 + j;
+            if off >= row_bytes.len() {
+                out[out_idx] = 0.0;
+            } else {
+                let q = row_bytes[off] as i8 as f32;
+                out[out_idx] = q * d;
+            }
+            out_idx += 1;
+        }
+    }
+    while out_idx < n_cols {
+        out[out_idx] = 0.0;
+        out_idx += 1;
+    }
+}

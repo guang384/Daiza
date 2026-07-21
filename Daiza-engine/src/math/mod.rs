@@ -25,6 +25,8 @@ pub mod softmax;
 pub mod activation;
 pub mod sampling;
 pub mod simd_exp;
+pub mod layernorm;
+pub mod gelu;
 
 pub use rmsnorm::{rmsnorm_inplace, rmsnorm_into};
 pub use rope::{apply_rope_partial, rope_cos_sin_mrope_text, rope_cos_sin_mrope_text_into, rope_freqs};
@@ -35,3 +37,5 @@ pub use simd_exp::{
     exp_inplace_simd, mul_inplace_simd, sigmoid_fast, sigmoid_inplace_simd,
     silu_fast, silu_inplace_simd, swiglu_inplace_simd,
 };
+pub use layernorm::{layernorm_into, layernorm_inplace};
+pub use gelu::{gelu_into, gelu_inplace};

@@ -39,6 +39,33 @@ fn main() -> Result<()> {
         }
         p
     };
+    // --mmproj <path>: 加载多模态视觉编码器 (mmproj GGUF)
+    let mmproj_path: Option<String> = {
+        let mut iter = args.iter().skip(1);
+        let mut p = None;
+        while let Some(a) = iter.next() {
+            if a == "--mmproj" {
+                if let Some(v) = iter.next() {
+                    p = Some(v.clone());
+                }
+            }
+        }
+        p
+    };
+    // --image <path>: 输入图像路径 (可多次指定, 与 --mmproj 配合)
+    //   若指定至少一张图, 走 generate_with_image 多模态路径
+    let image_paths: Vec<PathBuf> = {
+        let mut paths = Vec::new();
+        let mut iter = args.iter().skip(1);
+        while let Some(a) = iter.next() {
+            if a == "--image" {
+                if let Some(v) = iter.next() {
+                    paths.push(PathBuf::from(v));
+                }
+            }
+        }
+        paths
+    };
     // --confidence-threshold <f32>: DSpark confidence head 早停阈值 (默认 0.0 = 不截断)
     // sigmoid(confidence_logit) < threshold 的位置起, draft token 不再 verify
     // 典型值: 0.5 (中等置信), 0.8 (高置信才 verify)
@@ -141,6 +168,12 @@ fn main() -> Result<()> {
         println!("[daiza-cli] DSpark drafter loaded.");
     }
 
+    // 若指定 --mmproj, 加载多模态视觉编码器
+    if let Some(mp) = &mmproj_path {
+        engine.load_mmproj(std::path::Path::new(mp))?;
+        println!("[daiza-cli] mmproj (vision encoder) loaded.");
+    }
+
     println!("[daiza-cli] Prompt: {prompt:?}");
     println!("[daiza-cli] Max tokens: {max_tokens}");
     println!("[daiza-cli] Raw mode: {raw_mode}");
@@ -149,6 +182,9 @@ fn main() -> Result<()> {
         if confidence_threshold > 0.0 {
             println!("[daiza-cli] Confidence threshold: {confidence_threshold}");
         }
+    }
+    if mmproj_path.is_some() {
+        println!("[daiza-cli] Vision: ENABLED ({} image(s))", image_paths.len());
     }
     println!();
     println!("=== Generating ===");
@@ -168,7 +204,11 @@ fn main() -> Result<()> {
         }
     };
 
-    let output = if dspark_path.is_some() {
+    let output = if mmproj_path.is_some() && !image_paths.is_empty() {
+        // 多模态路径: --mmproj + --image
+        let system = "You are a helpful assistant.";
+        engine.generate_with_image(&prompt, &image_paths, max_tokens, params, Some(system))?
+    } else if dspark_path.is_some() {
         let system = "You are a helpful assistant.";
         engine.generate_with_dspark(&prompt, max_tokens, params, Some(system), confidence_threshold)?
     } else if raw_mode {

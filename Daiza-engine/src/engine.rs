@@ -20,7 +20,13 @@ use crate::model::dspark::{
     weights::DrafterWeights,
     speculative::SpeculativeContext,
 };
-use crate::model::forward::{forward_batch, forward_single_token, make_context};
+use crate::model::forward::{forward_batch, forward_batch_with_vision, forward_single_token, forward_single_token_with_embedding, make_context, VisionInject, ForwardContext};
+use crate::model::vision::{
+    VisionConfig, VisionWeights,
+    encoder::{ViTContext, encode_image},
+    projector::{ProjectorContext, project_vision},
+    preprocess_image,
+};
 use crate::model::weights::LoadedWeights;
 use crate::tokenizer::vocab::Vocab;
 use crate::tokenizer::BpeTokenizer;
@@ -55,6 +61,14 @@ fn ms_per(total_ms: u128, n: usize) -> u128 {
     if n == 0 { 0 } else { total_ms / n as u128 }
 }
 
+/// 多模态视觉上下文 (mmproj 加载后填充)
+pub struct VisionContext {
+    pub cfg: VisionConfig,
+    pub weights: VisionWeights,
+    pub vit_ctx: ViTContext,
+    pub proj_ctx: ProjectorContext,
+}
+
 pub struct Engine {
     pub gguf: GgufFile,
     pub config: Config,
@@ -62,6 +76,10 @@ pub struct Engine {
     pub weights: Option<LoadedWeights>,
     /// DSpark drafter (可选, 由 load_drafter 加载)
     pub spec_ctx: Option<SpeculativeContext>,
+    /// 多模态视觉编码器 (可选, 由 load_mmproj 加载)
+    pub vision: Option<VisionContext>,
+    /// 缓存的 image_token_id (从 tokenizer.special_tokens 查找, 懒初始化)
+    pub image_token_id: Option<u32>,
 }
 
 impl Engine {
@@ -77,6 +95,8 @@ impl Engine {
             tokenizer,
             weights: None,
             spec_ctx: None,
+            vision: None,
+            image_token_id: None,
         })
     }
 
@@ -90,6 +110,49 @@ impl Engine {
             cfg.block_count, cfg.embedding_length, cfg.block_size, cfg.markov_rank);
         self.spec_ctx = Some(SpeculativeContext::new(weights));
         Ok(())
+    }
+
+    /// 加载多模态视觉编码器 (mmproj GGUF)
+    ///
+    /// 加载后 engine 可执行 generate_with_image 多模态推理
+    pub fn load_mmproj(&mut self, path: &Path) -> Result<()> {
+        eprintln!("[vision] Loading mmproj GGUF: {}", path.display());
+        let mmproj_gguf = GgufFile::open(path)?;
+        let cfg = VisionConfig::from_metadata(&mmproj_gguf.metadata)?;
+        eprintln!("[vision] mmproj config: {} blocks, n_embd={}, image={}x{}, patch={}, n_patches={}, n_merged={}, proj_dim={}",
+            cfg.block_count, cfg.embedding_length,
+            cfg.image_size, cfg.image_size, cfg.patch_size,
+            cfg.n_patches, cfg.n_patches_merged(), cfg.projection_dim);
+        let weights = VisionWeights::load(&mmproj_gguf, &cfg)?;
+        let vit_ctx = ViTContext::new(&cfg);
+        let proj_ctx = ProjectorContext::new(&cfg);
+        eprintln!("[vision] mmproj loaded successfully");
+        self.vision = Some(VisionContext { cfg, weights, vit_ctx, proj_ctx });
+        Ok(())
+    }
+
+    /// 查找 image_token 的 token id (Qwen3-VL 标准命名 <|image_pad|>)
+    /// 优先查 tokenizer.ggml.image_token_id metadata, 否则从 special_tokens map 查找
+    pub fn image_token_id(&mut self) -> Result<u32> {
+        if let Some(id) = self.image_token_id {
+            return Ok(id);
+        }
+        // 1. 尝试 GGUF metadata
+        if let Some(id) = self.gguf.metadata.get_u32("tokenizer.ggml.image_token_id") {
+            self.image_token_id = Some(id);
+            return Ok(id);
+        }
+        // 2. 从 special_tokens 查找标准命名
+        for name in ["<|image_pad|>", "<|vision_pad|>", "<|image_start|>"] {
+            if let Some(&id) = self.tokenizer.special_tokens.get(name) {
+                eprintln!("[vision] image_token: {name} → id={id}");
+                self.image_token_id = Some(id);
+                return Ok(id);
+            }
+        }
+        Err(crate::BonsaiError::Unsupported(
+            "image_token_id not found: GGUF has neither tokenizer.ggml.image_token_id metadata nor <|image_pad|>/<|vision_pad|> special token".into()
+        ))
     }
 
     /// 一次性加载所有 block 权重到内存(约 13GB)
@@ -128,6 +191,200 @@ impl Engine {
         params: SamplingParams,
     ) -> Result<String> {
         self.generate_inner(prompt, max_tokens, params, None, true)
+    }
+
+    /// 多模态生成:输入文本 prompt + 一张或多张图像路径
+    ///
+    /// 流程:
+    /// 1. 对每张图: preprocess → ViT encode → project → 得到 n_vision_per_image 个 vision embeddings (hidden dim)
+    /// 2. 在 prompt 文本中插入 image_token 占位符 (每个图像一个 <|image_pad|>)
+    /// 3. 用 forward_batch_with_vision 做 prefill: image_token 位置展开为对应 vision embeddings
+    /// 4. 后续 decode 与 text-only generate 一致
+    ///
+    /// ★ text-only decode 零退化: vision 注入只在 prefill 阶段, decode 走 forward_single_token 不修改
+    pub fn generate_with_image(
+        &mut self,
+        prompt: &str,
+        image_paths: &[std::path::PathBuf],
+        max_tokens: usize,
+        params: SamplingParams,
+        system_prompt: Option<&str>,
+    ) -> Result<String> {
+        if self.vision.is_none() {
+            return Err(crate::BonsaiError::Unsupported(
+                "mmproj not loaded; call load_mmproj() first".into()
+            ));
+        }
+        if image_paths.is_empty() {
+            // 退化到纯文本
+            return self.generate_with_params(prompt, max_tokens, params, system_prompt);
+        }
+
+        // 1. 加载 target 权重 + 线程池 (若未加载)
+        if self.weights.is_none() {
+            eprintln!("[engine] loading target weights...");
+            self.load_weights()?;
+            let n_threads = crate::model::workspace::thread_count();
+            crate::model::workspace::init_thread_pool(n_threads);
+            eprintln!("[engine] thread pool ({n_threads} workers) initialized");
+        }
+
+        // 2. 查找 image_token_id
+        let image_token_id = self.image_token_id()?;
+
+        // 3. 对每张图做 preprocess → encode → project, 拼接 vision_embeddings
+        let n_vision_per_image;
+        let vision_embeddings: Vec<f32> = {
+            let vision = self.vision.as_mut().unwrap();
+            n_vision_per_image = vision.cfg.n_patches_merged();
+            let proj_dim = vision.cfg.projection_dim;
+            let hidden = self.config.hidden;
+            if proj_dim != hidden {
+                return Err(crate::BonsaiError::Model(format!(
+                    "mmproj projection_dim ({proj_dim}) != text model hidden ({hidden}), vision embeddings 无法直接注入"
+                )));
+            }
+            let mut all_emb = Vec::with_capacity(image_paths.len() * n_vision_per_image * hidden);
+            for img_path in image_paths {
+                let t0 = std::time::Instant::now();
+                let patches = preprocess_image(img_path, &vision.cfg)?;
+                let t_pre = t0.elapsed();
+
+                let t1 = std::time::Instant::now();
+                encode_image(&vision.weights, &vision.cfg, &mut vision.vit_ctx, &patches)?;
+                let t_enc = t1.elapsed();
+
+                let t2 = std::time::Instant::now();
+                let vit_out = vision.vit_ctx.hidden.clone(); // [n_patches, n_embd]
+                project_vision(&vit_out, &vision.weights, &vision.cfg, &mut vision.proj_ctx)?;
+                let t_proj = t2.elapsed();
+
+                let proj_out = &vision.proj_ctx.projected;
+                all_emb.extend_from_slice(proj_out);
+                eprintln!("[vision] image {}: pre={:.1}ms enc={:.1}ms proj={:.1}ms total={:.1}ms ({} patches → {} merged)",
+                    img_path.display(),
+                    t_pre.as_secs_f64() * 1000.0,
+                    t_enc.as_secs_f64() * 1000.0,
+                    t_proj.as_secs_f64() * 1000.0,
+                    (t_pre + t_enc + t_proj).as_secs_f64() * 1000.0,
+                    vision.cfg.n_patches, n_vision_per_image);
+            }
+            all_emb
+        };
+
+        // 4. 构造输入文本: 在 prompt 中插入 image_token
+        //    简单策略: 在 user 消息开头插入 N 个 image_token (N = 图像数)
+        //    每个 image_token 会被 forward_batch_with_vision 展开为 n_vision_per_image 个 vision embeddings
+        let image_token_str = self.tokenizer.vocab.tokens.get(image_token_id as usize)
+            .cloned().unwrap_or_else(|| "<|image_pad|>".to_string());
+        let mut image_section = String::new();
+        for _ in 0..image_paths.len() {
+            image_section.push_str(&image_token_str);
+        }
+        let chat_text = build_chat_input_with_image(&image_section, prompt, system_prompt);
+        eprintln!("[debug] input text: {chat_text:?}");
+        let input_ids = self.tokenizer.encode(&chat_text);
+        eprintln!("[debug] input_ids count: {} (含 {} 个 image_token, 展开为 {} 个 vision embeddings)",
+            input_ids.len(),
+            image_paths.len(),
+            image_paths.len() * n_vision_per_image);
+        if input_ids.is_empty() {
+            return Err(crate::BonsaiError::Tokenizer("encode returned empty".into()));
+        }
+
+        // 5. 构造前向上下文
+        let cfg = &self.config;
+        let weights = self.weights.as_ref().unwrap();
+        let mut ctx = make_context(weights, cfg);
+
+        // 6. prefill: text tokens 用 forward_batch (batched), vision embeddings 逐个注入
+        //    ★ 策略:
+        //      - text tokens: 收集成 batch (≤32), 用 forward_batch 一次读 13GB 权重
+        //      - image_token: 展开为 n_vision_per_image 个 vision embeddings,
+        //        用 forward_single_token_with_embedding 逐个注入 (不在热路径, 一次性成本)
+        //    ★ 不使用 forward_batch_with_vision, 因 batched Q1_0 kernel tmp buffer 上限 64,
+        //      而 n_vision_per_image=576 远超上限
+        let n_input = input_ids.len();
+        let prefill_start = std::time::Instant::now();
+        const MAX_TEXT_BATCH: usize = 32;
+        let mut text_batch: Vec<u32> = Vec::with_capacity(MAX_TEXT_BATCH);
+        let mut vision_offset = 0usize; // 以 hidden-dim 为单位的偏移
+        let hidden = self.config.hidden;
+
+        // flush 当前 text batch
+        let flush_text_batch = |batch: &mut Vec<u32>, ctx: &mut ForwardContext<'_>| -> crate::Result<()> {
+            if batch.is_empty() { return Ok(()); }
+            if batch.len() == 1 {
+                forward_single_token(ctx, batch[0])?;
+            } else {
+                forward_batch(ctx, batch, ctx.state.pos, None)?;
+            }
+            batch.clear();
+            Ok(())
+        };
+
+        for &tid in &input_ids {
+            if tid == image_token_id {
+                // 先 flush 累积的 text batch
+                flush_text_batch(&mut text_batch, &mut ctx)?;
+                // 逐个注入 n_vision_per_image 个 vision embeddings
+                for vi in 0..n_vision_per_image {
+                    let emb_start = (vision_offset + vi) * hidden;
+                    let emb_end = emb_start + hidden;
+                    let emb = &vision_embeddings[emb_start..emb_end];
+                    forward_single_token_with_embedding(&mut ctx, emb)?;
+                }
+                vision_offset += n_vision_per_image;
+            } else {
+                text_batch.push(tid);
+                if text_batch.len() >= MAX_TEXT_BATCH {
+                    flush_text_batch(&mut text_batch, &mut ctx)?;
+                }
+            }
+        }
+        flush_text_batch(&mut text_batch, &mut ctx)?;
+
+        let prefill_ms = prefill_start.elapsed().as_millis();
+        let n_image_tokens = input_ids.iter().filter(|&&t| t == image_token_id).count();
+        let n_batch_expanded = n_input - n_image_tokens + n_image_tokens * n_vision_per_image;
+        eprintln!("\r[prefill] {n_input} input tokens (expanded to {n_batch_expanded} with vision) done in {prefill_ms}ms");
+
+        // 7. decode: 与 text-only generate 完全一致
+        let mut rng = LcgRng::new(0xC0FFEE);
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
+        let stream_output = !matches!(std::env::var("DAIZA_STREAM").as_deref(),
+            Ok("0") | Ok("false") | Ok("no"));
+        let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
+
+        let decode_start = std::time::Instant::now();
+        for step in 0..max_tokens {
+            let next_id = sample_top_k_top_p_into(
+                &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
+            );
+            if next_id as u32 == self.config.eos_token_id {
+                break;
+            }
+            generated_ids.push(next_id as u32);
+            forward_single_token(&mut ctx, next_id as u32)?;
+            if stream_output {
+                eprint!("\r[decode] {step}/{max_tokens}");
+                if let Some(s) = self.tokenizer.vocab.tokens.get(next_id as usize) {
+                    eprint!(" -> {s}");
+                }
+            }
+        }
+        if stream_output {
+            eprintln!();
+        }
+        let decode_ms = decode_start.elapsed().as_millis();
+        let n_gen = generated_ids.len();
+        if n_gen > 0 {
+            eprintln!("[bench] vision decode({n_gen}t)={decode_ms}ms (~{}ms/tok ~{:.2} tok/s)",
+                decode_ms / n_gen as u128,
+                n_gen as f64 * 1000.0 / decode_ms as f64);
+        }
+
+        Ok(self.tokenizer.decode(&generated_ids))
     }
 
     fn generate_inner(
@@ -793,6 +1050,33 @@ fn build_chat_input(user_prompt: &str, system_prompt: Option<&str>) -> String {
     s.push_str("<|im_start|>assistant\n");
     // 思考模式:chat_template 的 else 分支(默认 enable_thinking=true)
     // 输出 `<think>\n` 作为思考模式开始标记(从 GGUF 原始字节确认:3c 74 68 69 6e 6b 3e)
+    s.push_str("<think>\n");
+    s
+}
+
+/// 构造带图像占位符的 chat 输入
+///
+/// `image_section`: N 个 image_token 字符串 (如 "<|image_pad|><|image_pad|>")
+/// `user_prompt`: 用户文本 prompt
+/// `system_prompt`: 可选系统 prompt
+///
+/// 输出: `<|im_start|>user\n{image_section}{user_prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n`
+fn build_chat_input_with_image(
+    image_section: &str,
+    user_prompt: &str,
+    system_prompt: Option<&str>,
+) -> String {
+    let mut s = String::new();
+    if let Some(sys) = system_prompt {
+        s.push_str("<|im_start|>system\n");
+        s.push_str(sys);
+        s.push_str("<|im_end|>\n");
+    }
+    s.push_str("<|im_start|>user\n");
+    s.push_str(image_section);
+    s.push_str(user_prompt);
+    s.push_str("<|im_end|>\n");
+    s.push_str("<|im_start|>assistant\n");
     s.push_str("<think>\n");
     s
 }

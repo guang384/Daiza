@@ -6,6 +6,20 @@ use crate::model::config::Config;
 use crate::model::weights::LoadedWeights;
 use crate::model::workspace::Workspace;
 
+/// 多模态 vision embedding 注入参数 (用于 forward_batch_with_vision)
+///
+/// 在 prefill 阶段, 把 token_ids 中匹配 `image_token_id` 的位置
+/// 替换为 `vision_embeddings` 中接下来的 `n_vision_per_image` 个 hidden-dim 向量.
+pub struct VisionInject<'a> {
+    /// 图像占位 token ID (如 <|image_pad|> 对应的 id)
+    pub image_token_id: u32,
+    /// 扁平化的 vision embeddings: [n_total_vision * hidden] 行优先
+    /// 多张图按 token_ids 中 image_token 出现顺序依次拼接
+    pub vision_embeddings: &'a [f32],
+    /// 单张图展开后的 vision patch 数 (spatial merge 后, 如 576)
+    pub n_vision_per_image: usize,
+}
+
 /// 每层的运行时状态
 pub struct ModelState {
     pub kv_caches: Vec<Option<KvCache>>,
@@ -99,16 +113,43 @@ pub fn forward_single_token(
     ctx: &mut ForwardContext<'_>,
     token_id: u32,
 ) -> crate::Result<()> {
+    let hidden = ctx.cfg.hidden;
+    // 1. embedding lookup → ctx.h_buf
+    //    ★ 通过 row_into_slice 直接写入预分配 buffer,避免返回 Vec
+    let t_emb_start = std::time::Instant::now();
+    ctx.weights.global.token_embd
+        .row_into_slice(token_id as usize, &mut ctx.h_buf[..hidden]);
+    let t_emb = t_emb_start.elapsed();
+    forward_single_token_core(ctx, t_emb)
+}
+
+/// 多模态变体: 用预计算的 vision embedding 替代 token_embd lookup
+///
+/// 用于 vision prefill: 576 个 vision patch embeddings 逐个注入,
+/// 每个 embedding 替代一个 image_token 位置的 token_embd 查找。
+/// ★ 不在热路径 (vision 是一次性成本), 不影响 text-only decode 性能。
+pub fn forward_single_token_with_embedding(
+    ctx: &mut ForwardContext<'_>,
+    embedding: &[f32],
+) -> crate::Result<()> {
+    let hidden = ctx.cfg.hidden;
+    debug_assert_eq!(embedding.len(), hidden);
+    let t_emb_start = std::time::Instant::now();
+    ctx.h_buf[..hidden].copy_from_slice(embedding);
+    let t_emb = t_emb_start.elapsed();
+    forward_single_token_core(ctx, t_emb)
+}
+
+/// forward_single_token 的核心逻辑 (embedding lookup 之后的部分)
+///
+/// cos/sin → 64 blocks → final norm → LM head → pos++
+fn forward_single_token_core(
+    ctx: &mut ForwardContext<'_>,
+    t_emb: std::time::Duration,
+) -> crate::Result<()> {
     let cfg = ctx.cfg;
     let hidden = cfg.hidden;
     let profile = profile_enabled();
-
-    // 1. embedding lookup → ctx.h_buf
-    //    ★ 通过 row_into_slice 直接写入预分配 buffer,避免返回 Vec
-    let t0 = std::time::Instant::now();
-    ctx.weights.global.token_embd
-        .row_into_slice(token_id as usize, &mut ctx.h_buf[..hidden]);
-    let t_emb = t0.elapsed();
 
     // 2. 预计算当前 pos 的 cos/sin(写入预分配 buffer,避免每 token 分配 Vec)
     let t1 = std::time::Instant::now();
@@ -270,6 +311,10 @@ pub fn forward_single_token(
 ///   写入 `[n_batch * vocab_size]` (行优先); 否则只算最后一个 token (省 (n_batch-1) × 179MB)。
 ///
 /// 最后一个 token 的 logits 始终写入 `ctx.logits_buf`(无 clone, 直接读)
+///
+/// ★ 多模态: `vision_inject` 为 Some 时, token_ids 中的 image_token_id 位置
+///   会被展开为 n_vision_per_image 个 vision embeddings (来自 mmproj 投影器).
+///   text-only 路径传 None, 零退化 (无额外分支开销).
 #[allow(unsafe_code)]
 pub fn forward_batch(
     ctx: &mut ForwardContext<'_>,
@@ -277,10 +322,25 @@ pub fn forward_batch(
     start_pos: usize,
     per_pos_logits: Option<&mut [f32]>,
 ) -> crate::Result<()> {
+    forward_batch_with_vision(ctx, token_ids, start_pos, per_pos_logits, None)
+}
+
+/// 多模态版 forward_batch: 支持 vision embeddings 注入
+///
+/// `vision_inject`: 若 Some, token_ids 中匹配 image_token_id 的位置
+///   被替换为 vision_embeddings 中接下来的 n_vision_per_image 个 hidden-dim 向量
+#[allow(unsafe_code)]
+pub fn forward_batch_with_vision(
+    ctx: &mut ForwardContext<'_>,
+    token_ids: &[u32],
+    start_pos: usize,
+    per_pos_logits: Option<&mut [f32]>,
+    vision_inject: Option<VisionInject<'_>>,
+) -> crate::Result<()> {
     let cfg = ctx.cfg;
     let hidden = cfg.hidden;
-    let n_batch = token_ids.len();
-    if n_batch == 0 {
+    let n_input = token_ids.len();
+    if n_input == 0 {
         return Ok(());
     }
 
@@ -295,11 +355,41 @@ pub fn forward_batch(
     let mut p_final = std::time::Duration::ZERO;
 
     // 1. embedding lookup: ctx.h_buf 需要扩展为 batch 大小
+    //    ★ vision_inject: 每个 image_token 位置展开为 n_vision_per_image 个 vision embedding
     let t0 = if profile { Some(std::time::Instant::now()) } else { None };
+    let n_batch: usize = if let Some(vi) = vision_inject.as_ref() {
+        let mut n = 0usize;
+        for &tid in token_ids {
+            n += if tid == vi.image_token_id { vi.n_vision_per_image } else { 1 };
+        }
+        n
+    } else {
+        n_input
+    };
     ctx.h_buf.resize(n_batch * hidden, 0.0);
-    for t in 0..n_batch {
-        ctx.weights.global.token_embd
-            .row_into_slice(token_ids[t] as usize, &mut ctx.h_buf[t * hidden..(t + 1) * hidden]);
+    if let Some(vi) = vision_inject.as_ref() {
+        let mut out_idx = 0usize;
+        let mut vis_idx = 0usize;
+        for &tid in token_ids {
+            if tid == vi.image_token_id {
+                let n_vis = vi.n_vision_per_image;
+                let src = &vi.vision_embeddings[vis_idx..vis_idx + n_vis * hidden];
+                let dst = &mut ctx.h_buf[out_idx * hidden..(out_idx + n_vis) * hidden];
+                dst.copy_from_slice(src);
+                out_idx += n_vis;
+                vis_idx += n_vis * hidden;
+            } else {
+                ctx.weights.global.token_embd
+                    .row_into_slice(tid as usize, &mut ctx.h_buf[out_idx * hidden..(out_idx + 1) * hidden]);
+                out_idx += 1;
+            }
+        }
+        debug_assert_eq!(out_idx, n_batch);
+    } else {
+        for t in 0..n_input {
+            ctx.weights.global.token_embd
+                .row_into_slice(token_ids[t] as usize, &mut ctx.h_buf[t * hidden..(t + 1) * hidden]);
+        }
     }
     if let Some(t) = t0 { p_emb = t.elapsed(); }
 

@@ -27,6 +27,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::cell::Cell;
 
 use crate::model::config::Config;
 
@@ -35,6 +36,26 @@ use crate::model::config::Config;
 // ---------------------------------------------------------------------------
 
 static GLOBAL_POOL: OnceLock<ThreadPool> = OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// 嵌套并行检测: 防止 matvec_into_slice 在 par_for_patches 闭包内再次调度
+// ---------------------------------------------------------------------------
+// thread_local 标志: 当前线程是否正在执行 scatter_wait 分发的任务.
+// - trampoline / stride_trampoline / steal_trampoline 进入时置位, 退出时清除
+// - scatter_wait 主线程执行 chunk 时置位, 完成后清除
+// - matvec_into_slice 检查此标志: 若在并行区内, 走 serial 路径, 避免嵌套调度死等
+thread_local! {
+    static IN_PARALLEL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 当前线程是否在并行区内 (正在执行 scatter_wait 分发的任务)
+pub fn in_parallel_region() -> bool {
+    IN_PARALLEL.with(|f| f.get())
+}
+
+fn set_in_parallel(v: bool) {
+    IN_PARALLEL.with(|f| f.set(v));
+}
 
 /// 初始化全局线程池(引擎启动时调用一次)
 ///
@@ -132,7 +153,9 @@ struct Shared {
 /// ctx 必须指向有效的 F 实例, 且在调用期间保持存活
 #[allow(unsafe_code)]
 unsafe fn trampoline<F: Fn(usize)>(ctx: *const (), i: usize) {
-    (&*(ctx as *const F))(i)
+    set_in_parallel(true);
+    (&*(ctx as *const F))(i);
+    set_in_parallel(false);
 }
 
 /// Worker 主循环: 自适应 wait 策略 (彻底解决热降频)
@@ -346,11 +369,13 @@ impl ThreadPool {
             }
 
             // main 执行 stride 循环: f(n_active), f(n_active+stride), ...
+            set_in_parallel(true);
             let mut i = n_active;
             while i < n {
                 f(i);
                 i += stride;
             }
+            set_in_parallel(false);
 
             if n_dispatch > 0 {
                 let mut spun = 0;
@@ -389,7 +414,9 @@ impl ThreadPool {
         }
 
         // 主线程执行最后一个 chunk (tid = n-1)
+        set_in_parallel(true);
         f(n - 1);
+        set_in_parallel(false);
 
         // 等待所有 worker 完成 (Acquire: 看到 done 后, 读到 worker 的内存写)
         if n_dispatch > 0 {
@@ -465,7 +492,9 @@ impl ThreadPool {
         }
 
         // 主线程也参与抢 chunk (像 llama.cpp)
+        set_in_parallel(true);
         steal_loop(&self.shared, &f);
+        set_in_parallel(false);
 
         // 等待所有 worker 完成 (Acquire: 看到 done 后, 读到 worker 的内存写)
         // ★ 热降频根治: main spin + yield 混合, 避免持续 spin 占满 main 核
@@ -555,11 +584,13 @@ unsafe fn stride_trampoline<F: Fn(usize)>(ctx: *const (), tid: usize) {
     let n_total = shared.total_work.load(Ordering::Relaxed);
     // stride = n_active + 1 (active workers + main)
     let stride = shared.n_active_workers.load(Ordering::Relaxed) + 1;
+    set_in_parallel(true);
     let mut i = tid;
     while i < n_total {
         f(i);
         i += stride;
     }
+    set_in_parallel(false);
 }
 
 /// Work-stealing trampoline: worker 调用此函数, 内部抢完所有 chunk 后返回
@@ -568,7 +599,9 @@ unsafe fn steal_trampoline<F: Fn(usize, usize)>(ctx: *const (), _tid: usize) {
     let sc = &*(ctx as *const StealCtx<F>);
     let shared = &*sc.shared;
     let f = &*sc.f;
+    set_in_parallel(true);
     steal_loop(shared, f);
+    set_in_parallel(false);
 }
 
 impl Drop for ThreadPool {

@@ -156,4 +156,34 @@ impl Metadata {
             _ => None,
         }
     }
+
+    /// 读取 bool 数组 (mmproj clip.vision.is_deepstack_layers 等)
+    pub fn get_bool_array(&self, key: &str) -> Option<Vec<bool>> {
+        match self.kv.get(key)? {
+            MetaValue::Array(elems) => elems
+                .iter()
+                .map(|v| match v {
+                    MetaValue::Bool(b) => Ok(*b),
+                    _ => Err(()),
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok(),
+            _ => None,
+        }
+    }
+
+    /// 读取字符串数组 (mmproj clip.vision.patch_bias 等)
+    pub fn get_string_array(&self, key: &str) -> Option<Vec<String>> {
+        match self.kv.get(key)? {
+            MetaValue::Array(elems) => elems
+                .iter()
+                .map(|v| match v {
+                    MetaValue::String(s) => Ok(s.clone()),
+                    _ => Err(()),
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok(),
+            _ => None,
+        }
+    }
 }
