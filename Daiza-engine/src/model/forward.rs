@@ -421,27 +421,45 @@ pub fn forward_batch(
                     &v_buf[kv_off..kv_off + n_kv_heads * head_dim],
                 );
 
-                // Attention scores + V weighted sum
+                // Attention scores + V weighted sum(★ GQA 复用)
+                //
+                // 原实现:每 qh 独立读 K/V cache,24 qh 重复读同一 kvh 的 K/V → 6× 冗余
+                // GQA 复用:外层循环 kvh,内层 group_size 个 qh 共享 K/V cache 读取
                 let n_cached = kv.len;
                 // ★ 优化: scale/group_size 已提到 block 循环外
                 // ★ P1-5: 直接写 attn_out_buf[t..], 省末尾 attn_out copy
                 let out_t = &mut attn_out_buf[t * attn_out_dim..(t + 1) * attn_out_dim];
                 out_t[..attn_out_dim].fill(0.0);
-                let scores = &mut ctx.workspace.attn_scores[..n_cached];
+                // ★ GQA 复用:attn_scores 容量为 group_size × context_length
+                debug_assert!(ctx.workspace.attn_scores.len() >= group_size * n_cached);
 
-                for qh in 0..n_q_heads {
-                    let kvh = qh / group_size;
-                    let q_head = &ctx.workspace.attn_q[qh * head_dim..(qh + 1) * head_dim];
+                for kvh in 0..n_kv_heads {
+                    // 阶段 1: K 复用 — 一次读 K[c][kvh],算 group_size 个 qh 的 scores
                     for c in 0..n_cached {
-                        let k_t_c = kv.k_at(c);
-                        let k_head = &k_t_c[kvh * head_dim..(kvh + 1) * head_dim];
-                        scores[c] = crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * attn_scale;
+                        let k_head = &kv.k_at(c)[kvh * head_dim..(kvh + 1) * head_dim];
+                        for qh_in_group in 0..group_size {
+                            let qh = kvh * group_size + qh_in_group;
+                            let q_head = &ctx.workspace.attn_q[qh * head_dim..(qh + 1) * head_dim];
+                            ctx.workspace.attn_scores[qh_in_group * n_cached + c] =
+                                crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * attn_scale;
+                        }
                     }
-                    math::softmax_inplace(scores);
-                    let out_head = &mut out_t[qh * head_dim..(qh + 1) * head_dim];
+
+                    // 阶段 2: group_size 个 qh 各自 softmax
+                    for qh_in_group in 0..group_size {
+                        let s = &mut ctx.workspace.attn_scores[qh_in_group * n_cached..(qh_in_group + 1) * n_cached];
+                        math::softmax_inplace(s);
+                    }
+
+                    // 阶段 3: V 复用 — 一次读 V[c][kvh],做 group_size 个 qh 的 V 加权
                     for c in 0..n_cached {
                         let v_head = &kv.v_at(c)[kvh * head_dim..(kvh + 1) * head_dim];
-                        crate::math::simd_exp::saxpy_avx2(scores[c], v_head, out_head, head_dim);
+                        for qh_in_group in 0..group_size {
+                            let qh = kvh * group_size + qh_in_group;
+                            let out_head = &mut out_t[qh * head_dim..(qh + 1) * head_dim];
+                            let s = ctx.workspace.attn_scores[qh_in_group * n_cached + c];
+                            crate::math::simd_exp::saxpy_avx2(s, v_head, out_head, head_dim);
+                        }
                     }
                 }
 

@@ -631,7 +631,8 @@ pub struct Workspace {
     pub attn_v: Vec<f32>,
     /// `[n_q_heads * head_dim]` = 6144,attention 输出(被 gate 调制后)
     pub attn_out: Vec<f32>,
-    /// `[max_seq_len]` softmax scores(动态增长,与 KV cache 同步)
+    /// `[group_size * max_seq_len]` softmax scores(GQA 复用:同 kvh 的 group_size 个 qh 并行持有各自 scores)
+    /// ★ GQA 复用:同 kvh 的 group_size 个 qh 共享 K/V cache 读取,各自 scores 在 [qh_in_group * n_cached + c] 处
     pub attn_scores: Vec<f32>,
 
     // === ssm.rs 用 ===
@@ -683,9 +684,10 @@ impl Workspace {
             attn_k: vec![0.0; n_kv_heads * head_dim],
             attn_v: vec![0.0; n_kv_heads * head_dim],
             attn_out: vec![0.0; n_q_heads * head_dim],
-            // 预分配到 context_length,消除热路径 realloc
-            // (长上下文下 n_cached 会持续增长,with_capacity 会多次 realloc)
-            attn_scores: vec![0.0; cfg.context_length],
+            // ★ GQA 复用:预分配 group_size × context_length,让同 kvh 的 group_size 个 qh
+            //   并行持有各自 scores(K/V cache 每 kvh 只读 1 次,服务 group_size 个 qh)
+            //   group_size = n_q_heads / n_kv_heads(Bonsai: 24/4 = 6)
+            attn_scores: vec![0.0; cfg.context_length * (n_q_heads / n_kv_heads)],
 
             ssm_qkv: vec![0.0; qkv_full_len],
             ssm_q: vec![0.0; qkv_dim],

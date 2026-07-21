@@ -114,35 +114,48 @@ pub fn attention_forward_into(
     // 7. 写入 KV cache
     kv_cache.append(&ws.attn_k, &ws.attn_v);
 
-    // 8. Attention scores + softmax + V 加权
+    // 8. Attention scores + softmax + V 加权(★ GQA 复用)
+    //
+    // 原实现:每 qh 独立读 K/V cache,24 qh × n_cached 次 K 读取 + 24 × n_cached 次 V 读取
+    //   每 6 个共享 kvh 的 qh 重复读同一份 K/V cache → 6× 冗余读取
+    //
+    // GQA 复用:外层循环 kvh,内层一次性算 group_size 个 qh 的 scores + V 加权
+    //   K/V cache 每 kvh 只读 1 次,服务 group_size 个 qh → 消除 6× 冗余
+    //   scores 布局:[group_size × n_cached] flat, scores[qh_in_group * n_cached + c]
     let n_cached = kv_cache.len;
     let scale = 1.0 / (head_dim as f32).sqrt();
     // 清零 attn_out(全部 n_q_heads * head_dim 长度,fill 更易被识别为 memset)
     ws.attn_out.fill(0.0);
-    // attn_scores 已在 Workspace::new 中预分配到 context_length,无需热路径 resize
-    debug_assert!(ws.attn_scores.len() >= n_cached);
-    let scores = &mut ws.attn_scores[..n_cached];
+    // ★ GQA 复用:attn_scores 容量为 group_size × context_length,持有 group_size 个 qh 的 scores
+    debug_assert!(ws.attn_scores.len() >= group_size * n_cached);
 
-    for qh in 0..n_q_heads {
-        let kvh = qh / group_size;
-        let q_head = &ws.attn_q[qh * head_dim..(qh + 1) * head_dim];
-
-        // scores[t] = q · k_cache[t]
-        // ★ AVX2 向量化: dot_product_avx2, head_dim=256 = 32 × 8-wide FMA
-        for t in 0..n_cached {
-            let k_t = kv_cache.k_at(t);
-            let k_head = &k_t[kvh * head_dim..(kvh + 1) * head_dim];
-            scores[t] = crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * scale;
+    for kvh in 0..n_kv_heads {
+        // 阶段 1: K 复用 — 一次读 K[c][kvh],算 group_size 个 qh 的 scores
+        for c in 0..n_cached {
+            let k_head = &kv_cache.k_at(c)[kvh * head_dim..(kvh + 1) * head_dim];
+            for qh_in_group in 0..group_size {
+                let qh = kvh * group_size + qh_in_group;
+                let q_head = &ws.attn_q[qh * head_dim..(qh + 1) * head_dim];
+                ws.attn_scores[qh_in_group * n_cached + c] =
+                    crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * scale;
+            }
         }
 
-        // softmax(全部可见,因为 decode 阶段只看历史 + 当前)
-        math::softmax_inplace(scores);
+        // 阶段 2: group_size 个 qh 各自 softmax(独立行,无依赖)
+        for qh_in_group in 0..group_size {
+            let s = &mut ws.attn_scores[qh_in_group * n_cached..(qh_in_group + 1) * n_cached];
+            math::softmax_inplace(s);
+        }
 
-        // ★ AVX2 向量化 V 加权: saxpy_avx2, 8-wide FMA
-        let out_head = &mut ws.attn_out[qh * head_dim..(qh + 1) * head_dim];
-        for t in 0..n_cached {
-            let v_head = &kv_cache.v_at(t)[kvh * head_dim..(kvh + 1) * head_dim];
-            crate::math::simd_exp::saxpy_avx2(scores[t], v_head, out_head, head_dim);
+        // 阶段 3: V 复用 — 一次读 V[c][kvh],做 group_size 个 qh 的 V 加权
+        for c in 0..n_cached {
+            let v_head = &kv_cache.v_at(c)[kvh * head_dim..(kvh + 1) * head_dim];
+            for qh_in_group in 0..group_size {
+                let qh = kvh * group_size + qh_in_group;
+                let out_head = &mut ws.attn_out[qh * head_dim..(qh + 1) * head_dim];
+                let s = ws.attn_scores[qh_in_group * n_cached + c];
+                crate::math::simd_exp::saxpy_avx2(s, v_head, out_head, head_dim);
+            }
         }
     }
 
