@@ -313,10 +313,10 @@ qwen3vl_merger 投影器:
 | 阶段 | 时间 | 说明 |
 |------|------|------|
 | preprocess | ~9ms | resize + patchify |
-| ViT encode (27 层) | ~7.8s | AVX2 batched matmul + 8-row dot product kernel + AVX2 attention (hoist q_i) |
-| projector | ~0.13s | batched matmul + AVX2 |
-| prefill (600 expanded tokens) | ~100s | ~165ms/tok,vision 分批 batched 注入 (MAX_VISION_BATCH=64) |
-| decode (32 tokens) | ~5.7s | 178ms/tok,与 text-only 一致 |
+| ViT encode (27 层) | ~8.2s | AVX2 batched matmul + 8-row dot product kernel + AVX2 attention (hoist q_i) |
+| projector | ~0.19s | batched matmul + AVX2 |
+| prefill (602 expanded tokens) | ~103s | ~165ms/tok,vision 分批 batched 注入 (MAX_VISION_BATCH=64) |
+| decode (48 tokens) | ~8.3s | 173ms/tok,与 text-only 一致 |
 
 ViT encode 优化路径: 173s (标量) → 102s (线程池并行) → 60.2s (2D tiled batched matmul) → 14.8s (AVX2 8-row dot product kernel) → 10.2s (AVX2 attention kernel) → 7.92s (proj batched). 总加速 **22×**.
 
@@ -333,35 +333,6 @@ text-only 推理在加载 mmproj 后零退化(5 轮交错 benchmark 验证)。
 | top_p | 0.95 |
 
 这些设置用于 Bonsai 27B 所有 benchmark 结果(thinking mode)。
-
-## 🧪 已验证输出
-
-| 模式 | 输入 | 输出 | 备注 |
-|------|------|------|------|
-| Raw | `The capital of China is` | ` Beijing` | ✅ top-1 logit 12.58 |
-| Raw | `The capital of France is` (16t) | ` the capital of France is Paris. The capital of France is Paris...` | ✅ 答案正确,但有重复倾向 |
-| Raw | `1, 2, 3, 4,` (16t) | ` 5, 6, 7, 8, 9,` | ✅ 序列补全完美 |
-| Raw | `1+1=` (greedy 50t) | `2, 1+2=3, 1+3=4, 1+4=5, 1+5=6, 1+6=7, 1+7=8, 1+8=9` | ✅ 正确答案 + 加法序列补全 |
-| Raw | `2+3=` (16t) | `5` | ✅ 正确 |
-| Raw | `10+20=` (16t) | `30` | ✅ 正确 |
-| Raw | `12+7=` / `5*6=` / `100-23=` (30t) | `19` / `30` / `77` | ✅ 全部正确 |
-| Raw | `What is 2 plus 2?` (16t) | (空白) | ❌ 模型为 chat 模式训练, raw 模式缺思考标记无法回答 |
-| Chat | `你好` (32 tok) | `Here's a thinking process: 1. **Analyze the user's input:** User says: "你好" (Hello)` | ✅ 正确进入思考 |
-| Chat (greedy) | `1+1等于几` / `池塘鱼` | 正确进入 thinking 步骤, 完成 arithmetic/interpretation 分析 | ✅ thinking 推理正常 |
-
-### ✅ 与官方 llama.cpp (PrismML-Eng 分支) 对比 — Daiza 实现 bug 已定位并修复
-
-相同 prompt `1+1=`, 相同 Q1_0 模型, 官方推荐参数 T=0.7/top_k=20/top_p=0.95:
-
-| 实现 | 输出 | 结果 |
-|------|------|------|
-| **官方 llama.cpp** (prism 分支, build b1-79697f2) | `[Start thinking] Here's a thinking process: 1. Analyze User Input... 6. Self-Correction: "2" is perfect.✅ [End thinking] 2` | ✅ 完整 6 步 thinking + 正确答案 `2` |
-| **Daiza** (修复前) | `Here's a thinking process: 1. **Analyze the user's input:** * The user's input is just "1+1=1=1=1=1=1=1=...` | ❌ thinking 步骤 1 重复 collapse |
-| **Daiza** (修复后) | `2, 1+2=3, 1+3=4, ...` (raw greedy) / thinking 推理正常 (chat) | ✅ 正确 |
-
-**根因**: SSM (Gated DeltaNet) 块的 GQA v_head→k_head 映射错误。Bonsai-27B GGUF 由 llama.cpp prism 分支转换工具生成, V heads 经 `conversion/qwen.py` 的 `_LinearAttentionVReorderBase` 重排为 **tiled 布局** (k_head i 对应 v_head `[i, i+num_k_heads, i+2*num_k_heads]`)。原实现误用 **div 映射** (`kh = vh / 3`, grouped 布局), 与 GGUF 实际布局不匹配, 导致 SSM scan 中 q/k 与错误的 v_head 配对, 累积后输出 collapse。
-
-**修复**: 改为 **mod 映射** (`kh = vh % num_k_heads`), 与 llama.cpp `ggml_repeat` 一致。修改 3 处: `ssm.rs` (decode path) + `forward.rs` (batch path 串行 + 并行)。commit `234c956`。
 
 ## 📊 性能参考(纯 CPU,单 token decode)
 
