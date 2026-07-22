@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["Daiza-engine", "Daiza-runtime", "Daiza-cli", "Daiza-web", "Daiza-app"]
+
+[profile.release]
+# 推理引擎是带宽/计算密集型,release 优化档对最终 tok/s 至关重要
+opt-level = 3
+# fat LTO: 合并所有 crate IR 为单一编译单元,保证跨 crate 内联等效于同 crate
+# (拆分为 workspace 后,热路径 daiza-runtime → daiza-engine 的 forward/matvec 调用
+#  需要 fat LTO 才能跨 crate 内联 #[inline] AVX2 kernel)
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1   # 开发时也启用 O1,避免 GEMM 慢到无法验证

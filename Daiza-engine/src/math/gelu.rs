@@ -16,8 +16,6 @@ use crate::math::simd_exp::{simd_available, exp_ps};
 
 const SQRT_2_OVER_PI: f32 = 0.7978845608028654; // sqrt(2/pi)
 const GELU_CONST: f32 = 0.044715;
-const SQRT_2: f32 = 1.4142135623730951;
-const INV_SQRT_2: f32 = 0.7071067811865476; // 1/sqrt(2)
 
 /// AVX2 tanh 近似 GELU 内核: `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`
 ///
@@ -85,10 +83,4 @@ pub fn gelu_into(x: &[f32], out: &mut [f32]) {
     }
 }
 
-/// 原地 GELU
-pub fn gelu_inplace(x: &mut [f32]) {
-    let n = x.len();
-    let mut tmp = vec![0.0f32; n];
-    gelu_into(x, &mut tmp);
-    x.copy_from_slice(&tmp);
-}
+

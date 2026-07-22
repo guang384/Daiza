@@ -21,6 +21,7 @@ pub struct VisionInject<'a> {
 }
 
 /// 每层的运行时状态
+#[derive(Clone, Default)]
 pub struct ModelState {
     pub kv_caches: Vec<Option<KvCache>>,
     pub ssm_states: Vec<Option<SsmState>>,
@@ -55,10 +56,6 @@ impl ModelState {
             rope_freqs: math::rope_freqs(cfg.rope_dim, cfg.rope_freq_base),
             rope_sections: cfg.rope_dim_sections.clone(),
         }
-    }
-
-    pub fn cos_sin_at(&self, pos: usize) -> (Vec<f32>, Vec<f32>) {
-        math::rope_cos_sin_mrope_text(pos, &self.rope_freqs, &self.rope_sections)
     }
 
     pub fn reset(&mut self) {
@@ -119,23 +116,6 @@ pub fn forward_single_token(
     let t_emb_start = std::time::Instant::now();
     ctx.weights.global.token_embd
         .row_into_slice(token_id as usize, &mut ctx.h_buf[..hidden]);
-    let t_emb = t_emb_start.elapsed();
-    forward_single_token_core(ctx, t_emb)
-}
-
-/// 多模态变体: 用预计算的 vision embedding 替代 token_embd lookup
-///
-/// 用于 vision prefill: 576 个 vision patch embeddings 逐个注入,
-/// 每个 embedding 替代一个 image_token 位置的 token_embd 查找。
-/// ★ 不在热路径 (vision 是一次性成本), 不影响 text-only decode 性能。
-pub fn forward_single_token_with_embedding(
-    ctx: &mut ForwardContext<'_>,
-    embedding: &[f32],
-) -> crate::Result<()> {
-    let hidden = ctx.cfg.hidden;
-    debug_assert_eq!(embedding.len(), hidden);
-    let t_emb_start = std::time::Instant::now();
-    ctx.h_buf[..hidden].copy_from_slice(embedding);
     let t_emb = t_emb_start.elapsed();
     forward_single_token_core(ctx, t_emb)
 }

@@ -7,7 +7,7 @@ $ProjectRoot = Resolve-Path (Join-Path $ScriptDir "..")
 $CurrentBin  = Join-Path $ProjectRoot "target\release\daiza-cli.exe"
 $GoldenTokens = Join-Path $ScriptDir "golden_tokens.txt"
 $CurrentTokens = Join-Path $ScriptDir "current_tokens.txt"
-$GgufPath = Join-Path $ProjectRoot "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf"
+$GgufPath = Join-Path $ProjectRoot "Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf"
 $Prompt = "The capital of China is Beijing, and"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()

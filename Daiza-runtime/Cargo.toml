@@ -1,0 +1,15 @@
+[package]
+name = "daiza-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Orchestration layer for Daiza engine: session management, tool calling, tokenizer"
+license = "Apache-2.0"
+
+[lib]
+name = "daiza_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+daiza-engine = { path = "../Daiza-engine" }
+# 零拷贝字节转换: session 持久化序列化
+bytemuck = { version = "1.21", features = ["derive"] }

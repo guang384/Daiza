@@ -1022,13 +1022,6 @@ pub enum BlockWeights {
 }
 
 impl BlockWeights {
-    pub fn ffn_dim(&self) -> usize {
-        match self {
-            BlockWeights::Ssm(w) => w.ffn_gate.rows,
-            BlockWeights::FullAttention(w) => w.ffn_gate.rows,
-        }
-    }
-
     pub fn as_full_attention(&self) -> &FullAttentionBlockWeights {
         match self {
             BlockWeights::FullAttention(w) => w,

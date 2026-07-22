@@ -8,7 +8,6 @@
 //!    顺序与 Conv2D weight [out_ch, in_ch, kh, kw] 行优先一致
 
 use image::imageops::FilterType;
-use image::GenericImageView;
 use crate::BonsaiError;
 
 use super::config::VisionConfig;

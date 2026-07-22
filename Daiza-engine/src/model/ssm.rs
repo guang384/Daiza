@@ -84,12 +84,15 @@ fn l2norm_inplace(x: &mut [f32], eps: f32) {
 /// 输入:`s` = [state_size, state_size], `y` = [head_dim]
 /// 输出:原地更新 `s` 和 `y`
 ///
-/// 融合 5 个原步骤为 2 pass(减少 S 流量 50%):
-/// - Pass 1: s *= decay 同时累加 kv_mem[i] = sum_j S[i,j] * k[j]
-/// - Pass 2: S += delta ⊗ k 同时计算 y[i] = sum_j S_new[i,j] * q[j]
+/// ★ 按 i 融合 Pass 1 + Pass 2(每行在 L1 中完成两 phase,减少 L2 重新加载):
+///   对每个 i:
+///     Phase 1: s[i,:] *= decay, 同时累加 kv_mem_i = sum_j s[i,j] * k[j]
+///     Phase 2: di = (v[i] - kv_mem_i) * beta, s[i,:] += di * k, y[i] = sum_j s_new[i,j] * q[j]
+///
+///   原分离实现: Pass 1 遍历全部 128 行后 Pass 2 再遍历, S 矩阵 64KB > L1(32KB),
+///   Pass 2 需从 L2 重新加载每行。融合后每行只从 L2 加载 1 次, L2 流量减半。
 ///
 /// ★ P0-2 优化: 内层 j 循环手写 AVX2 (head_dim=128 = 16 × 8-wide FMA)
-///   原标量循环有 read-after-write 依赖,rustc 无法自动向量化
 #[inline]
 pub(crate) fn ssm_scan_vhead(
     s: &mut [f32],
@@ -107,25 +110,22 @@ pub(crate) fn ssm_scan_vhead(
     let decay = g.exp();
     let beta = sigmoid(beta_vh);
 
-    let mut kv_mem = [0.0f32; 128];
-
-    // Pass 1 + Pass 2 (AVX2 向量化的内层循环)
+    // AVX2 融合路径
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
         #[allow(unsafe_code)]
         unsafe {
-            ssm_scan_pass1_avx2(s, k_head, decay, &mut kv_mem, head_dim);
-            ssm_scan_pass2_avx2(s, q_head, k_head, v_head, &kv_mem, beta, y, head_dim);
+            ssm_scan_fused_avx2(s, y, q_head, k_head, v_head, decay, beta, head_dim);
         }
         return;
     }
-    // Fallback: 标量实现(非 x86_64 或无 AVX2)
-    ssm_scan_scalar(s, y, q_head, k_head, v_head, decay, beta, &mut kv_mem, head_dim);
+    // Fallback: 标量融合实现(非 x86_64 或无 AVX2)
+    ssm_scan_fused_scalar(s, y, q_head, k_head, v_head, decay, beta, head_dim);
 }
 
-/// 标量 fallback(与 AVX2 版本逻辑一致)
+/// 标量融合 fallback(与 AVX2 版本逻辑一致)
 #[inline(never)]
-fn ssm_scan_scalar(
+fn ssm_scan_fused_scalar(
     s: &mut [f32],
     y: &mut [f32],
     q_head: &[f32],
@@ -133,24 +133,19 @@ fn ssm_scan_scalar(
     v_head: &[f32],
     decay: f32,
     beta: f32,
-    kv_mem: &mut [f32; 128],
     head_dim: usize,
 ) {
-    // Pass 1: s *= decay 同时累加 kv_mem
     for i in 0..head_dim {
         let srow = &mut s[i * head_dim..(i + 1) * head_dim];
-        let mut acc = 0.0f32;
+        // Phase 1: s *= decay, 累加 kv_mem_i
+        let mut kv_mem_i = 0.0f32;
         for j in 0..head_dim {
             let s_new = srow[j] * decay;
             srow[j] = s_new;
-            acc += s_new * k_head[j];
+            kv_mem_i += s_new * k_head[j];
         }
-        kv_mem[i] = acc;
-    }
-    // Pass 2: S += delta ⊗ k 同时计算 y
-    for i in 0..head_dim {
-        let di = (v_head[i] - kv_mem[i]) * beta;
-        let srow = &mut s[i * head_dim..(i + 1) * head_dim];
+        // Phase 2: di = (v[i] - kv_mem_i) * beta, s += di * k, 累加 y[i]
+        let di = (v_head[i] - kv_mem_i) * beta;
         let mut acc = 0.0f32;
         for j in 0..head_dim {
             srow[j] += di * k_head[j];
@@ -160,66 +155,53 @@ fn ssm_scan_scalar(
     }
 }
 
-/// AVX2 向量化的 Pass 1: s *= decay 同时累加 kv_mem[i] = sum_j s[i,j] * k[j]
+/// AVX2 向量化的融合 scan: 按 i 融合 Pass 1 + Pass 2
 ///
-/// 内层 128 元素循环 = 16 次 8-wide FMA,完全打破标量依赖链
+/// S 矩阵每行 512B (128×4B), 在 L1 中完成 decay + delta 两 phase,
+/// 消除分离实现中 Pass 2 的 L2 重新加载 (S 64KB > L1 32KB)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
 #[inline]
-unsafe fn ssm_scan_pass1_avx2(
+unsafe fn ssm_scan_fused_avx2(
     s: &mut [f32],
+    y: &mut [f32],
+    q_head: &[f32],
     k_head: &[f32],
+    v_head: &[f32],
     decay: f32,
-    kv_mem: &mut [f32; 128],
+    beta: f32,
     head_dim: usize,
 ) {
     use core::arch::x86_64::*;
     let decay_v = _mm256_set1_ps(decay);
     for i in 0..head_dim {
         let srow = &mut s[i * head_dim..(i + 1) * head_dim];
-        let mut acc = _mm256_setzero_ps();
+
+        // Phase 1: s *= decay, 同时累加 kv_mem_i = sum_j s[i,j] * k[j]
+        let mut kv_acc = _mm256_setzero_ps();
         for j in (0..head_dim).step_by(8) {
             let s_old = _mm256_loadu_ps(srow.as_ptr().add(j));
             let k = _mm256_loadu_ps(k_head.as_ptr().add(j));
             let s_new = _mm256_mul_ps(s_old, decay_v);
             _mm256_storeu_ps(srow.as_mut_ptr().add(j), s_new);
-            acc = _mm256_fmadd_ps(s_new, k, acc);
+            kv_acc = _mm256_fmadd_ps(s_new, k, kv_acc);
         }
-        kv_mem[i] = horizontal_sum_ps(acc);
-    }
-}
+        let kv_mem_i = horizontal_sum_ps(kv_acc);
 
-/// AVX2 向量化的 Pass 2: S += delta ⊗ k 同时计算 y[i] = sum_j S_new[i,j] * q[j]
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_code)]
-#[inline]
-unsafe fn ssm_scan_pass2_avx2(
-    s: &mut [f32],
-    q_head: &[f32],
-    k_head: &[f32],
-    v_head: &[f32],
-    kv_mem: &[f32; 128],
-    beta: f32,
-    y: &mut [f32],
-    head_dim: usize,
-) {
-    use core::arch::x86_64::*;
-    for i in 0..head_dim {
-        let di = (v_head[i] - kv_mem[i]) * beta;
+        // Phase 2: di = (v[i] - kv_mem_i) * beta, s += di * k, 同时累加 y[i]
+        let di = (v_head[i] - kv_mem_i) * beta;
         let di_v = _mm256_set1_ps(di);
-        let srow = &mut s[i * head_dim..(i + 1) * head_dim];
-        let mut acc = _mm256_setzero_ps();
+        let mut y_acc = _mm256_setzero_ps();
         for j in (0..head_dim).step_by(8) {
-            let s_old = _mm256_loadu_ps(srow.as_ptr().add(j));
+            let s_cur = _mm256_loadu_ps(srow.as_ptr().add(j));
             let k = _mm256_loadu_ps(k_head.as_ptr().add(j));
             let q = _mm256_loadu_ps(q_head.as_ptr().add(j));
-            let s_new = _mm256_fmadd_ps(di_v, k, s_old);
+            let s_new = _mm256_fmadd_ps(di_v, k, s_cur);
             _mm256_storeu_ps(srow.as_mut_ptr().add(j), s_new);
-            acc = _mm256_fmadd_ps(s_new, q, acc);
+            y_acc = _mm256_fmadd_ps(s_new, q, y_acc);
         }
-        y[i] = horizontal_sum_ps(acc);
+        y[i] = horizontal_sum_ps(y_acc);
     }
 }
 

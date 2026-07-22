@@ -1,0 +1,14 @@
+[package]
+name = "daiza-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for Daiza inference engine"
+license = "Apache-2.0"
+
+[[bin]]
+name = "daiza-cli"
+path = "src/main.rs"
+
+[dependencies]
+daiza-engine = { path = "../Daiza-engine" }
+daiza-runtime = { path = "../Daiza-runtime" }

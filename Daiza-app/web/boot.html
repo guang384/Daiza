@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Daiza 启动中</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #07070f; color: #e8e8f2;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 26px;
+    overflow: hidden;
+  }
+  .logo {
+    font-size: 52px; font-weight: 800; letter-spacing: 4px;
+    background: linear-gradient(90deg, #7c5cff, #00e0c6, #ff5c8a, #7c5cff);
+    background-size: 300% 100%;
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: sheen 3s linear infinite;
+  }
+  @keyframes sheen { to { background-position: 300% 0; } }
+  .spinner {
+    width: 46px; height: 46px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,.1);
+    border-top-color: #00e0c6;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #step { font-size: 14px; color: #9a9ab0; }
+  .err { color: #ff5c8a; font-size: 13px; max-width: 480px;
+         text-align: center; line-height: 1.7; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+  <div class="logo">DAIZA</div>
+  <div class="spinner" id="spinner"></div>
+  <div id="step">正在启动推理引擎…</div>
+  <div class="err" id="err"></div>
+<script>
+const stepEl = document.getElementById('step');
+const errEl = document.getElementById('err');
+
+async function boot() {
+  try {
+    stepEl.textContent = '正在启动推理引擎…';
+    await window.__TAURI__.core.invoke('start_backend');
+  } catch (e) {
+    errEl.textContent = '后端启动失败:\n' + e;
+    document.getElementById('spinner').style.display = 'none';
+    stepEl.textContent = '';
+    return;
+  }
+  // 轮询 HTTP 服务就绪
+  for (let i = 0; i < 60; i++) {
+    try {
+      const r = await fetch('http://127.0.0.1:8787/api/status');
+      if (r.ok) {
+        stepEl.textContent = '进入聊天…';
+        window.location.replace('http://127.0.0.1:8787/');
+        return;
+      }
+    } catch (e) { /* 还没起来 */ }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  errEl.textContent = '后端服务 30s 内未就绪, 请检查 daiza-web.exe 是否能独立运行。';
+  document.getElementById('spinner').style.display = 'none';
+  stepEl.textContent = '';
+}
+boot();
+</script>
+</body>
+</html>

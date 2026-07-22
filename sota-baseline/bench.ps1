@@ -45,7 +45,7 @@ if (-not (Test-Path $Bin)) {
     }
 }
 
-$GgufPath = Join-Path $ProjectRoot "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf"
+$GgufPath = Join-Path $ProjectRoot "Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf"
 if (-not (Test-Path $GgufPath)) {
     Write-Host "error: GGUF model not found at $GgufPath" -ForegroundColor Red
     exit 1

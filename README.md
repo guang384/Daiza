@@ -27,31 +27,78 @@
 
 ```
 Daiza/
-├── .gitignore
+├── .cargo/config.toml       # target-cpu=native + rsproxy 镜像
+├── Cargo.toml               # workspace 根 (lto="fat")
 ├── README.md
-├── Bonsai-27B-gguf/          # 模型权重(外部,不入库)
-│   ├── Bonsai-27B-Q1_0.gguf       # 主权重(必需)
-│   ├── Bonsai-27B-dspark-Q4_1.gguf  # DSpark 投机解码 drafter
-│   ├── Bonsai-27B-mmproj-Q8_0.gguf  # 视觉塔(多模态)
-│   └── bonsai-27b-whitepaper.pdf
-└── Daiza-engine/             # Rust 推理引擎
-    ├── Cargo.toml
-    ├── .cargo/config.toml    # target-cpu=native
-    └── src/
-        ├── lib.rs            # 模块入口 + BonsaiError
-        ├── main.rs           # CLI 入口(--dspark / --mmproj / --image)
-        ├── engine.rs         # 顶层 Engine:加载→前向→采样→解码 + DSpark + Vision 调度
-        ├── gguf/             # GGUF v3 二进制格式解析(parser/metadata/tensor_info)
-        ├── tensor/           # 张量类型 + Q1_0/Q4_1/Q8_0/Iq1M/F32/F16/BF16 反量化 + AVX2 GEMM 内核
-        ├── math/             # RMSNorm/LayerNorm/RoPE/Softmax/GELU/SIMD 超越函数/采样
-        ├── model/            # Bonsai 27B 架构
-        │   ├── config.rs / weights.rs / block.rs / attention.rs / ssm.rs / mlp.rs
-        │   ├── forward.rs    # 单 token 前向 + prefill batch + vision embedding 注入
-        │   ├── workspace.rs  # 持久线程池(park/unpark 零分配)+ Workspace 复用
-        │   ├── dspark/       # DSpark 推测解码(drafter/markov/speculative/weights/config)
-        │   └── vision/       # Qwen3-VL 多模态(config/weights/preprocess/rope/encoder/projector)
-        ├── cache/            # KV cache(16 层)+ SSM state(48 层)
-        └── tokenizer/        # GPT-2 BPE + Qwen35 预分词
+├── Bonsai-27B-gguf/         # 模型权重(外部,不入库)
+└── sota-baseline/           # benchmark 脚本(bench/compare/create-baseline)
+```
+
+### Crate 依赖层级
+
+```
+                    ┌─────────────────┐
+                    │  Daiza-engine   │  Layer 0  推理核心 (lib, 零内部依赖)
+                    │  gguf/tensor/   │
+                    │  math/model/    │
+                    │  cache          │
+                    └────────┬────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  Daiza-runtime  │  Layer 1  编排层 (lib, 依赖 engine)
+                    │  engine/session │
+                    │  tokenizer/     │
+                    │  tool_call      │
+                    └────────┬────────┘
+                             │
+          ┌──────────────────┼──────────────────┐
+          │                  │                  │
+   ┌──────▼──────┐    ┌──────▼──────┐    ┌──────▼──────┐
+   │  Daiza-cli  │    │  Daiza-web  │    │  Daiza-app  │  Layer 2  二进制入口
+   │  (CLI bin)  │    │  (HTTP bin) │    │  (Tauri bin)│
+   └─────────────┘    └─────────────┘    └──────┬──────┘
+                                               │ 运行时启动 daiza-web.exe 子进程
+                                               ▼
+                                      (非 Cargo 依赖,仅运行时)
+```
+
+- **Daiza-engine** (Layer 0):推理核心,零内部依赖。GGUF 解析、Q1_0 反量化、AVX2 GEMM 内核、SSM/Attention/MLP 前向、线程池。
+- **Daiza-runtime** (Layer 1):编排层,依赖 engine。Engine 顶层封装、会话管理、GPT-2 BPE 分词器、工具调用、SSD 持久化。
+- **Daiza-cli / Daiza-web / Daiza-app** (Layer 2):三个二进制入口,**平级**,各自依赖 engine+runtime。
+  - cli:命令行交互
+  - web:HTTP+SSE 聊天界面
+  - app:Tauri 桌面壳,运行时启动 `daiza-web.exe` 子进程(非 Cargo 依赖,仅打包/运行时关联)
+
+> `lto = "fat"` + `codegen-units = 1` 合并所有 crate IR 为单一编译单元,保证跨 crate 内联等效于同 crate(热路径 runtime → engine 的 forward/matvec/AVX2 kernel 调用可被内联)。
+
+### Daiza-engine 模块组织
+
+```
+Daiza-engine/src/
+├── lib.rs            # 模块入口 + BonsaiError
+├── gguf/             # GGUF v3 二进制格式解析(parser/metadata/tensor_info)
+├── tensor/           # 张量类型 + Q1_0/Q4_1/Q8_0/Iq1M/F32/F16/BF16 反量化 + AVX2 GEMM 内核
+├── math/             # RMSNorm/LayerNorm/RoPE/Softmax/GELU/SIMD 超越函数/采样
+├── model/            # Bonsai 27B 架构
+│   ├── config.rs / weights.rs / block.rs / attention.rs / ssm.rs / mlp.rs
+│   ├── forward.rs    # 单 token 前向 + prefill batch + vision embedding 注入
+│   ├── workspace.rs  # 持久线程池(park/unpark 零分配)+ Workspace 复用
+│   ├── dspark/       # DSpark 推测解码(drafter/markov/speculative/weights/config)
+│   └── vision/       # Qwen3-VL 多模态(config/weights/preprocess/rope/encoder/projector)
+└── cache/            # KV cache(16 层)+ SSM state(48 层)
+```
+
+### Daiza-runtime 模块组织
+
+```
+Daiza-runtime/src/
+├── lib.rs            # re-export engine::Engine + daiza_engine::{BonsaiError, Result}
+├── engine.rs         # 顶层 Engine:加载→前向→采样→解码 + DSpark + Vision 调度
+├── session.rs        # 多轮会话状态
+├── session_persist.rs# 会话 SSD 持久化 (.dzss)
+├── session_manager.rs# 多会话管理
+├── tool_call.rs      # 工具调用解析
+└── tokenizer/        # GPT-2 BPE + Qwen35 预分词
 ```
 
 ## 📥 模型权重下载
@@ -118,8 +165,7 @@ hf download prism-ml/Bonsai-27B-gguf `
 Get-ChildItem .\Bonsai-27B-gguf\*.gguf | Select-Object Name, @{N='Size(GB)';E={[math]::Round($_.Length/1GB,2)}}
 
 # 使用引擎 inspect 模式验证 GGUF 完整性
-cd Daiza-engine
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
+.\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
 ```
 
 预期输出包含 `tensor_count : 851`、`block_count : 64`、`Q1_0 tensors: 498`。
@@ -135,34 +181,32 @@ cd Daiza-engine
 ### 构建与运行
 
 ```powershell
-cd Daiza-engine
-
-# Release 构建(推荐,启用 LTO + 自动向量化)
+# Release 构建(推荐,workspace 根目录执行,启用 fat LTO + 跨 crate 内联)
 cargo build --release --bin daiza-cli
 
 # 运行推理 (chat 模式,默认 64 token)
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --prompt "你好" --max-tokens 64
+.\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --prompt "你好" --max-tokens 64
 
 # Raw 模式(跳过 chat 模板,用于调试)
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --prompt "The capital of China is" --max-tokens 8 --raw
+.\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --prompt "The capital of China is" --max-tokens 8 --raw
 
-# 启用 DSpark 投机解码(需先下载 drafter 权重)
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
+# 启用 DSpark 投测解码(需先下载 drafter 权重)
+.\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
     --prompt "请用中文写一首关于春天的诗,8句" --max-tokens 200 `
-    --dspark "..\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf"
+    --dspark ".\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf"
 
 # Greedy 模式(temperature=0, 用于正确性验证)
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
+.\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
     --prompt "你好" --max-tokens 100 `
-    --dspark "..\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf" --greedy
+    --dspark ".\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf" --greedy
 
 # 多模态:加载 mmproj 视觉塔并对图像问答 (--image 可多次指定)
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
+.\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
     --prompt "描述这张图" --max-tokens 128 `
-    --mmproj "..\Bonsai-27B-gguf\Bonsai-27B-mmproj-Q8_0.gguf" --image my_image.jpg
+    --mmproj ".\Bonsai-27B-gguf\Bonsai-27B-mmproj-Q8_0.gguf" --image my_image.jpg
 
 # 检查模型元信息
-.\target\release\daiza-cli.exe --model "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
+.\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
 
 # 查看帮助
 .\target\release\daiza-cli.exe --help
@@ -171,7 +215,7 @@ cargo build --release --bin daiza-cli
 ### 使用示例
 
 ```rust
-use daiza_engine::engine::Engine;
+use daiza_runtime::Engine;
 use daiza_engine::math::SamplingParams;
 
 let mut engine = Engine::load("../Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf")?;
@@ -193,7 +237,7 @@ println!("{output}");
 
 ```rust
 use std::path::PathBuf;
-use daiza_engine::engine::Engine;
+use daiza_runtime::Engine;
 use daiza_engine::math::SamplingParams;
 
 let mut engine = Engine::load("../Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf")?;
@@ -212,7 +256,7 @@ println!("{output}");
 DSpark 投机解码示例:
 
 ```rust
-use daiza_engine::engine::Engine;
+use daiza_runtime::Engine;
 use daiza_engine::math::SamplingParams;
 
 let mut engine = Engine::load("../Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf")?;

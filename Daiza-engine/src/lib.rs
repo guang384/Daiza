@@ -22,20 +22,20 @@
 //! | `math`     | 纯 CPU 数学内核:GEMM、RMSNorm、RoPE、Softmax、采样 |
 //! | `model`    | Bonsai 27B 架构:SSM 块、全注意力块、SwiGLU MLP、前向传播 |
 //! | `cache`    | KV 缓存(仅 16 个全注意力层)+ SSM 循环状态(48 层) |
-//! | `tokenizer`| GPT-2 BPE + Qwen35 预分词(零依赖手写) |
-//! | `engine`   | 顶层 Engine,串联加载 → tokenize → 前向 → 采样 → 解码 |
+//!
+//! 编排层 (engine / session / tokenizer / tool_call) 在独立的 `daiza-runtime` crate。
 
 // unsafe 策略:全局 deny,只在 quant.rs 的 AVX2 SIMD 内核局部 allow。
 // 这样既限制了 unsafe 的扩散,又允许手写 SIMD 突破 rustc 自动向量化的瓶颈。
 #![deny(unsafe_code)]
+// SSM/数学符号沿用论文记法 (U/V/D/K 等),允许 non_snake_case
+#![allow(non_snake_case)]
 
 pub mod gguf;
 pub mod tensor;
 pub mod math;
 pub mod model;
 pub mod cache;
-pub mod tokenizer;
-pub mod engine;
 
 /// 项目级错误类型,所有模块统一使用
 #[derive(Debug)]

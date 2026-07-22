@@ -13,43 +13,25 @@
 
 use std::path::Path;
 
-use crate::gguf::parser::GgufFile;
-use crate::math::{sample_top_k_top_p_into, SamplingBuffers, SamplingParams};
-use crate::model::config::Config;
-use crate::model::dspark::{
+use daiza_engine::gguf::parser::GgufFile;
+use daiza_engine::math::{sample_top_k_top_p_into, LcgRng, SamplingBuffers, SamplingParams};
+use daiza_engine::model::config::Config;
+use daiza_engine::model::dspark::{
     weights::DrafterWeights,
     speculative::SpeculativeContext,
 };
-use crate::model::forward::{forward_batch, forward_batch_with_vision, forward_single_token, forward_single_token_with_embedding, make_context, VisionInject, ForwardContext};
-use crate::model::vision::{
+use daiza_engine::model::forward::{forward_batch, forward_batch_with_vision, forward_single_token, make_context, VisionInject, ForwardContext};
+use daiza_engine::model::vision::{
     VisionConfig, VisionWeights,
     encoder::{ViTContext, encode_image},
     projector::{ProjectorContext, project_vision},
     preprocess_image,
 };
-use crate::model::weights::LoadedWeights;
+use daiza_engine::model::weights::LoadedWeights;
+use crate::session::{Session, session_reply};
 use crate::tokenizer::vocab::Vocab;
 use crate::tokenizer::BpeTokenizer;
 use crate::Result;
-
-/// 简单的伪随机数(零依赖)
-struct LcgRng {
-    state: u64,
-}
-
-impl LcgRng {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
-        }
-    }
-    fn next_f32(&mut self) -> f32 {
-        // Numerical Recipes LCG
-        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let x = (self.state >> 33) as u32;
-        (x as f32) / (u32::MAX as f32)
-    }
-}
 
 /// DSpark 性能分析 helper
 #[inline]
@@ -80,6 +62,8 @@ pub struct Engine {
     pub vision: Option<VisionContext>,
     /// 缓存的 image_token_id (从 tokenizer.special_tokens 查找, 懒初始化)
     pub image_token_id: Option<u32>,
+    /// 活跃会话 (可选, 由 session_begin 创建, 跨多轮 reply 复用 KV + SSM state)
+    pub session: Option<Session>,
 }
 
 impl Engine {
@@ -97,6 +81,7 @@ impl Engine {
             spec_ctx: None,
             vision: None,
             image_token_id: None,
+            session: None,
         })
     }
 
@@ -193,6 +178,188 @@ impl Engine {
         self.generate_inner(prompt, max_tokens, params, None, true)
     }
 
+    /// 开始新会话(创建 Session, state 全零)
+    ///
+    /// `think_enabled`:是否启用思考模式(控制 increment 末尾是否追加 <think>\n)
+    /// `system_prompt`:可选系统提示词(首轮 prefill 时使用)
+    pub fn session_begin(
+        &mut self,
+        think_enabled: bool,
+        system_prompt: Option<&str>,
+    ) -> Result<()> {
+        // 确保权重已加载
+        if self.weights.is_none() {
+            self.load_weights()?;
+            let n_threads = daiza_engine::model::workspace::thread_count();
+            daiza_engine::model::workspace::init_thread_pool(n_threads);
+            eprintln!("[engine] thread pool ({n_threads} workers) initialized");
+        }
+        let sys = system_prompt.map(String::from);
+        self.session = Some(Session::new(&self.config, think_enabled, sys));
+        Ok(())
+    }
+
+    /// 多轮对话:增量 prefill + decode(复用 KV cache + SSM state)
+    ///
+    /// 只编码增量 token(不含历史),从 state.pos 继续 prefill。
+    /// 无损复用:KV cache 和 SSM state 跨调用持久化。
+    pub fn session_reply(
+        &mut self,
+        user_msg: &str,
+        max_tokens: usize,
+        params: SamplingParams,
+    ) -> Result<String> {
+        let session = self.session.as_mut().ok_or(crate::BonsaiError::Unsupported(
+            "no active session; call session_begin() first".into()
+        ))?;
+        let cfg = &self.config;
+        let weights = self.weights.as_ref().ok_or(crate::BonsaiError::Unsupported(
+            "weights not loaded".into()
+        ))?;
+        session_reply(cfg, weights, &self.tokenizer, session, user_msg, max_tokens, params)
+    }
+
+    /// 结束会话(释放 DRAM)
+    pub fn session_end(&mut self) {
+        self.session = None;
+    }
+
+    /// 流式多轮对话: 与 session_reply 行为一致, 但每生成一个 token
+    /// 就通过 `on_delta` 回调增量文本 (供 GUI / Web 流式渲染)。
+    /// 回调返回 false 可中断生成。
+    pub fn session_reply_stream(
+        &mut self,
+        user_msg: &str,
+        max_tokens: usize,
+        params: SamplingParams,
+        on_delta: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String> {
+        let session = self.session.as_mut().ok_or(crate::BonsaiError::Unsupported(
+            "no active session; call session_begin() first".into()
+        ))?;
+        let cfg = &self.config;
+        let weights = self.weights.as_ref().ok_or(crate::BonsaiError::Unsupported(
+            "weights not loaded".into()
+        ))?;
+        crate::session::session_reply_stream(
+            cfg, weights, &self.tokenizer, session, user_msg, max_tokens, params, on_delta,
+        )
+    }
+
+    /// 多轮对话 + 多模态: 带 vision 注入的 session_reply
+    ///
+    /// 与 session_reply 区别: 若 session.pending_images 非空, 对每张图做
+    /// preprocess → encode → project, 然后走 forward_batch_with_vision 路径。
+    /// 图片处理完后清空 pending_images。
+    ///
+    /// 若 pending_images 为空, 退化为普通 session_reply (无额外开销)。
+    pub fn session_reply_with_vision(
+        &mut self,
+        user_msg: &str,
+        max_tokens: usize,
+        params: SamplingParams,
+    ) -> Result<String> {
+        // 无 pending_images: 退化为普通 session_reply
+        let has_images = self.session.as_ref()
+            .map(|s| !s.pending_images.is_empty())
+            .unwrap_or(false);
+        if !has_images {
+            return self.session_reply(user_msg, max_tokens, params);
+        }
+
+        // 检查 mmproj 已加载
+        if self.vision.is_none() {
+            return Err(crate::BonsaiError::Unsupported(
+                "mmproj not loaded; call load_mmproj() first".into()
+            ));
+        }
+
+        if self.weights.is_none() {
+            return Err(crate::BonsaiError::Unsupported(
+                "weights not loaded".into()
+            ));
+        }
+
+        // 1. 对每张图做 preprocess → encode → project, 拼接 vision_embeddings
+        let image_token_id = self.image_token_id()?;
+        // 先把 pending_images 从 session 中取出, 避免后续借用冲突
+        let images: Vec<_> = {
+            let session = self.session.as_mut().ok_or(crate::BonsaiError::Unsupported(
+                "no active session; call session_begin() first".into()
+            ))?;
+            session.pending_images.drain(..).collect()
+        };
+        let n_vision_per_image;
+        let vision_embeddings: Vec<f32> = {
+            let vision = self.vision.as_mut().unwrap();
+            n_vision_per_image = vision.cfg.n_patches_merged();
+            let proj_dim = vision.cfg.projection_dim;
+            let hidden = self.config.hidden;
+            if proj_dim != hidden {
+                return Err(crate::BonsaiError::Model(format!(
+                    "mmproj projection_dim ({proj_dim}) != text model hidden ({hidden}), vision embeddings 无法直接注入"
+                )));
+            }
+            let mut all_emb = Vec::with_capacity(images.len() * n_vision_per_image * hidden);
+            for img_path in &images {
+                let t0 = std::time::Instant::now();
+                let patches = preprocess_image(img_path, &vision.cfg)?;
+                let t_pre = t0.elapsed();
+
+                let t1 = std::time::Instant::now();
+                encode_image(&vision.weights, &vision.cfg, &mut vision.vit_ctx, &patches)?;
+                let t_enc = t1.elapsed();
+
+                let t2 = std::time::Instant::now();
+                let vit_out = vision.vit_ctx.hidden.clone();
+                project_vision(&vit_out, &vision.weights, &vision.cfg, &mut vision.proj_ctx)?;
+                let t_proj = t2.elapsed();
+
+                let proj_out = &vision.proj_ctx.projected;
+                all_emb.extend_from_slice(proj_out);
+                eprintln!("[vision] image {}: pre={:.1}ms enc={:.1}ms proj={:.1}ms total={:.1}ms ({} patches → {} merged)",
+                    img_path.display(),
+                    t_pre.as_secs_f64() * 1000.0,
+                    t_enc.as_secs_f64() * 1000.0,
+                    t_proj.as_secs_f64() * 1000.0,
+                    (t_pre + t_enc + t_proj).as_secs_f64() * 1000.0,
+                    vision.cfg.n_patches, n_vision_per_image);
+            }
+            all_emb
+        };
+
+        // 2. 调用 session_reply_with_vision (在 session.rs 中实现)
+        // 借出顺序: weights → session → tokenizer (无冲突)
+        let weights = self.weights.as_ref().unwrap();
+        let session = self.session.as_mut().unwrap();
+        crate::session::session_reply_with_vision(
+            &self.config, weights, &self.tokenizer, session,
+            user_msg, max_tokens, params,
+            &vision_embeddings, n_vision_per_image, image_token_id,
+        )
+    }
+
+    /// tool_call: 注入 tool response 后继续生成
+    ///
+    /// 调用方执行 tool 后, 用本函数把结果送回模型, 模型继续生成下一轮回复。
+    pub fn session_reply_with_tool_response(
+        &mut self,
+        responses: &[crate::tool_call::ToolResponse],
+        max_tokens: usize,
+        params: SamplingParams,
+    ) -> Result<String> {
+        let session = self.session.as_mut().ok_or(crate::BonsaiError::Unsupported(
+            "no active session; call session_begin() first".into()
+        ))?;
+        let cfg = &self.config;
+        let weights = self.weights.as_ref().ok_or(crate::BonsaiError::Unsupported(
+            "weights not loaded".into()
+        ))?;
+        crate::session::session_reply_with_tool_response(
+            cfg, weights, &self.tokenizer, session, responses, max_tokens, params,
+        )
+    }
+
     /// 多模态生成:输入文本 prompt + 一张或多张图像路径
     ///
     /// 流程:
@@ -224,8 +391,8 @@ impl Engine {
         if self.weights.is_none() {
             eprintln!("[engine] loading target weights...");
             self.load_weights()?;
-            let n_threads = crate::model::workspace::thread_count();
-            crate::model::workspace::init_thread_pool(n_threads);
+            let n_threads = daiza_engine::model::workspace::thread_count();
+            daiza_engine::model::workspace::init_thread_pool(n_threads);
             eprintln!("[engine] thread pool ({n_threads} workers) initialized");
         }
 
@@ -440,8 +607,8 @@ impl Engine {
             eprintln!("[engine] loading weights (one-shot, ~13GB)...");
             self.load_weights()?;
             // 初始化持久线程池(消除每 token ~369 次 scope 创建 + ~2952 次 thread spawn)
-            let n_threads = crate::model::workspace::thread_count();
-            crate::model::workspace::init_thread_pool(n_threads);
+            let n_threads = daiza_engine::model::workspace::thread_count();
+            daiza_engine::model::workspace::init_thread_pool(n_threads);
             eprintln!("[engine] thread pool ({n_threads} workers) initialized");
             // GGUF 文件已通过 mmap 映射, 权重加载时 to_vec() 复制到独立缓冲,
             // mmap 区域由内核按需 page-in, 物理内存占用远小于文件大小。
@@ -539,28 +706,9 @@ impl Engine {
                 n_gen as f64 * 1000.0 / decode_ms as f64);
         }
 
-        // 正确性验证: 把生成的 token IDs dump 到文件 (env DAIZA_DUMP_TOKENS=path)
+        // 正确性验证: dump token IDs (env DAIZA_DUMP_TOKENS=path)
         // 用于 baseline vs optimized 的逐 token 对比 (FP 重排可能让 argmax 翻转)
-        if let Ok(path) = std::env::var("DAIZA_DUMP_TOKENS") {
-            let mut content = String::new();
-            // 第一行: prompt token IDs
-            content.push_str("prompt:");
-            for (i, &id) in input_ids.iter().enumerate() {
-                if i > 0 { content.push(','); }
-                content.push_str(&id.to_string());
-            }
-            content.push('\n');
-            // 第二行: generated token IDs
-            content.push_str("generated:");
-            for (i, &id) in generated_ids.iter().enumerate() {
-                if i > 0 { content.push(','); }
-                content.push_str(&id.to_string());
-            }
-            content.push('\n');
-            std::fs::write(&path, content)
-                .map_err(|e| crate::BonsaiError::Io(format!("dump_tokens write failed: {e}")))?;
-            eprintln!("[dump_tokens] wrote {n_gen} generated ids to {path}");
-        }
+        crate::session_persist::dump_tokens_if_enabled(&input_ids, &generated_ids)?;
 
         // 5. decode token ids 为字符串
         Ok(self.tokenizer.decode(&generated_ids))
@@ -607,8 +755,8 @@ impl Engine {
         if self.weights.is_none() {
             eprintln!("[engine] loading target weights...");
             self.load_weights()?;
-            let n_threads = crate::model::workspace::thread_count();
-            crate::model::workspace::init_thread_pool(n_threads);
+            let n_threads = daiza_engine::model::workspace::thread_count();
+            daiza_engine::model::workspace::init_thread_pool(n_threads);
             eprintln!("[engine] thread pool ({n_threads} workers) initialized");
         }
 
@@ -759,7 +907,7 @@ impl Engine {
             //   - forward_batch 为 prefill 设计, 小批量 (k=4) 时开销超过 batched matvec 收益
             //   - 方案 B (SSM state snapshot/restore) 可行但复杂度高, 收益不确定, 暂不实施
             let verify_start = std::time::Instant::now();
-            let pos_before = ctx.state.pos;
+            let _pos_before = ctx.state.pos;
 
             let mut n_accepted = 0usize;
             let mut bonus_token: Option<usize> = None;
@@ -932,24 +1080,7 @@ impl Engine {
                 ms_per(t_draft, n_gen));
         }
 
-        if let Ok(path) = std::env::var("DAIZA_DUMP_TOKENS") {
-            let mut content = String::new();
-            content.push_str("prompt:");
-            for (i, &id) in input_ids.iter().enumerate() {
-                if i > 0 { content.push(','); }
-                content.push_str(&id.to_string());
-            }
-            content.push('\n');
-            content.push_str("generated:");
-            for (i, &id) in generated_ids.iter().enumerate() {
-                if i > 0 { content.push(','); }
-                content.push_str(&id.to_string());
-            }
-            content.push('\n');
-            std::fs::write(&path, content)
-                .map_err(|e| crate::BonsaiError::Io(format!("dump_tokens: {e}")))?;
-            eprintln!("[dump_tokens] wrote {n_gen} ids to {path}");
-        }
+        crate::session_persist::dump_tokens_if_enabled(&input_ids, &generated_ids)?;
 
         Ok(self.tokenizer.decode(&generated_ids))
     }
@@ -1016,7 +1147,7 @@ impl Engine {
         );
         println!();
         println!("[Dtype histogram]");
-        crate::model::weights::LoadedWeights::print_dtype_summary(&self.gguf);
+        daiza_engine::model::weights::LoadedWeights::print_dtype_summary(&self.gguf);
         println!();
         println!("[Sample tensor shapes]");
         for name in [

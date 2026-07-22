@@ -39,12 +39,8 @@ pub unsafe fn exp_ps(x: __m256) -> __m256 {
     // 2. r = x - n * ln2(用 FNMADD: r = -(n * ln2) + x = x - n*ln2)
     let r = _mm256_fnmadd_ps(n_f, _mm256_set1_ps(LN2_F), x);
 
-    // 3. exp(r) 多项式展开(Horner 法):
+    // 3. exp(r) 多项式展开(Horner 法,从高到低):
     //    exp(r) = 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120
-    //    用 5 次 FMA:
-    //      r2 = r * r
-    //      p = r5/120
-    //      p = p * r + 1/24  → r⁵/120 + r⁴/24? 错了,Horner 应该从高到低:
     //      p = 1/120
     //      p = p * r + 1/24  → r/120 + 1/24
     //      p = p * r + 1/6   → r²/120 + r/24 + 1/6
@@ -114,20 +110,6 @@ pub fn sigmoid_fast(x: f32) -> f32 {
         }
     }
     1.0 / (1.0 + (-x).exp())
-}
-
-/// SIMD silu 标量入口
-pub fn silu_fast(x: f32) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    if simd_available() {
-        #[allow(unsafe_code)]
-        unsafe {
-            let v = _mm256_set1_ps(x);
-            let r = silu_ps(v);
-            return _mm256_cvtss_f32(r);
-        }
-    }
-    x / (1.0 + (-x).exp())
 }
 
 // ============================================================================
@@ -264,7 +246,7 @@ pub fn swiglu_inplace_simd(gate: &mut [f32], up: &[f32]) {
 // ---------------------------------------------------------------------------
 
 /// AVX2 8-wide 点积: sum(a[i] * b[i])
-/// head_dim=128 是 8 的倍数,无需尾处理。
+/// head_dim (128 或 256) 是 8 的倍数,无需尾处理。
 #[allow(unsafe_code)]
 #[inline]
 pub fn dot_product_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
@@ -304,7 +286,7 @@ pub fn dot_product_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
 }
 
 /// AVX2 8-wide saxpy: y[i] += scale * x[i]
-/// head_dim=128 是 8 的倍数,无需尾处理。
+/// head_dim (128 或 256) 是 8 的倍数,无需尾处理。
 #[allow(unsafe_code)]
 #[inline]
 pub fn saxpy_avx2(scale: f32, x: &[f32], y: &mut [f32], len: usize) {
@@ -316,6 +298,65 @@ pub fn saxpy_avx2(scale: f32, x: &[f32], y: &mut [f32], len: usize) {
             let vx = _mm256_loadu_ps(x.as_ptr().add(i));
             let vy = _mm256_loadu_ps(y.as_ptr().add(i));
             let result = _mm256_fmadd_ps(sv, vx, vy);
+            _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
+            i += 8;
+        }
+    }
+}
+
+/// AVX2 8-wide online softmax V-update: y[i] = y[i] * alpha + beta * x[i]
+///
+/// attention online softmax 内层循环 (head_dim=256 = 32×8-wide, 无尾处理)。
+/// 原标量循环每 iter 2c (FMUL + FMA), 256 iter = 512c;
+/// AVX2 32 iter × 2c (mul + fma 可融合为单 FMA if 编译器优化, 或 2c 独立) ≈ 64c, **8× 加速**。
+///
+/// 调用频次 (per token, n_cached=N):
+///   16 attn blocks × 4 kv_heads × N × 6 group_size = 384N 次 V-update
+///   N=256: 98K 次 × (512c-64c) = 43M cycle ≈ 12ms/token 节省
+///   N=1024: 393K 次 × 448c = 176M cycle ≈ 50ms/token 节省 (但受 KV cache L2 带宽限制, 实际收益较小)
+#[allow(unsafe_code)]
+#[inline]
+pub fn online_softmax_v_update_avx2(
+    y: &mut [f32],
+    alpha: f32,
+    beta: f32,
+    x: &[f32],
+    len: usize,
+) {
+    debug_assert!(len >= 8);
+    debug_assert_eq!(y.len(), len);
+    debug_assert_eq!(x.len(), len);
+    unsafe {
+        let av = _mm256_set1_ps(alpha);
+        let bv = _mm256_set1_ps(beta);
+        let mut i = 0;
+        while i + 8 <= len {
+            let vy = _mm256_loadu_ps(y.as_ptr().add(i));
+            let vx = _mm256_loadu_ps(x.as_ptr().add(i));
+            // y = alpha * y + beta * x = FMA(beta, x, alpha*y)
+            let scaled_y = _mm256_mul_ps(av, vy);
+            let result = _mm256_fmadd_ps(bv, vx, scaled_y);
+            _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
+            i += 8;
+        }
+    }
+}
+
+/// AVX2 8-wide scale: y[i] = x[i] * scale
+///
+/// attention online softmax 归一化: out_head[j] = out[j] * inv_s (head_dim=256)。
+#[allow(unsafe_code)]
+#[inline]
+pub fn scale_avx2(x: &[f32], scale: f32, y: &mut [f32], len: usize) {
+    debug_assert!(len >= 8);
+    debug_assert_eq!(x.len(), len);
+    debug_assert_eq!(y.len(), len);
+    unsafe {
+        let sv = _mm256_set1_ps(scale);
+        let mut i = 0;
+        while i + 8 <= len {
+            let vx = _mm256_loadu_ps(x.as_ptr().add(i));
+            let result = _mm256_mul_ps(sv, vx);
             _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
             i += 8;
         }

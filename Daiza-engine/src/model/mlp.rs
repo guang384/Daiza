@@ -14,7 +14,7 @@
 //! - `gate` / `up` 写入预分配的 caller-provided slice,跨 token 复用
 //! - `W_down` 结果通过 `matvec_add_into_slice` 直接累加到主残差流 `h`,避免分配
 //! - 调用方(`block.rs`)负责把 `ws.mlp_gate` / `ws.mlp_up` 传进来,
-//!   这样可以在同一作用域内同时借用 `ws.block_mlp_in`(输入,不可变)
+//!   这样可以在同一作用域内同时借用 `ws.block_normed`(输入,不可变)
 //!   和 `ws.mlp_gate` / `ws.mlp_up`(中间 buffer,可变)—— Rust split borrow。
 
 use crate::math;

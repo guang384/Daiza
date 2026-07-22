@@ -6,6 +6,7 @@
 //! 在 decode 阶段每 token 用 delta rule 原地更新,不增长。
 //! 这是混合注意力能在 262K context 上可行的核心原因。
 
+#[derive(Clone)]
 pub struct SsmState {
     /// recurrent state: `[num_v_heads, state_size, state_size]`
     /// 每个 v_head 维护一个 [128, 128] 矩阵作为线性 attention 的"记忆"
@@ -36,3 +37,4 @@ impl SsmState {
         self.conv_head = 0;
     }
 }
+

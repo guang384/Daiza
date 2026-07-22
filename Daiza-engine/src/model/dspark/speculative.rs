@@ -106,20 +106,6 @@ impl SpeculativeContext {
         self.target_tap_len = n_rows;
     }
 
-    /// 重置 target tap 相关缓存 (target_tap_feat 增量复制 + drafter fc cache + K/V cache)
-    ///
-    /// 在 engine.rs 中 drain `target_tap_history` 后调用, 强制下次 `set_target_tap` +
-    /// `draft_forward` 全量重算。drain 改变了 history 内容, 增量复用假设 (旧行不变)
-    /// 不再成立, 必须重置三个 cache:
-    /// - `target_tap_len`: set_target_tap 的增量复制 cache
-    /// - `drafter.cached_ctx_len`: fc 投影 + RMSNorm 的增量 cache
-    /// - `drafter.cached_kv_len`: K/V proj+norm+RoPE 的增量 cache
-    pub fn reset_target_tap_cache(&mut self) {
-        self.target_tap_len = 0;
-        self.drafter.cached_ctx_len = 0;
-        self.drafter.cached_kv_len = 0;
-    }
-
     /// Phase 1: 生成 block_size 个 draft tokens
     ///
     /// 输入:

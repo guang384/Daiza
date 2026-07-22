@@ -42,7 +42,6 @@ unsafe fn layernorm_into_avx2(
     let mut sum_v = _mm256_setzero_ps();
     let mut sq_v = _mm256_setzero_ps();
     let mut i = 0;
-    let n8 = (n / 8) * 8;
     while i + 32 <= n {
         for off in (0..32).step_by(8) {
             let v = _mm256_loadu_ps(src.as_ptr().add(i + off));
@@ -119,7 +118,7 @@ pub fn layernorm_into(
     let mean = sum / n;
     let var = sq / n - mean * mean;
     let inv_std = 1.0 / (var + eps).sqrt();
-    for ((d, (&s, &wi))) in dst.iter_mut().zip(src.iter().zip(w.iter())) {
+    for (d, (&s, &wi)) in dst.iter_mut().zip(src.iter().zip(w.iter())) {
         *d = (s - mean) * inv_std * wi;
     }
     for (d, &bi) in dst.iter_mut().zip(b.iter()) {
@@ -127,11 +126,4 @@ pub fn layernorm_into(
     }
 }
 
-/// 原地 LayerNorm
-pub fn layernorm_inplace(x: &mut [f32], w: &[f32], b: &[f32], eps: f32) {
-    // 借用 split 避免分配
-    let n = x.len();
-    let mut tmp = vec![0.0f32; n];
-    layernorm_into(x, &mut tmp, w, b, eps);
-    x.copy_from_slice(&tmp);
-}
+

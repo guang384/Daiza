@@ -1,5 +1,0 @@
-[build]
-# 启用本机 CPU 的 SIMD 指令(AVX2/AVX-512),
-# 让编译器能自动向量化 Q1_0 反量化 + FMA 点积循环。
-# 学习项目,不考虑二进制可移植性。
-rustflags = ["-C", "target-cpu=native"]

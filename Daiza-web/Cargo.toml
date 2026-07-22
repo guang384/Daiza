@@ -1,0 +1,14 @@
+[package]
+name = "daiza-web"
+version = "0.1.0"
+edition = "2021"
+description = "Web GUI for Daiza inference engine (HTTP + SSE)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "daiza-web"
+path = "src/main.rs"
+
+[dependencies]
+daiza-engine = { path = "../Daiza-engine" }
+daiza-runtime = { path = "../Daiza-runtime" }

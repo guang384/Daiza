@@ -32,6 +32,17 @@ impl KvCache {
         }
     }
 
+    /// 从原始数据构造 KvCache (用于从 SSD 恢复 session)
+    pub fn from_raw(k: Vec<f32>, v: Vec<f32>, len: usize, per_token: usize) -> Self {
+        Self { k, v, len, per_token }
+    }
+
+    /// 每个 token 的 K/V 向量长度 (n_kv_heads * head_dim)
+    #[inline]
+    pub fn per_token(&self) -> usize {
+        self.per_token
+    }
+
     /// 追加一个新 token 的 K/V 向量
     pub fn append(&mut self, k: &[f32], v: &[f32]) {
         self.k.extend_from_slice(k);

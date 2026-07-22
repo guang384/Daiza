@@ -33,7 +33,7 @@ Write-Host "Baseline binary: $BaselineBin" -ForegroundColor Green
 
 # 生成 golden reference tokens (greedy decode, 用于后续正确性对比)
 Write-Host "Generating golden reference tokens..." -ForegroundColor Cyan
-$GgufPath = Join-Path $ProjectRoot "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf"
+$GgufPath = Join-Path $ProjectRoot "Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf"
 $Prompt = "The capital of China is Beijing, and"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()

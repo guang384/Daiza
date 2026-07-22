@@ -2,31 +2,17 @@
 name = "daiza-engine"
 version = "0.1.0"
 edition = "2021"
-description = "Pure-CPU Rust inference engine for 1-bit Bonsai 27B (minimal-dep, only memmap2)"
+description = "Pure-CPU Rust inference engine core for 1-bit Bonsai 27B"
 license = "Apache-2.0"
 
 [lib]
 name = "daiza_engine"
 path = "src/lib.rs"
 
-[[bin]]
-name = "daiza-cli"
-path = "src/main.rs"
-
-[profile.release]
-# 推理引擎是带宽/计算密集型,release 优化档对最终 tok/s 至关重要
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-panic = "abort"
-
-[profile.dev]
-opt-level = 1   # 开发时也启用 O1,避免 GEMM 慢到无法验证
-
 [dependencies]
 # 跨平台 mmap: 用于 GGUF 权重文件按需 page-in, 避免一次性 read_to_end 导致 ~3.9GB 内存峰值。
-# memmap2 是 memmap crate 的维护分支, Rust 生态事实标准。
 memmap2 = "0.9"
 # 图像解码 (PNG/JPEG) + resize: 多模态图像预处理
-# image crate 的 imageops 模块始终可用 (无需 feature flag), 这里只需启用格式解码
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# 零拷贝字节转换 (f32/u32 slice ↔ u8 slice), 用于 cache state 序列化
+bytemuck = { version = "1.21", features = ["derive"] }

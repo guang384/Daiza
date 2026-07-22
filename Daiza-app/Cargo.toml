@@ -1,0 +1,21 @@
+[package]
+name = "daiza-app"
+version = "0.1.0"
+edition = "2021"
+description = "Tauri desktop client for Daiza inference engine"
+license = "Apache-2.0"
+
+[[bin]]
+name = "daiza-app"
+path = "src/main.rs"
+
+[dependencies]
+daiza-engine = { path = "../Daiza-engine" }
+daiza-runtime = { path = "../Daiza-runtime" }
+tauri = { version = "2" }
+ureq = { version = "3" }
+base64 = { version = "0.22" }
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+tauri-build = { version = "2" }

@@ -531,11 +531,6 @@ impl ThreadPool {
             thread.unpark();
         }
     }
-
-    /// 获取当前活跃 worker 数
-    pub fn n_active_workers(&self) -> usize {
-        self.shared.n_active_workers.load(Ordering::Relaxed)
-    }
 }
 
 /// Work-stealing 循环: 反复 fetch_add 抢 chunk, 直到 next_chunk >= total_work
@@ -644,6 +639,7 @@ pub fn thread_count() -> usize {
     })
 }
 
+#[derive(Default)]
 pub struct Workspace {
     // === block.rs 用 ===
     // ★ P0-3: block_normed 复用为 mlp 输入(attention/ssm 完成后即死,post_norm 可覆盖)
@@ -666,6 +662,7 @@ pub struct Workspace {
     pub attn_out: Vec<f32>,
     /// `[group_size * max_seq_len]` softmax scores(GQA 复用:同 kvh 的 group_size 个 qh 并行持有各自 scores)
     /// ★ GQA 复用:同 kvh 的 group_size 个 qh 共享 K/V cache 读取,各自 scores 在 [qh_in_group * n_cached + c] 处
+    /// (仅 batch prefill 使用;decode 路径用 online softmax 无需此 buffer)
     pub attn_scores: Vec<f32>,
 
     // === ssm.rs 用 ===

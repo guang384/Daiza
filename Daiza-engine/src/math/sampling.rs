@@ -5,6 +5,19 @@
 //! - top_p = 0.95
 //! - top_k = 20
 
+/// 简易 LCG 随机数生成器 (确定性,用于可重现的采样)
+pub struct LcgRng {
+    state: u64,
+}
+impl LcgRng {
+    pub fn new(seed: u64) -> Self { Self { state: seed } }
+    pub fn next_f32(&mut self) -> f32 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let bits = ((self.state >> 40) & 0xFFFFFF) as u32;
+        (bits as f32) / (0x1000000 as f32)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SamplingParams {
     pub temperature: f32,

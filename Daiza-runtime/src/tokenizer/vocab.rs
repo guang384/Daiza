@@ -6,7 +6,7 @@
 //! - `tokenizer.ggml.merges`:STRING[247587]
 //! - `tokenizer.ggml.model` = "gpt2"
 
-use crate::gguf::metadata::Metadata;
+use daiza_engine::gguf::metadata::Metadata;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenType {
@@ -34,10 +34,10 @@ pub struct Vocab {
 impl Vocab {
     pub fn from_metadata(meta: &Metadata) -> crate::Result<Self> {
         let tokens = match meta.kv.get("tokenizer.ggml.tokens") {
-            Some(crate::gguf::metadata::MetaValue::Array(elems)) => elems
+            Some(daiza_engine::gguf::metadata::MetaValue::Array(elems)) => elems
                 .iter()
                 .map(|v| match v {
-                    crate::gguf::metadata::MetaValue::String(s) => s.clone(),
+                    daiza_engine::gguf::metadata::MetaValue::String(s) => s.clone(),
                     _ => String::new(),
                 })
                 .collect(),
@@ -52,11 +52,11 @@ impl Vocab {
             .unwrap_or_default();
 
         let merges = match meta.kv.get("tokenizer.ggml.merges") {
-            Some(crate::gguf::metadata::MetaValue::Array(elems)) => elems
+            Some(daiza_engine::gguf::metadata::MetaValue::Array(elems)) => elems
                 .iter()
                 .enumerate()
                 .map(|(i, v)| match v {
-                    crate::gguf::metadata::MetaValue::String(s) => (s.clone(), i as u32),
+                    daiza_engine::gguf::metadata::MetaValue::String(s) => (s.clone(), i as u32),
                     _ => (String::new(), i as u32),
                 })
                 .collect(),

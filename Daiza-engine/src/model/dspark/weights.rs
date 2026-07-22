@@ -173,124 +173,6 @@ impl DrafterMatrix {
         }
     }
 
-    /// matvec 累加: y[i] += dot(W_row_i, x)
-    #[allow(unsafe_code)]
-    pub fn matvec_add_into_slice(&self, x: &[f32], y: &mut [f32]) {
-        debug_assert_eq!(x.len(), self.cols);
-        debug_assert_eq!(y.len(), self.rows);
-        let n = self.rows;
-        let k = self.cols;
-
-        // ★ Q8_PATH: Q4_1/Q1_0 weight × F32 input 时, llama.cpp 自动量化 input 为 Q8_0
-        let x_q8 = if matches!(self.dtype, TensorType::Q4_1 | TensorType::Q1_0) {
-            crate::model::weights::maybe_quantize_x_q8(x)
-        } else {
-            std::borrow::Cow::Borrowed(x)
-        };
-        let x = x_q8.as_ref();
-
-        match self.dtype {
-            TensorType::Q4_1 => {
-                #[cfg(target_arch = "x86_64")]
-                let use_avx2 = avx2_q4_1_available();
-                #[cfg(not(target_arch = "x86_64"))]
-                let use_avx2 = false;
-
-                if n < 64 || get_thread_pool().is_none() {
-                    #[cfg(target_arch = "x86_64")]
-                    if use_avx2 {
-                        for i in 0..n {
-                            unsafe { y[i] += dot_q4_1_row_avx2(&self.bytes, i, k, x); }
-                        }
-                        return;
-                    }
-                    for i in 0..n {
-                        y[i] += dot_q4_1_row_scalar(&self.bytes, i, k, x);
-                    }
-                    return;
-                }
-
-                let pool = get_thread_pool().unwrap();
-                let n_threads = pool.n_threads();
-                let chunk = (n + n_threads - 1) / n_threads;
-                let bytes_addr = self.bytes.as_ptr() as usize;
-                let bytes_len = self.bytes.len();
-                let x_addr = x.as_ptr() as usize;
-                let y_addr = y.as_mut_ptr() as usize;
-                pool.scatter_wait_stealing(n, chunk, move |start, end| {
-                    if start >= end { return; }
-                    let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
-                    let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
-                    #[cfg(target_arch = "x86_64")]
-                    if use_avx2 {
-                        for i in start..end {
-                            unsafe {
-                                let v = dot_q4_1_row_avx2(bytes, i, k, x);
-                                *((y_addr as *mut f32).add(i)) += v;
-                            }
-                        }
-                        return;
-                    }
-                    for i in start..end {
-                        let v = dot_q4_1_row_scalar(bytes, i, k, x);
-                        unsafe { *((y_addr as *mut f32).add(i)) += v; }
-                    }
-                });
-            }
-            TensorType::Q1_0 => {
-                for i in 0..n {
-                    y[i] += dot_q1_0_row_scalar(&self.bytes, i, k, x);
-                }
-            }
-            TensorType::Iq1M => {
-                for i in 0..n {
-                    y[i] += dot_iq1m_row_scalar(&self.bytes, i, k, x);
-                }
-            }
-            TensorType::Bf16 => {
-                if n < 64 || get_thread_pool().is_none() {
-                    for i in 0..n {
-                        y[i] += dot_bf16_row_scalar(&self.bytes, i, k, x);
-                    }
-                    return;
-                }
-                let pool = get_thread_pool().unwrap();
-                let n_threads = pool.n_threads();
-                let chunk = (n + n_threads - 1) / n_threads;
-                let bytes_addr = self.bytes.as_ptr() as usize;
-                let bytes_len = self.bytes.len();
-                let x_addr = x.as_ptr() as usize;
-                let y_addr = y.as_mut_ptr() as usize;
-                pool.scatter_wait_stealing(n, chunk, move |start, end| {
-                    if start >= end { return; }
-                    let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
-                    let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
-                    for i in start..end {
-                        let v = dot_bf16_row_scalar(bytes, i, k, x);
-                        unsafe { *((y_addr as *mut f32).add(i)) += v; }
-                    }
-                });
-            }
-            TensorType::F32 => {
-                for i in 0..n {
-                    let row_off = i * k * 4;
-                    let mut acc = 0.0f32;
-                    for j in 0..k {
-                        let b = [
-                            self.bytes[row_off + j * 4],
-                            self.bytes[row_off + j * 4 + 1],
-                            self.bytes[row_off + j * 4 + 2],
-                            self.bytes[row_off + j * 4 + 3],
-                        ];
-                        acc += f32::from_le_bytes(b) * x[j];
-                    }
-                    y[i] += acc;
-                }
-            }
-            _ => panic!("unsupported drafter dtype: {:?}", self.dtype),
-        }
-    }
-
     /// Batched matvec: `y[t*rows + i] = dot(W_row_i, x[t*cols..(t+1)*cols])` 对 t ∈ 0..n_batch。
     ///
     /// ★ 同一 W 行被所有 n_batch 个 token 共享 (只 unpack 一次), 节省 (n_batch-1)/n_batch
@@ -420,7 +302,6 @@ impl F32Vec {
         Ok(Self { data })
     }
 
-    pub fn len(&self) -> usize { self.data.len() }
 }
 
 /// 单层 drafter transformer 权重

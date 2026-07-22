@@ -9,7 +9,6 @@
 
 use std::fs::File;
 use std::path::Path;
-use std::path::PathBuf;
 
 use crate::gguf::err;
 use crate::gguf::metadata::Metadata;
@@ -28,9 +27,6 @@ pub struct GgufFile {
     pub tensors: Vec<TensorInfo>,
     /// 张量数据段在文件中的绝对偏移(用于按 tensor.offset 随机读取)
     pub data_section_offset: u64,
-    /// 文件路径(保留用于错误信息)
-    #[allow(dead_code)]
-    pub path: PathBuf,
     /// mmap 映射的整个文件字节
     mmap: memmap2::Mmap,
 }
@@ -85,7 +81,6 @@ impl GgufFile {
             metadata,
             tensors,
             data_section_offset: aligned,
-            path: path_buf,
             mmap,
         })
     }

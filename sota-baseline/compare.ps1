@@ -27,7 +27,7 @@ $ProjectRoot = Resolve-Path (Join-Path $ScriptDir "..")
 $BaselineBin = Join-Path $ScriptDir "daiza-cli-baseline.exe"
 $CurrentBin  = Join-Path $ProjectRoot "target\release\daiza-cli.exe"
 $GoldenTokens = Join-Path $ScriptDir "golden_tokens.txt"
-$GgufPath = Join-Path $ProjectRoot "..\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf"
+$GgufPath = Join-Path $ProjectRoot "Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf"
 
 if (-not (Test-Path $BaselineBin)) {
     Write-Host "error: baseline binary not found: $BaselineBin" -ForegroundColor Red

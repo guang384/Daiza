@@ -180,96 +180,6 @@ impl VisionMatrix {
         Ok(Self { data, rows, cols })
     }
 
-    /// matvec: y[i] = dot(W_row_i, x), 覆盖写入 y
-    ///
-    /// F32 通用路径, 大矩阵走线程池 (n_patches=2304 行足够并行).
-    /// ★ 嵌套并行检测: 若在 par_for_patches 闭包内调用, 走 serial 路径
-    ///   (避免 worker 持有外层任务时再次 dispatch 导致死等)
-    #[allow(unsafe_code)]
-    pub fn matvec_into_slice(&self, x: &[f32], y: &mut [f32]) {
-        debug_assert_eq!(x.len(), self.cols);
-        debug_assert_eq!(y.len(), self.rows);
-        let n = self.rows;
-        let k = self.cols;
-
-        // 小矩阵 或 无线程池 或 嵌套并行 → 单线程
-        if n < 64 || get_thread_pool().is_none() || in_parallel_region() {
-            self.matvec_serial(x, y);
-            return;
-        }
-
-        let pool = get_thread_pool().unwrap();
-        let steal_chunk = 64;
-        let data_addr = self.data.as_ptr() as usize;
-        let x_addr = x.as_ptr() as usize;
-        let y_addr = y.as_mut_ptr() as usize;
-        pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
-            let data = unsafe { std::slice::from_raw_parts(data_addr as *const f32, n * k) };
-            let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
-            for i in start..end {
-                let row = &data[i * k..(i + 1) * k];
-                let mut acc = 0.0f32;
-                for j in 0..k {
-                    acc += row[j] * x[j];
-                }
-                unsafe { *((y_addr as *mut f32).add(i)) = acc; }
-            }
-        });
-    }
-
-    /// matvec 累加: y[i] += dot(W_row_i, x)
-    #[allow(unsafe_code)]
-    pub fn matvec_add_into_slice(&self, x: &[f32], y: &mut [f32]) {
-        debug_assert_eq!(x.len(), self.cols);
-        debug_assert_eq!(y.len(), self.rows);
-        let n = self.rows;
-        let k = self.cols;
-
-        // 小矩阵 或 无线程池 或 嵌套并行 → 单线程
-        if n < 64 || get_thread_pool().is_none() || in_parallel_region() {
-            for i in 0..n {
-                let row = &self.data[i * k..(i + 1) * k];
-                let mut acc = 0.0f32;
-                for j in 0..k {
-                    acc += row[j] * x[j];
-                }
-                y[i] += acc;
-            }
-            return;
-        }
-
-        let pool = get_thread_pool().unwrap();
-        let steal_chunk = 64;
-        let data_addr = self.data.as_ptr() as usize;
-        let x_addr = x.as_ptr() as usize;
-        let y_addr = y.as_mut_ptr() as usize;
-        pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
-            let data = unsafe { std::slice::from_raw_parts(data_addr as *const f32, n * k) };
-            let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, k) };
-            for i in start..end {
-                let row = &data[i * k..(i + 1) * k];
-                let mut acc = 0.0f32;
-                for j in 0..k {
-                    acc += row[j] * x[j];
-                }
-                unsafe { *((y_addr as *mut f32).add(i)) += acc; }
-            }
-        });
-    }
-
-    fn matvec_serial(&self, x: &[f32], y: &mut [f32]) {
-        let n = self.rows;
-        let k = self.cols;
-        for i in 0..n {
-            let row = &self.data[i * k..(i + 1) * k];
-            let mut acc = 0.0f32;
-            for j in 0..k {
-                acc += row[j] * x[j];
-            }
-            y[i] = acc;
-        }
-    }
-
     /// 批量矩阵乘: Y[p, i] = sum_k W[i, k] * X[p, k]
     ///
     /// - W = self: [n (rows), k (cols)], row-major
@@ -443,11 +353,6 @@ impl VisionMatrix {
         });
     }
 
-    /// 获取一行的引用 (用于 Conv2D 等需要直接访问的场景)
-    pub fn row(&self, row_idx: usize) -> &[f32] {
-        let k = self.cols;
-        &self.data[row_idx * k..(row_idx + 1) * k]
-    }
 }
 
 /// F32 向量 (1D 张量, bias / norm weight 等)
