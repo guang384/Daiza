@@ -677,14 +677,43 @@ pub fn forward_batch_with_vision(
                             a[vh], alpha_t[vh], beta_t[vh], dt_bias[vh],
                             state_size,
                         );
-                        // output gate (fused)
-                        let mut ss = 0.0f32;
-                        for i in 0..state_size {
-                            ss += y[i] * y[i];
-                        }
-                        let inv_rms = 1.0 / (ss / state_size as f32 + l2norm_eps).sqrt();
-                        for i in 0..state_size {
-                            y[i] = y[i] * inv_rms * ssm_norm_w[i] * gate_t[y_off + i];
+                        // output gate (fused, AVX2)
+                        // ★ 与 ssm.rs 同算法, 内联此处因 y_off 是 per-v_head 偏移
+                        //   head_dim=128 = 16×8-wide, 无尾处理
+                        #[cfg(target_arch = "x86_64")]
+                        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                            #[allow(unsafe_code)]
+                            unsafe {
+                                use std::arch::x86_64::*;
+                                let mut ss_v = _mm256_setzero_ps();
+                                for i in (0..state_size).step_by(8) {
+                                    let yv = _mm256_loadu_ps(y.as_ptr().add(i));
+                                    ss_v = _mm256_fmadd_ps(yv, yv, ss_v);
+                                }
+                                let ss = hsum_ps(ss_v);
+                                let inv_rms = 1.0 / (ss / state_size as f32 + l2norm_eps).sqrt();
+                                let inv_rms_v = _mm256_set1_ps(inv_rms);
+                                let gate_vh = &gate_t[y_off..y_off + state_size];
+                                for i in (0..state_size).step_by(8) {
+                                    let yv = _mm256_loadu_ps(y.as_ptr().add(i));
+                                    let nw = _mm256_loadu_ps(ssm_norm_w.as_ptr().add(i));
+                                    let gv = _mm256_loadu_ps(gate_vh.as_ptr().add(i));
+                                    let scaled = _mm256_mul_ps(yv, inv_rms_v);
+                                    let gated = _mm256_mul_ps(scaled, nw);
+                                    let result = _mm256_mul_ps(gated, gv);
+                                    _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
+                                }
+                            }
+                        } else {
+                            let mut ss = 0.0f32;
+                            for i in 0..state_size {
+                                ss += y[i] * y[i];
+                            }
+                            let inv_rms = 1.0 / (ss / state_size as f32 + l2norm_eps).sqrt();
+                            let gate_vh = &gate_t[y_off..y_off + state_size];
+                            for i in 0..state_size {
+                                y[i] = y[i] * inv_rms * ssm_norm_w[i] * gate_vh[i];
+                            }
                         }
                     }
                 } else {
@@ -735,15 +764,42 @@ pub fn forward_batch_with_vision(
                                 a_s[vh], alpha_s[vh], beta_s[vh], dt_s[vh],
                                 ss,
                             );
-                            // output gate (fused, per-v_head 独立)
-                            let mut sum_sq = 0.0f32;
-                            for i in 0..ss {
-                                sum_sq += y[i] * y[i];
-                            }
-                            let inv_rms = 1.0 / (sum_sq / ss as f32 + eps).sqrt();
-                            let gate_vh = &gate_s[y_off..y_off + ss];
-                            for i in 0..ss {
-                                y[i] = y[i] * inv_rms * norm_w[i] * gate_vh[i];
+                            // output gate (fused, per-v_head 独立, AVX2)
+                            // ★ 与串行路径同算法, head_dim=128=16×8-wide
+                            #[cfg(target_arch = "x86_64")]
+                            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                                #[allow(unsafe_code)]
+                                unsafe {
+                                    use std::arch::x86_64::*;
+                                    let mut ss_v = _mm256_setzero_ps();
+                                    for i in (0..ss).step_by(8) {
+                                        let yv = _mm256_loadu_ps(y.as_ptr().add(i));
+                                        ss_v = _mm256_fmadd_ps(yv, yv, ss_v);
+                                    }
+                                    let sum_sq = hsum_ps(ss_v);
+                                    let inv_rms = 1.0 / (sum_sq / ss as f32 + eps).sqrt();
+                                    let inv_rms_v = _mm256_set1_ps(inv_rms);
+                                    let gate_vh = &gate_s[y_off..y_off + ss];
+                                    for i in (0..ss).step_by(8) {
+                                        let yv = _mm256_loadu_ps(y.as_ptr().add(i));
+                                        let nw = _mm256_loadu_ps(norm_w.as_ptr().add(i));
+                                        let gv = _mm256_loadu_ps(gate_vh.as_ptr().add(i));
+                                        let scaled = _mm256_mul_ps(yv, inv_rms_v);
+                                        let gated = _mm256_mul_ps(scaled, nw);
+                                        let result = _mm256_mul_ps(gated, gv);
+                                        _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
+                                    }
+                                }
+                            } else {
+                                let mut sum_sq = 0.0f32;
+                                for i in 0..ss {
+                                    sum_sq += y[i] * y[i];
+                                }
+                                let inv_rms = 1.0 / (sum_sq / ss as f32 + eps).sqrt();
+                                let gate_vh = &gate_s[y_off..y_off + ss];
+                                for i in 0..ss {
+                                    y[i] = y[i] * inv_rms * norm_w[i] * gate_vh[i];
+                                }
                             }
                         }
                     });
@@ -917,4 +973,21 @@ pub fn make_context<'a>(
         hidden_tap_layers: Vec::new(),
         hidden_tap_batch_buf: Vec::new(),
     }
+}
+
+/// __m256 → f32 横向求和(纯寄存器内,无 store)
+/// 用于 SSM output gate AVX2 路径的 sum-of-squares reduce
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[inline]
+unsafe fn hsum_ps(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(hi, lo);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
 }

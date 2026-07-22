@@ -123,6 +123,86 @@ pub(crate) fn ssm_scan_vhead(
     ssm_scan_fused_scalar(s, y, q_head, k_head, v_head, decay, beta, head_dim);
 }
 
+/// SSM output gate 标量实现 — 与 AVX2 版本逻辑一致
+/// y = rmsnorm(y) * ssm_norm_weight * silu(z), per v_head
+#[inline(never)]
+pub(crate) fn ssm_output_gate_scalar(
+    y: &mut [f32],
+    z: &[f32],
+    norm_w: &[f32],
+    num_v_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) {
+    let inv_hd = 1.0 / head_dim as f32;
+    for vh in 0..num_v_heads {
+        let off = vh * head_dim;
+        let mut ss = 0.0f32;
+        for i in 0..head_dim {
+            ss += y[off + i] * y[off + i];
+        }
+        let inv_rms = 1.0 / (ss * inv_hd + eps).sqrt();
+        for i in 0..head_dim {
+            y[off + i] = y[off + i] * inv_rms * norm_w[i] * z[off + i];
+        }
+    }
+}
+
+/// SSM output gate AVX2 向量化: sum-of-squares + 4-way mul
+///
+/// y 布局: [num_v_heads * head_dim] flat 连续
+/// z 布局: 同 y
+/// norm_w 布局: [head_dim],per v_head 共享
+///
+/// head_dim=128 = 16×8-wide,无尾处理。
+/// sum-of-squares: AVX2 FMA + 水平 reduce (16 iter → 1 个 __m256 累加)
+/// 4-way mul: y = y * inv_rms * norm_w * z (2 次 FMUL,或 1 次 FMA + 1 次 FMUL)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_code)]
+#[inline]
+pub(crate) unsafe fn ssm_output_gate_avx2(
+    y: &mut [f32],
+    z: &[f32],
+    norm_w: &[f32],
+    num_v_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(head_dim % 8, 0);
+    let inv_hd = 1.0 / head_dim as f32;
+    let inv_hd_v = _mm256_set1_ps(inv_hd);
+    let eps_v = _mm256_set1_ps(eps);
+    for vh in 0..num_v_heads {
+        let off = vh * head_dim;
+        // Pass 1: sum of squares (16 iter FMA → 1 __m256)
+        let mut ss_v = _mm256_setzero_ps();
+        for i in (0..head_dim).step_by(8) {
+            let y_v = _mm256_loadu_ps(y.as_ptr().add(off + i));
+            ss_v = _mm256_fmadd_ps(y_v, y_v, ss_v);
+        }
+        // 水平 reduce: sum → rsqrt(sum*inv_hd + eps)
+        let ss = horizontal_sum_ps(ss_v);
+        let inv_rms = 1.0 / (ss * inv_hd + eps).sqrt();
+        // Pass 2: y = y * inv_rms * norm_w * z
+        let inv_rms_v = _mm256_set1_ps(inv_rms);
+        for i in (0..head_dim).step_by(8) {
+            let y_v = _mm256_loadu_ps(y.as_ptr().add(off + i));
+            let nw_v = _mm256_loadu_ps(norm_w.as_ptr().add(i));
+            let z_v = _mm256_loadu_ps(z.as_ptr().add(off + i));
+            // y = (y * inv_rms) * norm_w * z,先 FMA: tmp = norm_w * inv_rms * y,
+            // 再 mul z。但更精确的写法:y * inv_rms → FMA(norm_w, ·, 0) → * z
+            let scaled = _mm256_mul_ps(y_v, inv_rms_v);
+            let gated = _mm256_mul_ps(scaled, nw_v);
+            let result = _mm256_mul_ps(gated, z_v);
+            _mm256_storeu_ps(y.as_mut_ptr().add(off + i), result);
+        }
+    }
+    // 抑制 unused warning(inv_hd_v/eps_v 在 rsqrt 走标量,但保留语义清晰)
+    let _ = (inv_hd_v, eps_v);
+}
+
 /// 标量融合 fallback(与 AVX2 版本逻辑一致)
 #[inline(never)]
 fn ssm_scan_fused_scalar(
@@ -367,16 +447,32 @@ pub fn ssm_forward_into(
     //   原标量 silu_fast 294912 次/token,每次 ~5c(broadcast+extract 浪费 7 lane)
     //   批量后 768 次 SIMD,每次 ~10c 处理 8 元素 → ~1.25c/element
     math::silu_inplace_simd(&mut ws.ssm_z[..num_v_heads * head_dim]);
-    for vh in 0..num_v_heads {
-        let y_off = vh * head_dim;
-        let mut ss = 0.0f32;
-        for i in 0..head_dim {
-            ss += ws.ssm_y[y_off + i] * ws.ssm_y[y_off + i];
+    // ★ AVX2 output gate: sum-of-squares + 4-way mul 向量化
+    //   head_dim=128 = 16×8-wide,无尾处理
+    //   原: 48 v_heads × 2 × 128 iter = 12288 标量 iter/block × 48 blocks = 589824 iter/token
+    //   新: 48 v_heads × 16 iter = 768 SIMD iter/block × 48 = 36864 iter/token (~16x 减少)
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        #[allow(unsafe_code)]
+        unsafe {
+            ssm_output_gate_avx2(
+                &mut ws.ssm_y[..num_v_heads * head_dim],
+                &ws.ssm_z[..num_v_heads * head_dim],
+                ssm_norm_w,
+                num_v_heads,
+                head_dim,
+                SSM_EPS,
+            );
         }
-        let inv_rms = 1.0 / (ss / head_dim as f32 + SSM_EPS).sqrt();
-        for i in 0..head_dim {
-            ws.ssm_y[y_off + i] = ws.ssm_y[y_off + i] * inv_rms * ssm_norm_w[i] * ws.ssm_z[y_off + i];
-        }
+    } else {
+        ssm_output_gate_scalar(
+            &mut ws.ssm_y[..num_v_heads * head_dim],
+            &ws.ssm_z[..num_v_heads * head_dim],
+            ssm_norm_w,
+            num_v_heads,
+            head_dim,
+            SSM_EPS,
+        );
     }
 
     // 9. Output projection + residual: h += W_out @ y
