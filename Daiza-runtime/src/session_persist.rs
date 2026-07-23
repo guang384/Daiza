@@ -101,12 +101,21 @@ impl Session {
                 let len = kv.len as u64;
                 file.write_all(&per_token.to_le_bytes())?;
                 file.write_all(&len.to_le_bytes())?;
-                // 只写 len * per_token 个 f32 (不写 capacity)
+                // Gather per-kvh [kvh, seq, dim] → flat [seq, kvh, dim] (磁盘格式兼容)
                 let n = kv.len * kv.per_token();
-                let k_bytes = bytemuck::cast_slice(&kv.k[..n]);
-                let v_bytes = bytemuck::cast_slice(&kv.v[..n]);
-                file.write_all(k_bytes)?;
-                file.write_all(v_bytes)?;
+                let mut k_flat = vec![0.0f32; n];
+                let mut v_flat = vec![0.0f32; n];
+                let head_dim = cfg.head_dim;
+                for seq in 0..kv.len {
+                    for kvh in 0..kv.k.len() {
+                        let dst = seq * per_token as usize + kvh * head_dim;
+                        let src = seq * head_dim;
+                        k_flat[dst..dst + head_dim].copy_from_slice(&kv.k[kvh][src..src + head_dim]);
+                        v_flat[dst..dst + head_dim].copy_from_slice(&kv.v[kvh][src..src + head_dim]);
+                    }
+                }
+                file.write_all(bytemuck::cast_slice(&k_flat))?;
+                file.write_all(bytemuck::cast_slice(&v_flat))?;
             } else {
                 // SSM state
                 let ssm = self.state.ssm_states[blk_idx].as_ref()
@@ -231,7 +240,7 @@ impl Session {
                 let mut v = vec![0.0f32; n];
                 file.read_exact(bytemuck::cast_slice_mut(&mut k))?;
                 file.read_exact(bytemuck::cast_slice_mut(&mut v))?;
-                kv_caches.push(Some(KvCache::from_raw(k, v, len, per_token)));
+                kv_caches.push(Some(KvCache::from_raw(&k, &v, len, cfg.head_count_kv, cfg.head_dim)));
                 ssm_states.push(None);
             } else {
                 // 期望 SSM

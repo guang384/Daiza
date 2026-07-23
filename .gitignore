@@ -19,6 +19,9 @@ __pycache__/
 Daiza-engine/test_*.txt
 Daiza-engine/inspect_output.txt
 Daiza-engine/gguf_inspect_output.txt
+sota-baseline/current_tokens.txt
+sota-baseline/golden_tokens.txt
+sota-baseline/daiza-cli-baseline.exe
 
 # ===== 编辑器与系统文件 =====
 .vscode/

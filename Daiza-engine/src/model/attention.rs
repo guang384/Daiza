@@ -149,8 +149,8 @@ pub fn attention_forward_into(
         let mut out = [[0.0f32; 256]; 8];         // running output(容量 head_dim=256)
 
         for c in 0..n_cached {
-            let k_head = &kv_cache.k_at(c)[kvh * head_dim..(kvh + 1) * head_dim];
-            let v_head = &kv_cache.v_at(c)[kvh * head_dim..(kvh + 1) * head_dim];
+            let k_head = kv_cache.k_head_at(kvh, c);
+            let v_head = kv_cache.v_head_at(kvh, c);
 
             for qh_in_group in 0..group_size {
                 let qh = kvh * group_size + qh_in_group;

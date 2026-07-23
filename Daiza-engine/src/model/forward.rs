@@ -506,7 +506,7 @@ pub fn forward_batch_with_vision(
                 for kvh in 0..n_kv_heads {
                     // 阶段 1: K 复用 — 一次读 K[c][kvh],算 group_size 个 qh 的 scores
                     for c in 0..n_cached {
-                        let k_head = &kv.k_at(c)[kvh * head_dim..(kvh + 1) * head_dim];
+                        let k_head = kv.k_head_at(kvh, c);
                         for qh_in_group in 0..group_size {
                             let qh = kvh * group_size + qh_in_group;
                             let q_head = &ctx.workspace.attn_q[qh * head_dim..(qh + 1) * head_dim];
@@ -523,7 +523,7 @@ pub fn forward_batch_with_vision(
 
                     // 阶段 3: V 复用 — 一次读 V[c][kvh],做 group_size 个 qh 的 V 加权
                     for c in 0..n_cached {
-                        let v_head = &kv.v_at(c)[kvh * head_dim..(kvh + 1) * head_dim];
+                        let v_head = kv.v_head_at(kvh, c);
                         for qh_in_group in 0..group_size {
                             let qh = kvh * group_size + qh_in_group;
                             let out_head = &mut out_t[qh * head_dim..(qh + 1) * head_dim];
