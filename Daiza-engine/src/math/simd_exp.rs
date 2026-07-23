@@ -524,3 +524,46 @@ pub fn argmax_avx2(x: &[f32]) -> (usize, f32) {
     }
     (best_id, best_val)
 }
+
+/// AVX2 向量化: residual[i] = max(0, p[i] - q[i]), 返回 sum(residual)
+///
+/// ★ 用于 DSpark sample_bonus (vocab=248K, 原 3 次标量遍历 → 1 次 AVX2 遍历)
+///   融合 sub + max(0) + store + sum 累加 (原标量 248K iter, 现 31K×8-wide)
+pub fn residual_max_zero_sum_avx2(p: &[f32], q: &[f32], residual: &mut [f32]) -> f32 {
+    let len = p.len();
+    debug_assert_eq!(q.len(), len);
+    debug_assert_eq!(residual.len(), len);
+    let mut sum = 0.0f32;
+    #[cfg(target_arch = "x86_64")]
+    if simd_available() && len >= 8 {
+        #[allow(unsafe_code)]
+        unsafe {
+            let zero = _mm256_setzero_ps();
+            let mut sum_v = _mm256_setzero_ps();
+            let n8 = (len / 8) * 8;
+            let mut i = 0;
+            while i < n8 {
+                let pv = _mm256_loadu_ps(p.as_ptr().add(i));
+                let qv = _mm256_loadu_ps(q.as_ptr().add(i));
+                let diff = _mm256_sub_ps(pv, qv);
+                let r = _mm256_max_ps(diff, zero);
+                _mm256_storeu_ps(residual.as_mut_ptr().add(i), r);
+                sum_v = _mm256_add_ps(sum_v, r);
+                i += 8;
+            }
+            sum = hsum_ps(sum_v);
+            for j in n8..len {
+                let r = (p[j] - q[j]).max(0.0);
+                residual[j] = r;
+                sum += r;
+            }
+        }
+        return sum;
+    }
+    for i in 0..len {
+        let r = (p[i] - q[i]).max(0.0);
+        residual[i] = r;
+        sum += r;
+    }
+    sum
+}

@@ -1325,17 +1325,13 @@ fn sample_bonus(
     }
     let p = &mut bonus_buf.p;
     let q = &mut bonus_buf.q;
-    softmax_inplace(target_logits, p);
-    softmax_inplace(draft_logits, q);
+    softmax_into(target_logits, p);
+    softmax_into(draft_logits, q);
 
     // residual = max(0, p - q), 归一化为概率分布, 转为 logits 供 top_k/top_p 采样
+    // ★ AVX2 向量化: max(0, p-q) + sum 累加 (原标量 248K iter, 现 31K×8-wide)
     let residual = &mut bonus_buf.residual;
-    let mut sum = 0.0f32;
-    for i in 0..vocab {
-        let r = (p[i] - q[i]).max(0.0);
-        residual[i] = r;
-        sum += r;
-    }
+    let sum = daiza_engine::math::simd_exp::residual_max_zero_sum_avx2(p, q, residual);
     if sum <= 1e-12 {
         // 退化为 target 分布采样
         return sample_top_k_top_p_into(target_logits, params, rng, sampling_buf);
@@ -1349,18 +1345,11 @@ fn sample_bonus(
 }
 
 /// 数值稳定的 softmax: logits → prob (写入 out)
-fn softmax_inplace(logits: &[f32], out: &mut [f32]) {
-    let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let mut sum = 0.0f32;
-    for (i, &l) in logits.iter().enumerate() {
-        let e = (l - max).exp();
-        out[i] = e;
-        sum += e;
-    }
-    let inv = 1.0 / sum;
-    for v in out.iter_mut() {
-        *v *= inv;
-    }
+/// ★ 复用 daiza_engine::math::softmax_inplace 的 3-pass SIMD 实现
+///   原标量实现 ~6ms (vocab=248K), SIMD ~1.5ms
+fn softmax_into(logits: &[f32], out: &mut [f32]) {
+    out[..logits.len()].copy_from_slice(logits);
+    daiza_engine::math::softmax_inplace(&mut out[..logits.len()]);
 }
 
 /// 只计算 softmax 在 `idx` 位置的概率值, 避免全量分配
