@@ -501,8 +501,8 @@ impl DrafterContext {
         // ★ P1 零拷贝: K/V 数据源分两段 — k ∈ [0..cached_kv_len) 读 ws_k_cache[il],
         //   k ∈ [cached_kv_len..n_total) 读 ws_k。避免 245KB/层 的 cache→ws_k 复制。
         self.ws_attn_out.resize(bs * h, 0.0);
-        // 复用 ws_scores buffer (消除每 (pos, qh) 一次 vec![] 分配)
-        self.ws_scores.resize(n_total, 0.0);
+        // 复用 ws_scores buffer (★ GQA: 扩容到 group_size * n_total, per kvh 一组)
+        self.ws_scores.resize(group_size * n_total, 0.0);
         let kq_scale = self.ws_kq_scale;
         // 提前借用 K/V 数据源 slice (避免循环内重复借用 self)
         let (k_src, v_src, cache_split): (&[f32], &[f32], usize) = if kv_cache_valid {
@@ -513,44 +513,69 @@ impl DrafterContext {
         // ws_k/ws_v 中只有 [cache_split..n_total] 行有有效数据 (kv_cache_valid=true 时)
         let ws_k = &self.ws_k;
         let ws_v = &self.ws_v;
+        // ★ GQA K/V 复用: 外层 kvh, 内层 group_size 个 qh 共享 K/V 读取
+        //   原: per (pos, qh) 独立读 K/V, 24 qh × n_total 次 K/V 读取
+        //   新: per (pos, kvh) 读 K/V, 4 kvh × n_total 次 K/V 读取 (6x 减少)
+        //   K/V 每个 k 只读一次, 服务 group_size=6 个 qh 的 scores 和 V sum
         for pos in 0..bs {
             let q_row = ctx_len + pos;
-            for qh in 0..n_qh {
-                let kvh = qh / group_size;
-                let q_ptr = q_row * n_qh * hd + qh * hd;
-                let scores = &mut self.ws_scores[..n_total];
-
-                // scores[k] = dot(Q, K[k]) * kq_scale  (AVX2)
-                // 拆段: k ∈ [0..cache_split) 读 k_src (cache), k ∈ [cache_split..n_total) 读 ws_k
-                let q_head = &self.ws_q[q_ptr..q_ptr + hd];
+            for kvh in 0..n_kvh {
+                // 阶段 1: K 复用 — 一次读 K[k][kvh], 算 group_size 个 qh 的 scores
+                let q_base = q_row * n_qh * hd + kvh * group_size * hd;
                 for k in 0..cache_split {
                     let k_ptr = k * n_kvh * hd + kvh * hd;
-                    scores[k] = crate::math::simd_exp::dot_product_avx2(q_head, &k_src[k_ptr..k_ptr + hd], hd) * kq_scale;
+                    let k_head = &k_src[k_ptr..k_ptr + hd];
+                    for qh_in_group in 0..group_size {
+                        let q_ptr = q_base + qh_in_group * hd;
+                        let q_head = &self.ws_q[q_ptr..q_ptr + hd];
+                        self.ws_scores[qh_in_group * n_total + k] =
+                            crate::math::simd_exp::dot_product_avx2(q_head, k_head, hd) * kq_scale;
+                    }
                 }
                 for k in cache_split..n_total {
                     let k_ptr = k * n_kvh * hd + kvh * hd;
-                    scores[k] = crate::math::simd_exp::dot_product_avx2(q_head, &ws_k[k_ptr..k_ptr + hd], hd) * kq_scale;
+                    let k_head = &ws_k[k_ptr..k_ptr + hd];
+                    for qh_in_group in 0..group_size {
+                        let q_ptr = q_base + qh_in_group * hd;
+                        let q_head = &self.ws_q[q_ptr..q_ptr + hd];
+                        self.ws_scores[qh_in_group * n_total + k] =
+                            crate::math::simd_exp::dot_product_avx2(q_head, k_head, hd) * kq_scale;
+                    }
                 }
 
-                // softmax (无 mask, AVX2 exp via math::softmax_inplace)
-                math::softmax_inplace(scores);
+                // 阶段 2: group_size 个 qh 各自 softmax
+                for qh_in_group in 0..group_size {
+                    let s = &mut self.ws_scores[qh_in_group * n_total..(qh_in_group + 1) * n_total];
+                    math::softmax_inplace(s);
+                }
 
-                // out = sum_k attn[k] * V[k]  (k-major + AVX2 saxpy)
-                // 外循环 k (连续 V 访问), 内循环 j (saxpy_avx2 8-wide FMA)
-                // 拆段 V 同样按 cache_split 切分数据源
-                let out_off = pos * h + qh * hd;
+                // 阶段 3: V 复用 — 一次读 V[k][kvh], 做 group_size 个 qh 的 V 加权
+                //   先清零 group_size 个 out_head
                 let v_base = kvh * hd;
-                let out_head = &mut self.ws_attn_out[out_off..out_off + hd];
-                for j in 0..hd { out_head[j] = 0.0; }
+                let out_base = pos * h + kvh * group_size * hd;
+                for qh_in_group in 0..group_size {
+                    let out_off = out_base + qh_in_group * hd;
+                    for j in 0..hd { self.ws_attn_out[out_off + j] = 0.0; }
+                }
                 for k in 0..cache_split {
-                    let s = scores[k];
                     let v_ptr = k * n_kvh * hd + v_base;
-                    crate::math::simd_exp::saxpy_avx2(s, &v_src[v_ptr..v_ptr + hd], out_head, hd);
+                    let v_head = &v_src[v_ptr..v_ptr + hd];
+                    for qh_in_group in 0..group_size {
+                        let s = self.ws_scores[qh_in_group * n_total + k];
+                        let out_off = out_base + qh_in_group * hd;
+                        let out_head = &mut self.ws_attn_out[out_off..out_off + hd];
+                        crate::math::simd_exp::saxpy_avx2(s, v_head, out_head, hd);
+                    }
                 }
                 for k in cache_split..n_total {
-                    let s = scores[k];
                     let v_ptr = k * n_kvh * hd + v_base;
-                    crate::math::simd_exp::saxpy_avx2(s, &ws_v[v_ptr..v_ptr + hd], out_head, hd);
+                    let v_head = &ws_v[v_ptr..v_ptr + hd];
+                    for qh_in_group in 0..group_size {
+                        let s = self.ws_scores[qh_in_group * n_total + k];
+                        let out_off = out_base + qh_in_group * hd;
+                        let out_head = &mut self.ws_attn_out[out_off..out_off + hd];
+                        crate::math::simd_exp::saxpy_avx2(s, v_head, out_head, hd);
+                    }
                 }
             }
         }
