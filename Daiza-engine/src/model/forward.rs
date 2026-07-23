@@ -439,6 +439,11 @@ pub fn forward_batch_with_vision(
     }
     if let Some(t) = t0 { p_cos_sin = t.elapsed(); }
 
+    // ★ 3.3: tap_idx 游标 (与 forward_single_token 一致, O(1) 比较替代 O(n_tap) 线性查找)
+    //   target_layers 升序排列 (如 [1,16,31,46,61]), 游标单调递增
+    let tap_enabled_batch = !ctx.hidden_tap_layers.is_empty();
+    let mut tap_idx_batch = 0usize;
+
     for blk_idx in 0..cfg.block_count {
         let is_full = cfg.is_full_attention_block(blk_idx);
         let block_ts = if debug_blocks { Some(std::time::Instant::now()) } else { None };
@@ -898,27 +903,30 @@ pub fn forward_batch_with_vision(
 
         // DSpark batch tap: 在 tap layer 完成后捕获所有 token 的 h_buf (post-FFN residual)
         // 布局: [n_batch, n_tap_layers, hidden] (token-major, 每 token 拼接 n_tap_layers 个 hidden)
-        if !ctx.hidden_tap_layers.is_empty() {
-            if let Some(tap_idx) = ctx.hidden_tap_layers.iter().position(|&l| l == blk_idx) {
-                let n_tap = ctx.hidden_tap_layers.len();
-                let need = n_batch * n_tap * hidden;
-                if ctx.hidden_tap_batch_buf.len() != need {
-                    ctx.hidden_tap_batch_buf = vec![0.0; need];
-                }
-                for t in 0..n_batch {
-                    let src = &ctx.h_buf[t * hidden..(t + 1) * hidden];
-                    let dst_off = (t * n_tap + tap_idx) * hidden;
-                    ctx.hidden_tap_batch_buf[dst_off..dst_off + hidden].copy_from_slice(src);
-                }
-                // ★ DAIZA_DUMP_TAP: dump 最后 token 在每个 tap layer 的前 16 个值
-                //   用于与 llama.cpp 逐值对比, 判断 Q1_0 target model 实现是否一致
-                if dump_tap_enabled() {
-                    let hL = &ctx.h_buf[(n_batch - 1) * hidden..n_batch * hidden];
-                    eprintln!("[dump-tap] blk_idx={blk_idx} tap_idx={tap_idx} token[last={n_batch_minus_1}] first16: {first16:?}",
-                        n_batch_minus_1 = n_batch - 1,
-                        first16 = &hL[..16.min(hidden)]);
-                }
+        // ★ 3.3: 游标方式 (与 forward_single_token 一致), O(1) 比较替代 O(n_tap) 线性查找
+        if tap_enabled_batch
+            && tap_idx_batch < ctx.hidden_tap_layers.len()
+            && blk_idx == ctx.hidden_tap_layers[tap_idx_batch] {
+            let tap_idx = tap_idx_batch;
+            let n_tap = ctx.hidden_tap_layers.len();
+            let need = n_batch * n_tap * hidden;
+            if ctx.hidden_tap_batch_buf.len() != need {
+                ctx.hidden_tap_batch_buf = vec![0.0; need];
             }
+            for t in 0..n_batch {
+                let src = &ctx.h_buf[t * hidden..(t + 1) * hidden];
+                let dst_off = (t * n_tap + tap_idx) * hidden;
+                ctx.hidden_tap_batch_buf[dst_off..dst_off + hidden].copy_from_slice(src);
+            }
+            // ★ DAIZA_DUMP_TAP: dump 最后 token 在每个 tap layer 的前 16 个值
+            //   用于与 llama.cpp 逐值对比, 判断 Q1_0 target model 实现是否一致
+            if dump_tap_enabled() {
+                let hL = &ctx.h_buf[(n_batch - 1) * hidden..n_batch * hidden];
+                eprintln!("[dump-tap] blk_idx={blk_idx} tap_idx={tap_idx} token[last={n_batch_minus_1}] first16: {first16:?}",
+                    n_batch_minus_1 = n_batch - 1,
+                    first16 = &hL[..16.min(hidden)]);
+            }
+            tap_idx_batch += 1;
         }
 
         if let Some(ts) = block_ts {

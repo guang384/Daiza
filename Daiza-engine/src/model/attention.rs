@@ -169,6 +169,7 @@ pub fn attention_forward_into(
                 let m_old = m[qh_in_group];
                 // ★ branch 消除: m_new = max(m_old, score); 当 m_old=-inf, exp(-inf)=0, 与原 branch 等价
                 let m_new = m_old.max(score);
+                // ★ 3.1: simd_available() 已加 #[inline], fat LTO 下内联消除 call/ret 开销
                 let alpha = crate::math::simd_exp::exp_fast(m_old - m_new);
                 let beta = crate::math::simd_exp::exp_fast(score - m_new);
 

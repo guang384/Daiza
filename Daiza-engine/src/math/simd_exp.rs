@@ -108,6 +108,7 @@ pub unsafe fn silu_ps(x: __m256) -> __m256 {
 }
 
 /// 检测 CPU 是否支持 AVX2 + FMA
+#[inline]
 pub fn simd_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -120,6 +121,7 @@ pub fn simd_available() -> bool {
 }
 
 /// SIMD sigmoid 标量入口
+/// ★ 3.1: simd_available() 已加 #[inline], fat LTO 下内联消除 call/ret
 pub fn sigmoid_fast(x: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
     if simd_available() {
@@ -135,6 +137,7 @@ pub fn sigmoid_fast(x: f32) -> f32 {
 
 /// SIMD exp 标量入口 (broadcast + exp_ps + extract low lane)
 /// ★ 用于 online softmax 内层循环的 alpha/beta 计算, 替代 libm expf (~30c → ~12c)
+/// ★ 3.1: simd_available() 已加 #[inline], fat LTO + codegen-units=1 下内联消除 call/ret
 pub fn exp_fast(x: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
     if simd_available() {
