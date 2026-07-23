@@ -837,15 +837,14 @@ pub fn forward_batch_with_vision(
         w_up.matvec_batch_into_slice(&normed_batch, n_batch, &mut tmp_buf[..n_batch * ffn_dim]);
         if let Some(ts) = ts { p_batch_matvec += ts.elapsed(); }
 
-        // 4c. Per-token SwiGLU: gate = silu(gate) * up (in-place on qkv_buf, 读 tmp_buf)
-        //    qkv_buf 和 tmp_buf 是不同 Vec,可同时 &mut qkv_buf[..] 和 &tmp_buf[..]
+        // 4c. SwiGLU: gate = silu(gate) * up (in-place on qkv_buf, 读 tmp_buf)
+        //    ★ 两 buffer 连续, 合并为单次调用 (消除 n_batch-1 次函数调用 + 尾部分支)
+        //    ffn_dim=17408 是 8 的倍数, n_batch*ffn_dim 仍是 8 的倍数, 无尾处理
         let ts = if profile { Some(std::time::Instant::now()) } else { None };
-        for t in 0..n_batch {
-            math::swiglu_inplace(
-                &mut qkv_buf[t * ffn_dim..(t + 1) * ffn_dim],
-                &tmp_buf[t * ffn_dim..(t + 1) * ffn_dim],
-            );
-        }
+        math::swiglu_inplace(
+            &mut qkv_buf[..n_batch * ffn_dim],
+            &tmp_buf[..n_batch * ffn_dim],
+        );
         if let Some(ts) = ts { p_swiglu += ts.elapsed(); }
 
         // 4d. Batch down projection: h += W_down @ gate
