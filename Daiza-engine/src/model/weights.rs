@@ -1094,7 +1094,24 @@ impl LoadedWeights {
                     ssm_alpha: Self::load_q1_0_block(gguf, blk_idx, "ssm_alpha.weight")?,
                     ssm_beta: Self::load_q1_0_block(gguf, blk_idx, "ssm_beta.weight")?,
                     ssm_out: Self::load_q1_0_block(gguf, blk_idx, "ssm_out.weight")?,
-                    ssm_conv1d: Self::load_block_tensor(gguf, blk_idx, "ssm_conv1d.weight")?,
+                    ssm_conv1d: {
+                        // ★ P1-5: 转置 ssm_conv1d 权重 [qkv_full_len, conv_k] → [conv_k, qkv_full_len]
+                        //   原布局 data[ch * conv_k + t] (stride=conv_k 访问, 无法 SIMD)
+                        //   转置后 data[t * qkv + ch] (每个 t 连续, 可 AVX2 FMA)
+                        //   一次性成本: 48 blocks × 40960 元素 ≈ 2ms, 运行时每 token 省 stride 访问
+                        let mut t = Self::load_block_tensor(gguf, blk_idx, "ssm_conv1d.weight")?;
+                        let conv_k = cfg.ssm_conv_kernel;
+                        let qkv = t.data.len() / conv_k;
+                        let mut transposed = vec![0.0f32; t.data.len()];
+                        for ch in 0..qkv {
+                            for t_idx in 0..conv_k {
+                                transposed[t_idx * qkv + ch] = t.data[ch * conv_k + t_idx];
+                            }
+                        }
+                        t.data = transposed;
+                        t.dims = vec![conv_k, qkv];
+                        t
+                    },
                     ssm_a: Self::load_block_tensor(gguf, blk_idx, "ssm_a")?,
                     ssm_dt_bias: Self::load_block_tensor(gguf, blk_idx, "ssm_dt.bias")?,
                     ssm_norm: Self::load_block_tensor(gguf, blk_idx, "ssm_norm.weight")?,

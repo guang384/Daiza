@@ -606,11 +606,31 @@ pub fn forward_batch_with_vision(
                 let conv_w = &w.ssm_conv1d.data;
                 ctx.workspace.ssm_conv_out.fill(0.0);
                 // ★ P2-2: 环形读取 — 第 ct 个历史 token 在 (conv_head + ct) % conv_k 行
+                // ★ P1-5: 权重已转置为 [conv_k, qkv_full_len], 每个 ct 的 w 连续, AVX2 FMA
+                #[cfg(target_arch = "x86_64")]
+                let use_avx2 = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
                 for ct in 0..conv_k {
                     let row = (ssm.conv_head + ct) % conv_k;
                     let hist_row = &ssm.conv_history[row * qkv_full_len..(row + 1) * qkv_full_len];
-                    for ch in 0..qkv_full_len {
-                        ctx.workspace.ssm_conv_out[ch] += hist_row[ch] * conv_w[ch * conv_k + ct];
+                    let w_t = &conv_w[ct * qkv_full_len..(ct + 1) * qkv_full_len];
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 {
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            crate::model::ssm::conv1d_fma_avx2(
+                                &mut ctx.workspace.ssm_conv_out, hist_row, w_t, qkv_full_len,
+                            );
+                        }
+                    } else {
+                        for ch in 0..qkv_full_len {
+                            ctx.workspace.ssm_conv_out[ch] += hist_row[ch] * w_t[ch];
+                        }
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        for ch in 0..qkv_full_len {
+                            ctx.workspace.ssm_conv_out[ch] += hist_row[ch] * w_t[ch];
+                        }
                     }
                 }
                 // ★ P2-9: silu 向量化 — 先原地 SIMD silu,再 memcpy 拆分

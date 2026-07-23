@@ -123,6 +123,32 @@ pub(crate) fn ssm_scan_vhead(
     ssm_scan_fused_scalar(s, y, q_head, k_head, v_head, decay, beta, head_dim);
 }
 
+/// depthwise conv1d FMA 累加: out[ch] += hist[ch] * w_t[ch]
+///
+/// 三个 slice 均连续, 长度 n。AVX2 8-wide FMA, 尾部标量处理。
+/// 用于 ssm_conv1d (转置后权重连续)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_code)]
+#[inline]
+pub(crate) unsafe fn conv1d_fma_avx2(out: &mut [f32], hist: &[f32], w_t: &[f32], n: usize) {
+    use core::arch::x86_64::*;
+    let n8 = (n / 8) * 8;
+    let mut i = 0;
+    while i < n8 {
+        let h = _mm256_loadu_ps(hist.as_ptr().add(i));
+        let w = _mm256_loadu_ps(w_t.as_ptr().add(i));
+        let o = _mm256_loadu_ps(out.as_ptr().add(i));
+        let r = _mm256_fmadd_ps(h, w, o);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), r);
+        i += 8;
+    }
+    while i < n {
+        out[i] += hist[i] * w_t[i];
+        i += 1;
+    }
+}
+
 /// SSM output gate 标量实现 — 与 AVX2 版本逻辑一致
 /// y = rmsnorm(y) * ssm_norm_weight * silu(z), per v_head
 #[inline(never)]
@@ -359,8 +385,8 @@ pub fn ssm_forward_into(
     state.conv_head = (state.conv_head + 1) % conv_k;
 
     // depthwise conv1d + silu
-    // ssm_conv1d.weight GGUF dims=[conv_k=4, qkv_full_len=10240]
-    //   行优先存储: (channel=ch, kernel_pos=t) 偏移 = ch * conv_k + t
+    // ssm_conv1d.weight 已在 load 时转置为 [conv_k, qkv_full_len] 行优先
+    //   转置后: conv_w[t * qkv_full_len + ch], 每个 t 的权重连续, 可 AVX2 FMA
     //
     // ★ P2-2: 环形读取 — 第 t 个历史 token 在 (conv_head + t) % conv_k 行
     //   conv_head 现指向最旧 token, t=0 最旧, t=conv_k-1 最新
@@ -368,11 +394,31 @@ pub fn ssm_forward_into(
     let conv_w = &w.ssm_conv1d.data;
     // 先清零 conv_out(fill 更易被识别为 memset)
     ws.ssm_conv_out.fill(0.0);
+    // ★ P1-5: AVX2 FMA — conv_out[ch] += hist[ch] * w_t[ch] (两向量连续)
+    //   原: 10240 次标量 FMA × conv_k=4 = 40960 iter/SSM block × 48 = 1.97M/token
+    //   新: 1280 次 SIMD FMA × 4 = 5120 iter/SSM block × 48 = 246K/token (~8x 减少)
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
     for t in 0..conv_k {
         let row = (state.conv_head + t) % conv_k;
         let hist_row = &state.conv_history[row * qkv_full_len..(row + 1) * qkv_full_len];
-        for ch in 0..qkv_full_len {
-            ws.ssm_conv_out[ch] += hist_row[ch] * conv_w[ch * conv_k + t];
+        let w_t = &conv_w[t * qkv_full_len..(t + 1) * qkv_full_len];
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 {
+            #[allow(unsafe_code)]
+            unsafe {
+                conv1d_fma_avx2(&mut ws.ssm_conv_out, hist_row, w_t, qkv_full_len);
+            }
+        } else {
+            for ch in 0..qkv_full_len {
+                ws.ssm_conv_out[ch] += hist_row[ch] * w_t[ch];
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            for ch in 0..qkv_full_len {
+                ws.ssm_conv_out[ch] += hist_row[ch] * w_t[ch];
+            }
         }
     }
     // ★ P2-9: silu 向量化 — 原 10240 次 silu_fast (broadcast+extract 浪费 7 lane)
