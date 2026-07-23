@@ -33,13 +33,13 @@ unsafe fn hmax_ps(v: __m256) -> f32 {
 
 /// 标准数值稳定 softmax:原地修改
 ///
-/// ★ 优化:5 次标量遍历 → 4 次 SIMD 遍历(3 阶段,Pass 3 含 sum+mul 两遍)
+/// ★ 优化:3 pass SIMD (原 4 pass, Pass 2+3a 融合)
 ///   Pass 1: AVX2 max reduce(含尾部标量)
-///   Pass 2: AVX2 (sub_max + exp) 融合(原标量 sub + 分离 SIMD exp)
-///   Pass 3: AVX2 sum reduce + AVX2 mul inv
+///   Pass 2+3a: AVX2 (sub_max + exp + sum 累加) 融合 — 省 1 次完整读 x
+///   Pass 3b: AVX2 mul inv (归一化)
 ///
 /// attention 调用频次:16 层 × 24 head × n_cached 次/token
-/// n_cached=512 时每 token ~200K 元素,5 pass → 3 pass 节省 ~2 次遍历
+/// n_cached=512 时每 token ~200K 元素,4 pass → 3 pass 节省 1 次遍历
 pub fn softmax_inplace(x: &mut [f32]) {
     if x.is_empty() {
         return;
@@ -68,32 +68,28 @@ pub fn softmax_inplace(x: &mut [f32]) {
                 i += 1;
             }
 
-            // Pass 2: (sub_max + exp) 融合
+            // Pass 2+3a: (sub_max + exp + sum 累加) 融合
+            // ★ 原 Pass 2 (write x[i]=exp) + Pass 3a (read x[i] for sum) = 2 reads + 1 write
+            //   现 fused: 1 read + 1 write + 在线累加 sum (省 1 次完整读 x)
             let max_v = _mm256_set1_ps(max);
+            let mut sum_v = _mm256_setzero_ps();
             i = 0;
             while i < n8 {
                 let v = _mm256_loadu_ps(x.as_ptr().add(i));
                 let shifted = _mm256_sub_ps(v, max_v);
                 let e = exp_ps(shifted);
                 _mm256_storeu_ps(x.as_mut_ptr().add(i), e);
-                i += 8;
-            }
-            for j in n8..n {
-                x[j] = (x[j] - max).exp();
-            }
-
-            // Pass 3: AVX2 sum reduce + AVX2 mul inv
-            let mut sum_v = _mm256_setzero_ps();
-            i = 0;
-            while i < n8 {
-                let v = _mm256_loadu_ps(x.as_ptr().add(i));
-                sum_v = _mm256_add_ps(sum_v, v);
+                sum_v = _mm256_add_ps(sum_v, e);
                 i += 8;
             }
             let mut sum = hsum_ps(sum_v);
             for j in n8..n {
-                sum += x[j];
+                let e = (x[j] - max).exp();
+                x[j] = e;
+                sum += e;
             }
+
+            // Pass 3b: AVX2 mul inv (归一化)
             let inv = 1.0 / sum;
             let inv_v = _mm256_set1_ps(inv);
             i = 0;

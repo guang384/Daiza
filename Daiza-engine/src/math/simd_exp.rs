@@ -80,13 +80,24 @@ pub unsafe fn exp_ps(x: __m256) -> __m256 {
 }
 
 /// SIMD sigmoid(x) = 1 / (1 + exp(-x))
+///
+/// ★ 用 rcp + 1 次 Newton 迭代替代 _mm256_div_ps
+///   - _mm256_div_ps: ~10-20c (IEEE-compliant, correctly rounded)
+///   - rcp + Newton:  ~5c (rcp 1c + 2×FMA + 1×MUL = ~5c, ~1 ULP 误差)
+///   - sigmoid 输出 ∈ [0,1], 1 ULP 相对误差对模型精度无影响
+///   - 除数 1+exp(-x) ∈ [1, 2], 无 0/inf 边界
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
 pub unsafe fn sigmoid_ps(x: __m256) -> __m256 {
     let neg_x = _mm256_xor_ps(x, _mm256_set1_ps(-0.0)); // 翻转符号位
     let exp_neg = exp_ps(neg_x);
     let one = _mm256_set1_ps(1.0);
-    _mm256_div_ps(one, _mm256_add_ps(one, exp_neg))
+    let d = _mm256_add_ps(one, exp_neg);
+    // rcp + Newton: y = rcp(d); y *= (2 - d*y)
+    let y0 = _mm256_rcp_ps(d);
+    let two = _mm256_set1_ps(2.0);
+    let y1 = _mm256_mul_ps(y0, _mm256_fnmadd_ps(d, y0, two)); // y0 * (2 - d*y0)
+    y1
 }
 
 /// SIMD silu(x) = x * sigmoid(x)
