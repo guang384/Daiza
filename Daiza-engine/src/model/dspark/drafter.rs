@@ -77,7 +77,6 @@ pub struct DrafterContext {
     pub ws_logits: Vec<f32>,        // [block_size * vocab] (base logits)
     pub ws_kq_scale: f32,           // 1/sqrt(head_dim)
     // ★ P2: 热路径复用 buffer (消除 forward_block 内 vec![] 分配)
-    pub ws_scores: Vec<f32>,        // [n_total] attention scores (动态 resize)
     pub ws_attn_tmp: Vec<f32>,      // [bs * hidden] attn output proj 中间结果
     pub ws_ffn_normed: Vec<f32>,    // [bs * hidden] FFN normed
     pub ws_ffn_out: Vec<f32>,       // [bs * hidden] FFN output
@@ -138,7 +137,6 @@ impl DrafterContext {
             ws_logits: vec![0.0; bs * vocab],
             ws_kq_scale: 1.0 / (hd as f32).sqrt(),
             // P2: 热路径复用 buffer (消除 forward_block 内 vec![] 分配)
-            ws_scores: Vec::with_capacity(256),
             ws_attn_tmp: vec![0.0; bs * h],
             ws_ffn_normed: vec![0.0; bs * h],
             ws_ffn_out: vec![0.0; bs * h],
@@ -509,18 +507,12 @@ impl DrafterContext {
             self.ws_v_cache[il][start..end].copy_from_slice(&self.ws_v[start..end]);
         }
 
-        // Step 4: 非因果 attention (全开 mask, GQA)
-        // 对每个 draft 位置 × 每个 query head:
-        //   scores[k] = (Q · K[k]) * kq_scale, softmax, out = sum_k attn[k] * V[k]
-        //
-        // ★ AVX2 优化: dot product 用 dot_product_avx2 (8-wide FMA, 2x unroll),
-        //   V weighted sum 改 k-major + saxpy_avx2 (连续 V 访问, cache 友好)。
-        //   原 j-major V sum 对 V[k][j] 是 stride 访问, cache 不友好。
-        // ★ P1 零拷贝: K/V 数据源分两段 — k ∈ [0..cached_kv_len) 读 ws_k_cache[il],
-        //   k ∈ [cached_kv_len..n_total) 读 ws_k。避免 245KB/层 的 cache→ws_k 复制。
+        // Step 4: 非因果 attention (全开 mask, GQA) — online softmax + V-update 融合
+        // ★ 优化: 改用 online softmax (与 target decode path attention.rs 算法一致),
+        //   完全消除 ws_scores buffer (原 group_size × n_total × 4B × 6 pass 流量)
+        //   每个 kvh 内 group_size 个 qh 各维护 running max m / running sum s / running out
+        //   逐 k 读取一份 K[k][kvh] + V[k][kvh], 服务 group_size 个 qh
         self.ws_attn_out.resize(bs * h, 0.0);
-        // 复用 ws_scores buffer (★ GQA: 扩容到 group_size * n_total, per kvh 一组)
-        self.ws_scores.resize(group_size * n_total, 0.0);
         let kq_scale = self.ws_kq_scale;
         // 提前借用 K/V 数据源 slice (避免循环内重复借用 self)
         let (k_src, v_src, cache_split): (&[f32], &[f32], usize) = if kv_cache_valid {
@@ -528,72 +520,76 @@ impl DrafterContext {
         } else {
             (&self.ws_k, &self.ws_v, 0)
         };
-        // ws_k/ws_v 中只有 [cache_split..n_total] 行有有效数据 (kv_cache_valid=true 时)
         let ws_k = &self.ws_k;
         let ws_v = &self.ws_v;
         // ★ GQA K/V 复用: 外层 kvh, 内层 group_size 个 qh 共享 K/V 读取
-        //   原: per (pos, qh) 独立读 K/V, 24 qh × n_total 次 K/V 读取
-        //   新: per (pos, kvh) 读 K/V, 4 kvh × n_total 次 K/V 读取 (6x 减少)
-        //   K/V 每个 k 只读一次, 服务 group_size=6 个 qh 的 scores 和 V sum
+        //   K/V 每个 k 只读一次, 服务 group_size 个 qh (与 target decode path 一致)
+        // ★ drafter group_size=10, hd=128; stack 数组容量 16 (对齐 2^N)
+        debug_assert!(hd <= 128, "drafter online softmax stack buffer requires hd<=128");
+        debug_assert!(group_size <= 16, "drafter online softmax stack buffer requires group_size<=16");
         for pos in 0..bs {
             let q_row = ctx_len + pos;
             for kvh in 0..n_kvh {
-                // 阶段 1: K 复用 — 一次读 K[k][kvh], 算 group_size 个 qh 的 scores
                 let q_base = q_row * n_qh * hd + kvh * group_size * hd;
+
+                // group_size 个 qh 的 running state (stack 数组, group_size=10, 容量 16)
+                let mut m = [f32::NEG_INFINITY; 16];      // running max
+                let mut s = [0.0f32; 16];                  // running sum
+                let mut out = [[0.0f32; 128]; 16];         // running output (hd=128)
+
+                // K/V 数据源分两段: [0..cache_split) 读 k_src/v_src (cache),
+                //                  [cache_split..n_total) 读 ws_k/ws_v (新算)
                 for k in 0..cache_split {
-                    let k_ptr = k * n_kvh * hd + kvh * hd;
-                    let k_head = &k_src[k_ptr..k_ptr + hd];
+                    let kv_ptr = k * n_kvh * hd + kvh * hd;
+                    let k_head = &k_src[kv_ptr..kv_ptr + hd];
+                    let v_head = &v_src[kv_ptr..kv_ptr + hd];
                     for qh_in_group in 0..group_size {
                         let q_ptr = q_base + qh_in_group * hd;
                         let q_head = &self.ws_q[q_ptr..q_ptr + hd];
-                        self.ws_scores[qh_in_group * n_total + k] =
-                            crate::math::simd_exp::dot_product_avx2(q_head, k_head, hd) * kq_scale;
+                        let score = crate::math::simd_exp::dot_product_avx2(q_head, k_head, hd) * kq_scale;
+
+                        let m_old = m[qh_in_group];
+                        let m_new = m_old.max(score);
+                        let alpha = crate::math::simd_exp::exp_fast(m_old - m_new);
+                        let beta = crate::math::simd_exp::exp_fast(score - m_new);
+
+                        s[qh_in_group] = s[qh_in_group] * alpha + beta;
+                        crate::math::simd_exp::online_softmax_v_update_avx2(
+                            &mut out[qh_in_group], alpha, beta, v_head, hd,
+                        );
+                        m[qh_in_group] = m_new;
                     }
                 }
                 for k in cache_split..n_total {
-                    let k_ptr = k * n_kvh * hd + kvh * hd;
-                    let k_head = &ws_k[k_ptr..k_ptr + hd];
+                    let kv_ptr = k * n_kvh * hd + kvh * hd;
+                    let k_head = &ws_k[kv_ptr..kv_ptr + hd];
+                    let v_head = &ws_v[kv_ptr..kv_ptr + hd];
                     for qh_in_group in 0..group_size {
                         let q_ptr = q_base + qh_in_group * hd;
                         let q_head = &self.ws_q[q_ptr..q_ptr + hd];
-                        self.ws_scores[qh_in_group * n_total + k] =
-                            crate::math::simd_exp::dot_product_avx2(q_head, k_head, hd) * kq_scale;
+                        let score = crate::math::simd_exp::dot_product_avx2(q_head, k_head, hd) * kq_scale;
+
+                        let m_old = m[qh_in_group];
+                        let m_new = m_old.max(score);
+                        let alpha = crate::math::simd_exp::exp_fast(m_old - m_new);
+                        let beta = crate::math::simd_exp::exp_fast(score - m_new);
+
+                        s[qh_in_group] = s[qh_in_group] * alpha + beta;
+                        crate::math::simd_exp::online_softmax_v_update_avx2(
+                            &mut out[qh_in_group], alpha, beta, v_head, hd,
+                        );
+                        m[qh_in_group] = m_new;
                     }
                 }
 
-                // 阶段 2: group_size 个 qh 各自 softmax
-                for qh_in_group in 0..group_size {
-                    let s = &mut self.ws_scores[qh_in_group * n_total..(qh_in_group + 1) * n_total];
-                    math::softmax_inplace(s);
-                }
-
-                // 阶段 3: V 复用 — 一次读 V[k][kvh], 做 group_size 个 qh 的 V 加权
-                //   先清零 group_size 个 out_head
-                let v_base = kvh * hd;
+                // 归一化并写入 ws_attn_out
                 let out_base = pos * h + kvh * group_size * hd;
                 for qh_in_group in 0..group_size {
                     let out_off = out_base + qh_in_group * hd;
-                    for j in 0..hd { self.ws_attn_out[out_off + j] = 0.0; }
-                }
-                for k in 0..cache_split {
-                    let v_ptr = k * n_kvh * hd + v_base;
-                    let v_head = &v_src[v_ptr..v_ptr + hd];
-                    for qh_in_group in 0..group_size {
-                        let s = self.ws_scores[qh_in_group * n_total + k];
-                        let out_off = out_base + qh_in_group * hd;
-                        let out_head = &mut self.ws_attn_out[out_off..out_off + hd];
-                        crate::math::simd_exp::saxpy_avx2(s, v_head, out_head, hd);
-                    }
-                }
-                for k in cache_split..n_total {
-                    let v_ptr = k * n_kvh * hd + v_base;
-                    let v_head = &ws_v[v_ptr..v_ptr + hd];
-                    for qh_in_group in 0..group_size {
-                        let s = self.ws_scores[qh_in_group * n_total + k];
-                        let out_off = out_base + qh_in_group * hd;
-                        let out_head = &mut self.ws_attn_out[out_off..out_off + hd];
-                        crate::math::simd_exp::saxpy_avx2(s, v_head, out_head, hd);
-                    }
+                    let inv_s = 1.0 / s[qh_in_group];
+                    crate::math::simd_exp::scale_avx2(
+                        &out[qh_in_group], inv_s, &mut self.ws_attn_out[out_off..out_off + hd], hd,
+                    );
                 }
             }
         }
