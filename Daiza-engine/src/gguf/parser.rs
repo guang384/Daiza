@@ -7,6 +7,7 @@
 //! 避免一次性 read_to_end 导致 ~3.9GB 内存峰值。tensor_data 返回
 //! &[u8] 切片到 mmap 区域, 零拷贝。
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
@@ -29,6 +30,8 @@ pub struct GgufFile {
     pub data_section_offset: u64,
     /// mmap 映射的整个文件字节
     mmap: memmap2::Mmap,
+    /// 张量名 → tensors 索引的哈希表 (O(1) 查找, 替代线性扫描)
+    tensor_index: HashMap<String, usize>,
 }
 
 impl GgufFile {
@@ -65,15 +68,23 @@ impl GgufFile {
         let tensor_count = reader.read_u64()?;
         let kv_count = reader.read_u64()?;
 
-        // 对齐默认 32;部分文件会在 metadata 中显式给出 `general.alignment`
-        let alignment = 32u64;
-
         let metadata = Metadata::parse(&mut reader, kv_count)?;
+        // 对齐: 优先读 metadata 中的 `general.alignment`, 缺省 32
+        let alignment = metadata.get_u64("general.alignment").unwrap_or(32);
+        if alignment == 0 {
+            return Err(err("general.alignment must be > 0".to_string()));
+        }
         let tensors = TensorInfo::parse_all(&mut reader, tensor_count)?;
         let data_section_offset = reader.pos() as u64;
         // 对齐数据段起点
         let mask = alignment - 1;
         let aligned = (data_section_offset + mask) & !mask;
+
+        let tensor_index: HashMap<String, usize> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.name.clone(), i))
+            .collect();
 
         Ok(Self {
             version,
@@ -82,12 +93,13 @@ impl GgufFile {
             tensors,
             data_section_offset: aligned,
             mmap,
+            tensor_index,
         })
     }
 
-    /// 按 tensor 名字查找
+    /// 按 tensor 名字查找 (O(1) 哈希查表)
     pub fn find_tensor(&self, name: &str) -> Option<&TensorInfo> {
-        self.tensors.iter().find(|t| t.name == name)
+        self.tensor_index.get(name).map(|&i| &self.tensors[i])
     }
 
     /// 取某个张量的数据切片(零拷贝, 直接切片到 mmap 区域)

@@ -320,13 +320,7 @@ pub unsafe fn dot_q1_0_row_avx2(
     }
 
     // 行末一次性横向求和 __m256 → f32
-    let hi = _mm256_extractf128_ps(acc_vec, 1);
-    let lo = _mm256_castps256_ps128(acc_vec);
-    let sum128 = _mm_add_ps(hi, lo);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+    hsum_ps(acc_vec)
 }
 
 /// ★ P0-A: 双行并行 kernel — 同时计算 2 行的点积, 共享 x 向量 load
@@ -827,7 +821,8 @@ pub unsafe fn dot_q1_0_q8_0_row_avx2(
         let mut acc_block = _mm256_setzero_ps();
         for K in 0..4 {
             // Q1_0 sign bits: 4 字节 (uint32)
-            let qs32 = *(qs_ptr.add(K * 4) as *const u32) as i32;
+            // ★ Q1_0 block=18 字节, 地址几乎总非 4 对齐, 必须用 read_unaligned 避免 UB
+            let qs32 = std::ptr::read_unaligned(qs_ptr.add(K * 4) as *const u32) as i32;
             // Q8_0 int8 values: 32 字节
             let qy = _mm256_loadu_si256(x_q8.as_ptr().add(x_q8_off + K * 36 + 4) as *const __m256i);
             // Q8_0 f32 scale
@@ -861,13 +856,7 @@ pub unsafe fn dot_q1_0_q8_0_row_avx2(
     }
 
     // hsum
-    let hi = _mm256_extractf128_ps(acc, 1);
-    let lo = _mm256_castps256_ps128(acc);
-    let sum128 = _mm_add_ps(hi, lo);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+    hsum_ps(acc)
 }
 
 /// 批量计算 Q1_0 一行与多个 x 的点积 (P1-4 优化)
@@ -1356,13 +1345,7 @@ pub unsafe fn dot_q4_1_row_avx2(
     }
 
     // Horizontal sum __m256 → f32 (SSE)
-    let hi = _mm256_extractf128_ps(acc_vec, 1);
-    let lo = _mm256_castps256_ps128(acc_vec);
-    let sum128 = _mm_add_ps(hi, lo);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+    hsum_ps(acc_vec)
 }
 
 /// ★ Q4_1 batched AVX2 kernel — 同一 W[row] 与 n_batch 个 x 向量做点积

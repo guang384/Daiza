@@ -2,6 +2,7 @@
 
 use crate::cache::{KvCache, SsmState};
 use crate::math;
+use crate::math::simd_exp::hsum_ps;
 use crate::model::config::Config;
 use crate::model::weights::LoadedWeights;
 use crate::model::workspace::Workspace;
@@ -106,6 +107,13 @@ fn debug_blocks_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("DAIZA_DEBUG_BLOCKS").is_ok())
+}
+
+/// 调试开关:DAIZA_DUMP_TAP env var,OnceLock 缓存避免热路径 env::var 开销
+fn dump_tap_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("DAIZA_DUMP_TAP").is_ok())
 }
 
 /// 单 token 前向,logits 写入 `ctx.logits_buf`(无 clone)
@@ -214,7 +222,7 @@ fn forward_single_token_core(
             ctx.hidden_tap_buf[off..off + hidden].copy_from_slice(&ctx.h_buf[..hidden]);
             // ★ DAIZA_DUMP_TAP: dump 当前 token 在每个 tap layer 的前 16 个值
             //   用于与 llama.cpp 逐值对比, 判断 Q1_0 target model 实现是否一致
-            if std::env::var("DAIZA_DUMP_TAP").is_ok() {
+            if dump_tap_enabled() {
                 let h0 = &ctx.h_buf[..hidden];
                 let tap_layer = ctx.hidden_tap_layers[tap_idx];
                 eprintln!("[dump-tap-single] blk_idx={blk_idx} tap_idx={tap_idx} layer={tap_layer} first16: {first16:?}",
@@ -528,6 +536,8 @@ pub fn forward_batch_with_vision(
 
                 for kvh in 0..n_kv_heads {
                     // group_size 个 qh 的 running state (栈上, group_size<=8)
+                    debug_assert!(group_size <= 8, "online softmax stack buffer requires group_size<=8");
+                    debug_assert!(head_dim <= 256, "online softmax stack buffer requires head_dim<=256");
                     let mut m = [f32::NEG_INFINITY; 8];
                     let mut s = [0.0f32; 8];
                     let mut out = [[0.0f32; 256]; 8];
@@ -902,7 +912,7 @@ pub fn forward_batch_with_vision(
                 }
                 // ★ DAIZA_DUMP_TAP: dump 最后 token 在每个 tap layer 的前 16 个值
                 //   用于与 llama.cpp 逐值对比, 判断 Q1_0 target model 实现是否一致
-                if std::env::var("DAIZA_DUMP_TAP").is_ok() {
+                if dump_tap_enabled() {
                     let hL = &ctx.h_buf[(n_batch - 1) * hidden..n_batch * hidden];
                     eprintln!("[dump-tap] blk_idx={blk_idx} tap_idx={tap_idx} token[last={n_batch_minus_1}] first16: {first16:?}",
                         n_batch_minus_1 = n_batch - 1,
@@ -1012,21 +1022,4 @@ pub fn make_context<'a>(
         hidden_tap_layers: Vec::new(),
         hidden_tap_batch_buf: Vec::new(),
     }
-}
-
-/// __m256 → f32 横向求和(纯寄存器内,无 store)
-/// 用于 SSM output gate AVX2 路径的 sum-of-squares reduce
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[allow(unsafe_code)]
-#[inline]
-unsafe fn hsum_ps(v: std::arch::x86_64::__m256) -> f32 {
-    use std::arch::x86_64::*;
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let sum128 = _mm_add_ps(hi, lo);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
 }

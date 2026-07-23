@@ -57,13 +57,8 @@ pub fn load_as_f32(
                     n_elements
                 )));
             }
-            // 把 [u8] 重新解释为 [f32](借用 → owned)
-            (0..n_elements)
-                .map(|i| {
-                    let b = &data[i * 4..i * 4 + 4];
-                    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-                })
-                .collect()
+            // 零拷贝重新解释 [u8] → [f32] (bytemuck cast_slice, LLVM 生成 SIMD memcpy)
+            bytemuck::cast_slice::<u8, f32>(&data[..n_elements * 4]).to_vec()
         }
         TensorType::F16 => {
             if data.len() < n_elements * 2 {

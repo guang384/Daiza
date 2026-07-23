@@ -38,4 +38,4 @@ pub use simd_exp::{
     silu_inplace_simd, swiglu_inplace_simd,
 };
 pub use layernorm::layernorm_into;
-pub use gelu::gelu_into;
+pub use gelu::{gelu_into, gelu_inplace};

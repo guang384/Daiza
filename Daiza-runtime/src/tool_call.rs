@@ -20,8 +20,6 @@
 //! - assistant 消息若带 tool_calls, 渲染为 `<tool_call>...` 块
 //! - tool role 消息渲染为 `<tool_response>content</tool_response>`
 
-use std::collections::BTreeMap;
-
 /// 工具定义 (调用方注册)
 #[derive(Clone, Debug)]
 pub struct ToolDef {
@@ -45,8 +43,8 @@ pub struct ToolParam {
 #[derive(Clone, Debug)]
 pub struct ToolCall {
     pub name: String,
-    /// 参数 (有序, 保留模型输出的顺序)
-    pub arguments: BTreeMap<String, String>,
+    /// 参数 (有序, 保留模型输出的顺序; Vec 而非 BTreeMap 以保序)
+    pub arguments: Vec<(String, String)>,
 }
 
 /// 工具响应 (调用方执行后回送)
@@ -141,8 +139,7 @@ pub fn render_chat_template(
     }
 
     // 2. 逐消息渲染
-    let n = messages.len();
-    for (i, msg) in messages.iter().enumerate() {
+    for msg in messages.iter() {
         match msg.role {
             MessageRole::System => {
                 // 已在前面处理, 跳过
@@ -165,11 +162,6 @@ pub fn render_chat_template(
                 s.push_str(&msg.content);
                 s.push_str("\n</tool_response><|im_end|>\n");
             }
-        }
-        // 最后一条 assistant 消息: 追加 <think>\n
-        if i == n - 1 && msg.role == MessageRole::User && think_enabled {
-            // 注意: 上面 user 消息后紧接 assistant, 这里处理的是 messages 末尾是 user 的情况
-            // 实际上 chat_template 末尾是 <|im_start|>assistant\n + <think>\n
         }
     }
 
@@ -197,9 +189,11 @@ fn format_tool_def(tool: &ToolDef) -> String {
             escape_json(&p.name), escape_json(&p.param_type), escape_json(&p.description)));
     }
     s.push_str("}, \"required\": [");
-    for (i, p) in tool.parameters.iter().enumerate() {
+    let mut first_req = true;
+    for p in tool.parameters.iter() {
         if !p.required { continue; }
-        if i > 0 { s.push_str(", "); }
+        if !first_req { s.push_str(", "); }
+        first_req = false;
         s.push_str(&format!("\"{}\"", escape_json(&p.name)));
     }
     s.push_str("]}}");
@@ -261,7 +255,7 @@ fn parse_single_tool_call(block: &str) -> Option<ToolCall> {
     let body = &block[fn_end + 1..fn_body_end];
 
     // 解析 <parameter=key>value</parameter>
-    let mut arguments = BTreeMap::new();
+    let mut arguments = Vec::new();
     let mut p_idx = 0;
     while p_idx < body.len() {
         let p_start = match body[p_idx..].find("<parameter=") {
@@ -281,7 +275,7 @@ fn parse_single_tool_call(block: &str) -> Option<ToolCall> {
             None => break,
         };
         let value = body[val_start..val_end].trim().to_string();
-        arguments.insert(key, value);
+        arguments.push((key, value));
         p_idx = val_end + "</parameter>".len();
     }
 
@@ -297,8 +291,10 @@ mod tests {
         let block = "<function=get_weather>\n<parameter=location>\nBeijing\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>";
         let tc = parse_single_tool_call(block).unwrap();
         assert_eq!(tc.name, "get_weather");
-        assert_eq!(tc.arguments.get("location"), Some(&"Beijing".to_string()));
-        assert_eq!(tc.arguments.get("unit"), Some(&"celsius".to_string()));
+        let loc = tc.arguments.iter().find(|(k, _)| k == "location").map(|(_, v)| v.as_str());
+        assert_eq!(loc, Some("Beijing"));
+        let unit = tc.arguments.iter().find(|(k, _)| k == "unit").map(|(_, v)| v.as_str());
+        assert_eq!(unit, Some("celsius"));
     }
 
     #[test]
@@ -352,7 +348,7 @@ UTC
             ToolMessage::user("weather?".into()),
             ToolMessage::assistant_with_tool_calls(
                 "text".into(),
-                vec![ToolCall { name: "get_weather".into(), arguments: BTreeMap::new() }],
+                vec![ToolCall { name: "get_weather".into(), arguments: Vec::new() }],
             ),
             ToolMessage::tool(ToolResponse { name: "get_weather".into(), content: "Sunny 25C".into() }),
         ];

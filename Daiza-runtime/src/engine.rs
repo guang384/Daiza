@@ -311,8 +311,8 @@ impl Engine {
                 let t_enc = t1.elapsed();
 
                 let t2 = std::time::Instant::now();
-                let vit_out = vision.vit_ctx.hidden.clone();
-                project_vision(&vit_out, &vision.weights, &vision.cfg, &mut vision.proj_ctx)?;
+                // ★ V-5: 消除 10.6MB clone (disjoint field borrow: vit_ctx.hidden + proj_ctx 互不重叠)
+                project_vision(&vision.vit_ctx.hidden, &vision.weights, &vision.cfg, &mut vision.proj_ctx)?;
                 let t_proj = t2.elapsed();
 
                 let proj_out = &vision.proj_ctx.projected;
@@ -422,8 +422,8 @@ impl Engine {
                 let t_enc = t1.elapsed();
 
                 let t2 = std::time::Instant::now();
-                let vit_out = vision.vit_ctx.hidden.clone(); // [n_patches, n_embd]
-                project_vision(&vit_out, &vision.weights, &vision.cfg, &mut vision.proj_ctx)?;
+                // ★ V-5: 消除 10.6MB clone (disjoint field borrow: vit_ctx.hidden + proj_ctx 互不重叠)
+                project_vision(&vision.vit_ctx.hidden, &vision.weights, &vision.cfg, &mut vision.proj_ctx)?;
                 let t_proj = t2.elapsed();
 
                 let proj_out = &vision.proj_ctx.projected;

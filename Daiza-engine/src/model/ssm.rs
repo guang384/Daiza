@@ -44,6 +44,7 @@
 //! 跨 token 复用。最终输出通过 `matvec_add_into_slice` 直接累加到主残差流 h。
 
 use crate::math;
+use crate::math::simd_exp::hsum_ps;
 use crate::model::weights::{Q1_0Matrix, SsmBlockWeights};
 use crate::model::workspace::Workspace;
 use crate::cache::SsmState;
@@ -114,7 +115,7 @@ unsafe fn l2norm_inplace_avx2(x: &mut [f32], eps: f32) {
         ss_v = _mm256_fmadd_ps(v, v, ss_v);
         i += 8;
     }
-    let mut ss = horizontal_sum_ps(ss_v);
+    let mut ss = hsum_ps(ss_v);
     for j in n8..n {
         ss += x[j] * x[j];
     }
@@ -263,7 +264,7 @@ pub(crate) unsafe fn ssm_output_gate_avx2(
             ss_v = _mm256_fmadd_ps(y_v, y_v, ss_v);
         }
         // 水平 reduce: sum → rsqrt(sum*inv_hd + eps)
-        let ss = horizontal_sum_ps(ss_v);
+        let ss = hsum_ps(ss_v);
         let inv_rms = 1.0 / (ss * inv_hd + eps).sqrt();
         // Pass 2: y = y * inv_rms * norm_w * z
         let inv_rms_v = _mm256_set1_ps(inv_rms);
@@ -347,7 +348,7 @@ unsafe fn ssm_scan_fused_avx2(
             _mm256_storeu_ps(srow.as_mut_ptr().add(j), s_new);
             kv_acc = _mm256_fmadd_ps(s_new, k, kv_acc);
         }
-        let kv_mem_i = horizontal_sum_ps(kv_acc);
+        let kv_mem_i = hsum_ps(kv_acc);
 
         // Phase 2: di = (v[i] - kv_mem_i) * beta, s += di * k, 同时累加 y[i]
         let di = (v_head[i] - kv_mem_i) * beta;
@@ -361,24 +362,8 @@ unsafe fn ssm_scan_fused_avx2(
             _mm256_storeu_ps(srow.as_mut_ptr().add(j), s_new);
             y_acc = _mm256_fmadd_ps(s_new, q, y_acc);
         }
-        y[i] = horizontal_sum_ps(y_acc);
+        y[i] = hsum_ps(y_acc);
     }
-}
-
-/// __m256 → f32 横向求和(纯寄存器内,无 store)
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[allow(unsafe_code)]
-#[inline]
-unsafe fn horizontal_sum_ps(v: core::arch::x86_64::__m256) -> f32 {
-    use core::arch::x86_64::*;
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let sum128 = _mm_add_ps(hi, lo);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
 }
 
 /// 单 token 前向 (decode)

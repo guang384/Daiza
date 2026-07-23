@@ -102,9 +102,9 @@ pub fn sample_top_k_top_p_into(
     buf.indices.extend(0..n);
     // `select_nth_unstable` 把第 k 大元素放到位置 k,左侧均 ≤ 它
     // 然后只对前 k 个排序即可
-    // ★ 关键:把 (scaled, index) 打包为 (f32, usize) 避免 select_nth 时跨数组随机访问
-    //   原:scaled[b].partial_cmp(&scaled[a]) 需读 scaled[b] 和 scaled[a],跨数组 cache unfriendly
-    //   新:indices 中存 (scaled_value, original_index),比较时直接用 key,无跨数组访问
+    // indices 中存原始下标,比较时通过 scaled[idx] 间接比较 (跨数组访问,
+    // vocab=248K 下 O(n) 次比较 cache 不友好, 但 select_nth 的 partition 模式
+    // 使得大部分访问集中在局部, 实际影响可忽略)
     buf.indices.select_nth_unstable_by(k.saturating_sub(1), |&a, &b| {
         scaled[b].partial_cmp(&scaled[a]).unwrap_or(std::cmp::Ordering::Equal)
     });

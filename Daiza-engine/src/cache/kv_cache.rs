@@ -90,6 +90,8 @@ impl KvCache {
     /// 获取第 kvh 个 head 的第 seq_idx 个 token 的 K slice: [head_dim]
     #[inline]
     pub fn k_head_at(&self, kvh: usize, seq_idx: usize) -> &[f32] {
+        debug_assert!(kvh < self.n_kv_heads, "kvh {} >= n_kv_heads {}", kvh, self.n_kv_heads);
+        debug_assert!(seq_idx < self.len, "seq_idx {} >= len {}", seq_idx, self.len);
         let start = seq_idx * self.head_dim;
         &self.k[kvh][start..start + self.head_dim]
     }
@@ -97,6 +99,8 @@ impl KvCache {
     /// 获取第 kvh 个 head 的第 seq_idx 个 token 的 V slice: [head_dim]
     #[inline]
     pub fn v_head_at(&self, kvh: usize, seq_idx: usize) -> &[f32] {
+        debug_assert!(kvh < self.n_kv_heads, "kvh {} >= n_kv_heads {}", kvh, self.n_kv_heads);
+        debug_assert!(seq_idx < self.len, "seq_idx {} >= len {}", seq_idx, self.len);
         let start = seq_idx * self.head_dim;
         &self.v[kvh][start..start + self.head_dim]
     }
@@ -113,11 +117,13 @@ impl KvCache {
     /// 截断缓存到 new_len 个 token (用于 speculative decoding rollback)
     /// 保留前 new_len 个 token 的 K/V, 多余的被逻辑丢弃 (Vec 不缩容, 避免 realloc)
     pub fn truncate(&mut self, new_len: usize) {
-        debug_assert!(new_len <= self.len);
-        let new_bytes = new_len * self.head_dim;
+        if new_len >= self.len {
+            return;
+        }
+        let new_len_per_kvh = new_len * self.head_dim;
         for kvh in 0..self.n_kv_heads {
-            self.k[kvh].truncate(new_bytes);
-            self.v[kvh].truncate(new_bytes);
+            self.k[kvh].truncate(new_len_per_kvh);
+            self.v[kvh].truncate(new_len_per_kvh);
         }
         self.len = new_len;
     }

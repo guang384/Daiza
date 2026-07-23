@@ -18,7 +18,7 @@
 
 use std::arch::x86_64::*;
 
-use crate::math::{layernorm_into, gelu_into};
+use crate::math::{layernorm_into, gelu_inplace};
 use crate::math::softmax_inplace;
 use crate::math::simd_exp::simd_available;
 use crate::model::workspace::get_thread_pool;
@@ -279,24 +279,29 @@ pub fn encode_image(
     patch_embd_w.matmat_into_slice(patches, &mut ctx.hidden, n_patches);
     patch_embd_w1.matmat_add_into_slice(patches, &mut ctx.hidden, n_patches);
 
-    // + bias (per-patch 并行, 仅 n_embd 元素加法, 极轻量)
+    // + bias (per-patch 并行, AVX2 saxpy; n_embd=1152=8×144)
     let hidden_ptr = MPtr(ctx.hidden.as_mut_ptr());
     let pb_ptr = CPtr(patch_embd_b.as_ptr());
     par_for_patches(n_patches, move |p| {
         unsafe {
             let h = std::slice::from_raw_parts_mut(hidden_ptr.as_ptr().add(p * n_embd), n_embd);
-            for i in 0..n_embd {
-                h[i] += *pb_ptr.as_ptr().add(i);
-            }
+            let b = std::slice::from_raw_parts(pb_ptr.as_ptr(), n_embd);
+            crate::math::simd_exp::saxpy_avx2(1.0, b, h, n_embd);
         }
     });
     let t_patch = t0.elapsed();
 
-    // ───── 2. 加 learned position embedding ─────
+    // ───── 2. 加 learned position embedding ───── (per-patch 并行, AVX2 saxpy)
     let pos_embd = weights.position_embd.as_slice();
-    for i in 0..n_patches * n_embd {
-        ctx.hidden[i] += pos_embd[i];
-    }
+    let hidden_ptr = MPtr(ctx.hidden.as_mut_ptr());
+    let pos_ptr = CPtr(pos_embd.as_ptr());
+    par_for_patches(n_patches, move |p| {
+        unsafe {
+            let h = std::slice::from_raw_parts_mut(hidden_ptr.as_ptr().add(p * n_embd), n_embd);
+            let pos = std::slice::from_raw_parts(pos_ptr.as_ptr().add(p * n_embd), n_embd);
+            crate::math::simd_exp::saxpy_avx2(1.0, pos, h, n_embd);
+        }
+    });
 
     // ───── 3. 27 层 ViT block ─────
     let t_blocks = std::time::Instant::now();
@@ -319,15 +324,24 @@ pub fn encode_image(
             p_ln2.as_secs_f64()*1000.0, p_ffn.as_secs_f64()*1000.0);
     }
 
-    // ───── 4. post_ln ─────
+    // ───── 4. post_ln ───── (并行 per-patch, 与 block 内 LN1/LN2 一致)
     let t_post = std::time::Instant::now();
     let post_w = weights.post_ln_w.as_slice();
     let post_b = weights.post_ln_b.as_slice();
-    for p in 0..n_patches {
-        let src = &ctx.hidden[p * n_embd..(p + 1) * n_embd];
-        let dst = &mut ctx.ln1_out[p * n_embd..(p + 1) * n_embd];
-        layernorm_into(src, dst, post_w, post_b, cfg.layer_norm_eps);
-    }
+    let eps = cfg.layer_norm_eps;
+    let hidden_ptr = CPtr(ctx.hidden.as_ptr());
+    let ln1_out_ptr = MPtr(ctx.ln1_out.as_mut_ptr());
+    let postw_ptr = CPtr(post_w.as_ptr());
+    let postb_ptr = CPtr(post_b.as_ptr());
+    par_for_patches(n_patches, move |p| {
+        unsafe {
+            let src = std::slice::from_raw_parts(hidden_ptr.as_ptr().add(p * n_embd), n_embd);
+            let dst = std::slice::from_raw_parts_mut(ln1_out_ptr.as_ptr().add(p * n_embd), n_embd);
+            let w = std::slice::from_raw_parts(postw_ptr.as_ptr(), n_embd);
+            let b = std::slice::from_raw_parts(postb_ptr.as_ptr(), n_embd);
+            layernorm_into(src, dst, w, b, eps);
+        }
+    });
     std::mem::swap(&mut ctx.hidden, &mut ctx.ln1_out);
     let t_post_elapsed = t_post.elapsed();
 
@@ -394,16 +408,15 @@ fn forward_vit_block(
     // qkv = W_qkv @ ln1_out (batched, [n_patches, 3*n_embd])
     qkv_w.matmat_into_slice(&ctx.ln1_out, &mut ctx.qkv, n_patches);
 
-    // + bias (per-patch 并行)
+    // + bias (per-patch 并行, AVX2 saxpy; qkv_dim=3456=8×432)
     let qkv_ptr = MPtr(ctx.qkv.as_mut_ptr());
     let qkv_b_ptr = CPtr(qkv_b.as_ptr());
     let qkv_dim = 3 * n_embd;
     par_for_patches(n_patches, move |p| {
         unsafe {
             let y = std::slice::from_raw_parts_mut(qkv_ptr.as_ptr().add(p * qkv_dim), qkv_dim);
-            for i in 0..qkv_dim {
-                y[i] += *qkv_b_ptr.as_ptr().add(i);
-            }
+            let b = std::slice::from_raw_parts(qkv_b_ptr.as_ptr(), qkv_dim);
+            crate::math::simd_exp::saxpy_avx2(1.0, b, y, qkv_dim);
         }
     });
     if let Some(t) = t { *p_qkv += t.elapsed(); }
@@ -524,28 +537,19 @@ fn forward_vit_block(
 
     out_w.matmat_into_slice(&ctx.attn_proj, &mut ctx.attn_out, n_patches);
 
-    // + bias (per-patch 并行)
-    let attn_out_ptr = MPtr(ctx.attn_out.as_mut_ptr());
-    let out_b_ptr = CPtr(out_b.as_ptr());
-    par_for_patches(n_patches, move |p| {
-        unsafe {
-            let y = std::slice::from_raw_parts_mut(attn_out_ptr.as_ptr().add(p * n_embd), n_embd);
-            for i in 0..n_embd {
-                y[i] += *out_b_ptr.as_ptr().add(i);
-            }
-        }
-    });
-
-    // 残差: hidden += attn_out (并行 per-patch)
+    // ★ V-3: 残差 + bias 融合 (hidden += attn_out + bias), 单 par_for_patches + AVX2 saxpy
+    //   原实现: bias 写 attn_out (1 pass W attn_out) + 残差读 attn_out (1 pass R) = 2 pass over attn_out
+    //   融合后: 只读 attn_out 一次, bias 从 L1 复用, 省一次 10.6MB attn_out 写 pass
     let hidden_ptr = MPtr(ctx.hidden.as_mut_ptr());
     let attn_out_ptr = CPtr(ctx.attn_out.as_ptr());
+    let out_b_ptr = CPtr(out_b.as_ptr());
     par_for_patches(n_patches, move |p| {
         unsafe {
             let h = std::slice::from_raw_parts_mut(hidden_ptr.as_ptr().add(p * n_embd), n_embd);
             let a = std::slice::from_raw_parts(attn_out_ptr.as_ptr().add(p * n_embd), n_embd);
-            for i in 0..n_embd {
-                h[i] += a[i];
-            }
+            let b = std::slice::from_raw_parts(out_b_ptr.as_ptr(), n_embd);
+            crate::math::simd_exp::saxpy_avx2(1.0, a, h, n_embd);
+            crate::math::simd_exp::saxpy_avx2(1.0, b, h, n_embd);
         }
     });
     if let Some(t) = t { *p_outproj += t.elapsed(); }
@@ -587,47 +591,33 @@ fn forward_vit_block(
     // ffn_up = W_up @ ln2_out (batched, [n_patches, ffn_dim])
     ffn_up_w.matmat_into_slice(&ctx.ln2_out, &mut ctx.ffn_up, n_patches);
 
-    // + bias + GELU (per-patch 并行, 仅 element-wise op)
+    // + bias + GELU (per-patch 并行, AVX2 saxpy + in-place GELU; ffn_dim=4304=8×538)
     let ffn_up_ptr = MPtr(ctx.ffn_up.as_mut_ptr());
     let ffn_up_b_ptr = CPtr(ffn_up_b.as_ptr());
     par_for_patches(n_patches, move |p| {
         unsafe {
             let y = std::slice::from_raw_parts_mut(ffn_up_ptr.as_ptr().add(p * ffn_dim), ffn_dim);
-            for i in 0..ffn_dim {
-                y[i] += *ffn_up_b_ptr.as_ptr().add(i);
-            }
-            // GELU (per-patch tmp 避免 src=dst 别名)
-            let mut tmp = vec![0.0f32; ffn_dim];
-            gelu_into(y, &mut tmp);
-            std::ptr::copy_nonoverlapping(tmp.as_ptr(), y.as_mut_ptr(), ffn_dim);
+            let b = std::slice::from_raw_parts(ffn_up_b_ptr.as_ptr(), ffn_dim);
+            crate::math::simd_exp::saxpy_avx2(1.0, b, y, ffn_dim);
+            // ★ V-6: in-place GELU (无需 tmp buffer, 1 pass 替代 2 pass)
+            gelu_inplace(y);
         }
     });
 
     // ffn_down = W_down @ ffn_up (batched, [n_patches, n_embd])
     ffn_down_w.matmat_into_slice(&ctx.ffn_up, &mut ctx.ffn_down, n_patches);
 
-    // + bias (per-patch 并行)
-    let ffn_down_ptr = MPtr(ctx.ffn_down.as_mut_ptr());
-    let ffn_down_b_ptr = CPtr(ffn_down_b.as_ptr());
-    par_for_patches(n_patches, move |p| {
-        unsafe {
-            let y = std::slice::from_raw_parts_mut(ffn_down_ptr.as_ptr().add(p * n_embd), n_embd);
-            for i in 0..n_embd {
-                y[i] += *ffn_down_b_ptr.as_ptr().add(i);
-            }
-        }
-    });
-
-    // 残差: hidden += ffn_down (并行 per-patch)
+    // ★ V-3: 残差 + bias 融合 (hidden += ffn_down + bias), 单 par_for_patches + AVX2 saxpy
     let hidden_ptr = MPtr(ctx.hidden.as_mut_ptr());
     let ffn_down_ptr = CPtr(ctx.ffn_down.as_ptr());
+    let ffn_down_b_ptr = CPtr(ffn_down_b.as_ptr());
     par_for_patches(n_patches, move |p| {
         unsafe {
             let h = std::slice::from_raw_parts_mut(hidden_ptr.as_ptr().add(p * n_embd), n_embd);
             let f = std::slice::from_raw_parts(ffn_down_ptr.as_ptr().add(p * n_embd), n_embd);
-            for i in 0..n_embd {
-                h[i] += f[i];
-            }
+            let b = std::slice::from_raw_parts(ffn_down_b_ptr.as_ptr(), n_embd);
+            crate::math::simd_exp::saxpy_avx2(1.0, f, h, n_embd);
+            crate::math::simd_exp::saxpy_avx2(1.0, b, h, n_embd);
         }
     });
     if let Some(t) = t { *p_ffn += t.elapsed(); }

@@ -119,7 +119,7 @@ impl SpeculativeContext {
         let bs = self.drafter.weights.cfg.block_size;
         let vocab = self.drafter.weights.cfg.vocab_size;
         let has_conf = self.drafter.weights.confidence_head_w.is_some();
-        let profile = std::env::var("DAIZA_PROFILE").is_ok();
+        let profile = crate::model::forward::profile_enabled();
 
         // 1. drafter forward → base_logits [block_size, vocab] (写入 self.drafter.ws_logits)
         //    若 confidence_head 启用, 同时填充 ws_confidence_hidden [bs, hidden] (norm 前)

@@ -151,6 +151,8 @@ pub fn attention_forward_into(
 
     for kvh in 0..n_kv_heads {
         // group_size 个 qh 的 running state(stack 数组,group_size=6 很小)
+        debug_assert!(group_size <= 8, "online softmax stack buffer requires group_size<=8");
+        debug_assert!(head_dim <= 256, "online softmax stack buffer requires head_dim<=256");
         let mut m = [f32::NEG_INFINITY; 8];      // running max(容量 8,group_size<=8)
         let mut s = [0.0f32; 8];                  // running sum
         let mut out = [[0.0f32; 256]; 8];         // running output(容量 head_dim=256)

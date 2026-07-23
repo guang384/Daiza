@@ -18,7 +18,7 @@
 //! 输出 576 个 vision embeddings, 每个维度 = text model hidden dim (5120)
 //! 这些 embeddings 替换 text model prefill 中的 image_token 位置的 token_embd
 
-use crate::math::gelu_into;
+use crate::math::gelu_inplace;
 
 use super::config::VisionConfig;
 use super::weights::VisionWeights;
@@ -31,8 +31,6 @@ pub struct ProjectorContext {
     pub mm_0_out: Vec<f32>,
     /// n_patches_merged * projection_dim, mm.2 输出 (最终 vision embeddings)
     pub projected: Vec<f32>,
-    /// GELU 临时 buffer (per-patch merged_hidden)
-    pub gelu_tmp: Vec<f32>,
 }
 
 impl ProjectorContext {
@@ -44,7 +42,6 @@ impl ProjectorContext {
             merged: vec![0.0; n_merged * merged_hidden],
             mm_0_out: vec![0.0; n_merged * merged_hidden],
             projected: vec![0.0; n_merged * proj_dim],
-            gelu_tmp: vec![0.0; merged_hidden],
         }
     }
 }
@@ -110,19 +107,19 @@ pub fn project_vision(
     mm_0_w.matmat_into_slice(&pctx.merged, &mut pctx.mm_0_out, n_merged);
 
     // + bias (per-patch 并行, 仅 element-wise add)
+    // ★ P2: 内层标量循环改 AVX2 saxpy (y = 1.0*bias + y)
+    //   merged_hidden=4608, 576 patch × 576c 标量 ≈ 33Kc → AVX2 72c × 576 = 41Kc
+    //   注: saxpy_avx2 要求 len 为 8 的倍数 (merged_hidden=4608=8×576 ✓)
+    debug_assert!(merged_hidden % 8 == 0, "merged_hidden must be 8-aligned for saxpy_avx2");
     for m in 0..n_merged {
         let y = &mut pctx.mm_0_out[m * merged_hidden..(m + 1) * merged_hidden];
-        for i in 0..merged_hidden {
-            y[i] += mm_0_b[i];
-        }
+        crate::math::simd_exp::saxpy_avx2(1.0, mm_0_b, y, merged_hidden);
     }
 
-    // ───── 3. GELU (per merged patch, 借用 gelu_tmp 避免 src=dst 别名) ─────
+    // ───── 3. GELU (in-place, 无需 tmp buffer) ─────
+    // ★ V-6: gelu_inplace 替代 gelu_into + copy_from_slice (2 pass → 1 pass, 省 10.6MB copy)
     for m in 0..n_merged {
-        let src = &pctx.mm_0_out[m * merged_hidden..(m + 1) * merged_hidden];
-        gelu_into(src, &mut pctx.gelu_tmp);
-        pctx.mm_0_out[m * merged_hidden..(m + 1) * merged_hidden]
-            .copy_from_slice(&pctx.gelu_tmp);
+        gelu_inplace(&mut pctx.mm_0_out[m * merged_hidden..(m + 1) * merged_hidden]);
     }
 
     // ───── 4. mm.2: Linear(4608 → 5120) + bias, batched matmul ─────
@@ -136,11 +133,11 @@ pub fn project_vision(
     mm_2_w.matmat_into_slice(&pctx.mm_0_out, &mut pctx.projected, n_merged);
 
     // + bias (per-patch)
+    // ★ P2: 内层标量循环改 AVX2 saxpy (proj_dim=5120=8×640 ✓)
+    debug_assert!(proj_dim % 8 == 0, "proj_dim must be 8-aligned for saxpy_avx2");
     for m in 0..n_merged {
         let y = &mut pctx.projected[m * proj_dim..(m + 1) * proj_dim];
-        for i in 0..proj_dim {
-            y[i] += mm_2_b[i];
-        }
+        crate::math::simd_exp::saxpy_avx2(1.0, mm_2_b, y, proj_dim);
     }
 
     Ok(())

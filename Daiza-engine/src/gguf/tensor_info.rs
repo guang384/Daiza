@@ -153,9 +153,8 @@ impl TensorInfo {
             }
             let dtype_tag = reader.read_u32()?;
             let dtype = TensorType::from_u32(dtype_tag);
-            if matches!(dtype, TensorType::Unknown(_)) {
-                // 学习项目允许枚举外的值先通过,实际加载时再拒绝
-            }
+            // 学习项目允许枚举外的值先通过,实际加载时再拒绝
+            let _ = &dtype;
             let offset = reader.read_u64()?;
             out.push(Self {
                 name,

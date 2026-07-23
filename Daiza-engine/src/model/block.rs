@@ -75,7 +75,9 @@ pub fn forward_single_inplace(
         (BlockWeights::Ssm(w), None, Some(ssm)) => {
             crate::model::ssm::ssm_forward_into(h, w, cfg, ssm, ws);
         }
-        _ => {}
+        _ => {
+            debug_assert!(false, "block type mismatch with kv/ssm state");
+        }
     }
     if let Some(t0) = t0 {
         let elapsed = t0.elapsed();

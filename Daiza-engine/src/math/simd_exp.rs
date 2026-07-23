@@ -308,16 +308,7 @@ pub fn dot_product_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
             i += 8;
         }
         sum0 = _mm256_add_ps(sum0, sum1);
-        // ★ P1-1: 水平求和改纯寄存器内 SSE (无 store+scalar reduce)
-        //   原 store + 7 次标量 add ~5c; 寄存器内 ~3c
-        //   attention scores 调用频次高 (24 qh × n_cached × 16 attn blocks)
-        let hi = _mm256_extractf128_ps(sum0, 1);
-        let lo = _mm256_castps256_ps128(sum0);
-        let sum128 = _mm_add_ps(hi, lo);
-        let shuf = _mm_movehdup_ps(sum128);
-        let sums = _mm_add_ps(sum128, shuf);
-        let shuf2 = _mm_movehl_ps(sums, sums);
-        _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+        hsum_ps(sum0)
     }
 }
 
@@ -343,6 +334,23 @@ pub unsafe fn hsum_ps(v: __m256) -> f32 {
     _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
 }
 
+/// AVX2 水平 max: __m256 → f32 (纯寄存器内 SSE, 无 store)
+///
+/// 公共实现, 供 softmax.rs 等模块复用。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[inline]
+pub unsafe fn hmax_ps(v: __m256) -> f32 {
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let max128 = _mm_max_ps(hi, lo);
+    let shuf = _mm_movehdup_ps(max128);
+    let maxs = _mm_max_ps(max128, shuf);
+    let shuf2 = _mm_movehl_ps(maxs, maxs);
+    _mm_cvtss_f32(_mm_max_ss(maxs, shuf2))
+}
+
 /// AVX2 8-wide saxpy: y[i] += scale * x[i]
 /// head_dim (128 或 256) 是 8 的倍数,无需尾处理。
 #[allow(unsafe_code)]
@@ -366,7 +374,7 @@ pub fn saxpy_avx2(scale: f32, x: &[f32], y: &mut [f32], len: usize) {
 ///
 /// attention online softmax 内层循环 (head_dim=256 = 32×8-wide, 无尾处理)。
 /// 原标量循环每 iter 2c (FMUL + FMA), 256 iter = 512c;
-/// AVX2 32 iter × 2c (mul + fma 可融合为单 FMA if 编译器优化, 或 2c 独立) ≈ 64c, **8× 加速**。
+/// AVX2 32 iter × 2c (mul + fma 两条独立指令, 依赖链 4c, 用 2x unroll 交错打破) ≈ 64c, **8× 加速**。
 ///
 /// 调用频次 (per token, n_cached=N):
 ///   16 attn blocks × 4 kv_heads × N × 6 group_size = 384N 次 V-update
@@ -442,6 +450,7 @@ pub fn scale_avx2(x: &[f32], scale: f32, y: &mut [f32], len: usize) {
 ///   markov Step 3: step_logit = base + bias (vocab=248320, 4 位置/cycle)
 ///   原 2 pass: copy (1MB read+write) + saxpy (1MB read bias + 1MB RW step) = 4MB traffic
 ///   新 1 pass: 1MB read a + 1MB read b + 1MB write dst = 3MB traffic, 节省 25%
+#[inline]
 pub fn add_avx2(a: &[f32], b: &[f32], dst: &mut [f32], len: usize) {
     debug_assert!(len >= 8);
     debug_assert_eq!(a.len(), len);
@@ -476,6 +485,7 @@ pub fn add_avx2(a: &[f32], b: &[f32], dst: &mut [f32], len: usize) {
 ///   算法: 每 8 元素 AVX2 compare + movemask 检测是否有 > best_val
 ///   - 大多数块 (best_val 已接近 max) 直接跳过, 节省 ~70% 标量比较
 ///   - 命中块内标量扫描 8 个找 max (避免 horizontal reduce + index 跟踪复杂度)
+#[inline]
 pub fn argmax_avx2(x: &[f32]) -> (usize, f32) {
     let len = x.len();
     if len == 0 {
@@ -529,6 +539,7 @@ pub fn argmax_avx2(x: &[f32]) -> (usize, f32) {
 ///
 /// ★ 用于 DSpark sample_bonus (vocab=248K, 原 3 次标量遍历 → 1 次 AVX2 遍历)
 ///   融合 sub + max(0) + store + sum 累加 (原标量 248K iter, 现 31K×8-wide)
+#[inline]
 pub fn residual_max_zero_sum_avx2(p: &[f32], q: &[f32], residual: &mut [f32]) -> f32 {
     let len = p.len();
     debug_assert_eq!(q.len(), len);

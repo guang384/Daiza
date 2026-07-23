@@ -85,6 +85,8 @@ impl Q1_0Matrix {
     /// 反量化单行,写入 caller 提供的 slice(避免堆分配)
     #[inline]
     pub fn row_into_slice(&self, row_idx: usize, y: &mut [f32]) {
+        debug_assert!(row_idx < self.rows, "row_idx {} >= rows {}", row_idx, self.rows);
+        debug_assert!(y.len() >= self.cols, "y.len() {} < cols {}", y.len(), self.cols);
         crate::tensor::quant::dequantize_q1_0_row_into(&self.bytes, row_idx, self.cols, y);
     }
 

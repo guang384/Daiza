@@ -470,6 +470,7 @@ impl DrafterContext {
         let k_start = if kv_cache_valid { cached_kv_len } else { 0 };
         // ★ context 行 position = L + row = (start_pos - ctx_len) + row (绝对位置, 对齐 llama.cpp)
         //   L = start_pos - ctx_len = 上一 cycle 的 start (已 commit 的 KV cache 长度)
+        debug_assert!(start_pos >= ctx_len, "start_pos {} < ctx_len {}", start_pos, ctx_len);
         let ctx_pos_base = start_pos.wrapping_sub(ctx_len);
         // K norm + RoPE: 只对 [k_start..n_total] 行; draft 行同时算 Q norm+RoPE
         for row in k_start..n_total {

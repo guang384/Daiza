@@ -83,4 +83,29 @@ pub fn gelu_into(x: &[f32], out: &mut [f32]) {
     }
 }
 
+/// GELU in-place (tanh 近似)
+///
+/// 安全性: gelu_tanh_avx2 每 8 元素 chunk 独立 load→compute→store, 无跨 chunk 依赖,
+/// 因此 src==dst aliasing 安全 (每 chunk 先读后写同一地址, 不再读已写区域)。
+/// 原实现需 tmp buffer + copy_from_slice (2 pass 读写), in-place 仅 1 pass。
+pub fn gelu_inplace(x: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if simd_available() && x.len() >= 8 {
+        #[allow(unsafe_code)]
+        unsafe {
+            let src = std::slice::from_raw_parts(x.as_ptr(), x.len());
+            gelu_tanh_avx2(src, x);
+            return;
+        }
+    }
+    for v in x.iter_mut() {
+        let val = *v;
+        let x3 = val * val * val;
+        let inner = SQRT_2_OVER_PI * (val + GELU_CONST * x3);
+        let exp_2y = (2.0 * inner).exp();
+        let tanh_v = 1.0 - 2.0 / (exp_2y + 1.0);
+        *v = 0.5 * val * (1.0 + tanh_v);
+    }
+}
+
 

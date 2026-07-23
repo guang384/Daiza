@@ -6,21 +6,7 @@
 //! - `w` 是可学习的 scale 向量,在 GGUF 中以 F32 存储
 
 use std::arch::x86_64::*;
-use crate::math::simd_exp::simd_available;
-
-/// AVX2 水平求和 __m256 → f32 (寄存器内,无 store)
-#[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_code)]
-#[inline]
-unsafe fn hsum_ps(v: __m256) -> f32 {
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let sum128 = _mm_add_ps(hi, lo);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
-}
+use crate::math::simd_exp::{simd_available, hsum_ps};
 
 /// AVX2 内核: 原地 RMSNorm
 ///
