@@ -67,8 +67,26 @@ fn softplus(x: f32) -> f32 {
 
 /// L2 normalization (无权重, use_qk_l2norm_in_kernel)
 /// `x * rsqrt(sum(x²) + eps)` —— 单位向量归一化
+///
+/// ★ AVX2: sum-of-squares (FMA) + scale (mul), head_dim=128=16×8-wide
+///   调用频次: 48 SSM blocks × 16 k_heads × 2 (q+k) = 1536 次/token
+///   原 196K 标量 iter → 新 12K SIMD iter
 #[inline]
-fn l2norm_inplace(x: &mut [f32], eps: f32) {
+pub(crate) fn l2norm_inplace(x: &mut [f32], eps: f32) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") && x.len() >= 8 {
+        #[allow(unsafe_code)]
+        unsafe {
+            l2norm_inplace_avx2(x, eps);
+        }
+        return;
+    }
+    l2norm_inplace_scalar(x, eps);
+}
+
+/// L2 norm 标量 fallback
+#[inline(never)]
+fn l2norm_inplace_scalar(x: &mut [f32], eps: f32) {
     let mut ss = 0.0f32;
     for &xi in x.iter() {
         ss += xi * xi;
@@ -76,6 +94,42 @@ fn l2norm_inplace(x: &mut [f32], eps: f32) {
     let inv_norm = 1.0 / (ss + eps).sqrt();
     for xi in x.iter_mut() {
         *xi *= inv_norm;
+    }
+}
+
+/// L2 norm AVX2 实现: sum-of-squares + scale
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_code)]
+#[inline]
+unsafe fn l2norm_inplace_avx2(x: &mut [f32], eps: f32) {
+    use core::arch::x86_64::*;
+    let n = x.len();
+    let n8 = (n / 8) * 8;
+    // Pass 1: sum of squares
+    let mut ss_v = _mm256_setzero_ps();
+    let mut i = 0;
+    while i < n8 {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+        ss_v = _mm256_fmadd_ps(v, v, ss_v);
+        i += 8;
+    }
+    let mut ss = horizontal_sum_ps(ss_v);
+    for j in n8..n {
+        ss += x[j] * x[j];
+    }
+    // Pass 2: scale
+    let inv_norm = 1.0 / (ss + eps).sqrt();
+    let inv_norm_v = _mm256_set1_ps(inv_norm);
+    i = 0;
+    while i < n8 {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+        let r = _mm256_mul_ps(v, inv_norm_v);
+        _mm256_storeu_ps(x.as_mut_ptr().add(i), r);
+        i += 8;
+    }
+    for j in n8..n {
+        x[j] *= inv_norm;
     }
 }
 

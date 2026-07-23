@@ -640,27 +640,13 @@ pub fn forward_batch_with_vision(
                 ctx.workspace.ssm_k[..qkv_dim].copy_from_slice(&ctx.workspace.ssm_conv_out[qkv_dim..2 * qkv_dim]);
                 ctx.workspace.ssm_v[..inner].copy_from_slice(&ctx.workspace.ssm_conv_out[2 * qkv_dim..2 * qkv_dim + inner]);
 
-                // L2 norm q/k per head
+                // L2 norm q/k per head (★ AVX2, 复用 ssm::l2norm_inplace)
                 let l2norm_eps = 1e-6f32;
                 for h_i in 0..num_k_heads {
                     let hs = h_i * state_size;
                     let he = hs + state_size;
-                    let mut ss = 0.0f32;
-                    for j in hs..he {
-                        ss += ctx.workspace.ssm_q[j] * ctx.workspace.ssm_q[j];
-                    }
-                    let inv_norm = 1.0 / (ss + l2norm_eps).sqrt();
-                    for j in hs..he {
-                        ctx.workspace.ssm_q[j] *= inv_norm;
-                    }
-                    ss = 0.0;
-                    for j in hs..he {
-                        ss += ctx.workspace.ssm_k[j] * ctx.workspace.ssm_k[j];
-                    }
-                    let inv_norm = 1.0 / (ss + l2norm_eps).sqrt();
-                    for j in hs..he {
-                        ctx.workspace.ssm_k[j] *= inv_norm;
-                    }
+                    crate::model::ssm::l2norm_inplace(&mut ctx.workspace.ssm_q[hs..he], l2norm_eps);
+                    crate::model::ssm::l2norm_inplace(&mut ctx.workspace.ssm_k[hs..he], l2norm_eps);
                 }
 
                 // q scale: q *= 1/sqrt(head_dim) (★ q_scale 已提到 block 循环外)
