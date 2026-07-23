@@ -95,10 +95,17 @@ pub struct ForwardContext<'a> {
 }
 
 /// 剖析开关:DAIZA_PROFILE env var,OnceLock 缓存避免热路径 env::var 开销
-fn profile_enabled() -> bool {
+pub(crate) fn profile_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("DAIZA_PROFILE").is_ok())
+}
+
+/// 调试开关:DAIZA_DEBUG_BLOCKS env var,OnceLock 缓存避免每 token 热路径 env::var 开销
+fn debug_blocks_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("DAIZA_DEBUG_BLOCKS").is_ok())
 }
 
 /// 单 token 前向,logits 写入 `ctx.logits_buf`(无 clone)
@@ -149,7 +156,7 @@ fn forward_single_token_core(
     // ★ 热路径优化:移除每块 Instant::now() + eprint! 的系统调用开销
     //   (每 token × 64 块 = 64 次 syscall,~1-3ms/token 损耗)
     //   改为只在外层测量一次,通过 env 变量控制是否打印明细
-    let debug_blocks = std::env::var("DAIZA_DEBUG_BLOCKS").is_ok();
+    let debug_blocks = debug_blocks_enabled();
     let block_start_ts = std::time::Instant::now();
     let mut attn_total = std::time::Duration::ZERO;
     let mut ssm_total = std::time::Duration::ZERO;
@@ -325,6 +332,9 @@ pub fn forward_batch_with_vision(
     }
 
     let profile = profile_enabled();
+    // ★ P2-1 外提: AVX2 检测只做一次, 避免在 n_batch × 48 SSM blocks × v_heads 内层循环重复
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
     let mut p_emb = std::time::Duration::ZERO;
     let mut p_cos_sin = std::time::Duration::ZERO;
     let mut p_batch_rmsnorm = std::time::Duration::ZERO;
@@ -401,7 +411,7 @@ pub fn forward_batch_with_vision(
     let mut ssm_gate_buf = vec![0.0f32; n_batch * ssm_gate_dim];
 
     // 3. 逐 block 前向
-    let debug_blocks = std::env::var("DAIZA_DEBUG_BLOCKS").is_ok();
+    let debug_blocks = debug_blocks_enabled();
     let block_start_ts = std::time::Instant::now();
 
     // 预计算所有 batch token 的 cos/sin(避免与 kv cache 的 borrow 冲突)
@@ -491,45 +501,65 @@ pub fn forward_batch_with_vision(
                     &v_buf[kv_off..kv_off + n_kv_heads * head_dim],
                 );
 
-                // Attention scores + V weighted sum(★ GQA 复用)
+                // Attention: online softmax + V-update 融合 (与 decode 路径同算法)
                 //
-                // 原实现:每 qh 独立读 K/V cache,24 qh 重复读同一 kvh 的 K/V → 6× 冗余
-                // GQA 复用:外层循环 kvh,内层 group_size 个 qh 共享 K/V cache 读取
+                // 原 3-phase 实现 (写 scores → softmax → 读 scores 做 V saxpy) 需 4 读 + 2 写
+                // per element, 且 attn_scores buffer 随序列增长。
+                // online softmax: 单 pass 遍历 K/V cache, running max/sum/output 栈上维护,
+                // 消除 attn_scores buffer 读写, 代码与 decode 路径 (attention.rs) 统一。
+                //
+                // 算法 (per qh):
+                //   m = -inf, s = 0, out = 0
+                //   for c in 0..n_cached:
+                //       score = (q · K[c]) * scale
+                //       m_new = max(m, score)
+                //       alpha = exp(m - m_new), beta = exp(score - m_new)
+                //       s = s * alpha + beta
+                //       out = out * alpha + beta * V[c]
+                //       m = m_new
+                //   out /= s
                 let n_cached = kv.len;
-                // ★ 优化: scale/group_size 已提到 block 循环外
-                // ★ P1-5: 直接写 attn_out_buf[t..], 省末尾 attn_out copy
                 let out_t = &mut attn_out_buf[t * attn_out_dim..(t + 1) * attn_out_dim];
-                out_t[..attn_out_dim].fill(0.0);
-                // ★ GQA 复用:attn_scores 容量为 group_size × context_length
-                debug_assert!(ctx.workspace.attn_scores.len() >= group_size * n_cached);
 
                 for kvh in 0..n_kv_heads {
-                    // 阶段 1: K 复用 — 一次读 K[c][kvh],算 group_size 个 qh 的 scores
+                    // group_size 个 qh 的 running state (栈上, group_size<=8)
+                    let mut m = [f32::NEG_INFINITY; 8];
+                    let mut s = [0.0f32; 8];
+                    let mut out = [[0.0f32; 256]; 8];
+
                     for c in 0..n_cached {
                         let k_head = kv.k_head_at(kvh, c);
+                        let v_head = kv.v_head_at(kvh, c);
+
                         for qh_in_group in 0..group_size {
                             let qh = kvh * group_size + qh_in_group;
                             let q_head = &ctx.workspace.attn_q[qh * head_dim..(qh + 1) * head_dim];
-                            ctx.workspace.attn_scores[qh_in_group * n_cached + c] =
-                                crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * attn_scale;
+                            let score = crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * attn_scale;
+
+                            let m_old = m[qh_in_group];
+                            let m_new = if m_old > score { m_old } else { score };
+                            let alpha = if m_old == f32::NEG_INFINITY { 0.0 } else { crate::math::simd_exp::exp_fast(m_old - m_new) };
+                            let beta = crate::math::simd_exp::exp_fast(score - m_new);
+
+                            let s_old = s[qh_in_group];
+                            s[qh_in_group] = s_old * alpha + beta;
+
+                            let out_row = &mut out[qh_in_group];
+                            crate::math::simd_exp::online_softmax_v_update_avx2(
+                                out_row, alpha, beta, v_head, head_dim,
+                            );
+                            m[qh_in_group] = m_new;
                         }
                     }
 
-                    // 阶段 2: group_size 个 qh 各自 softmax
+                    // 归一化并写入 out_t
                     for qh_in_group in 0..group_size {
-                        let s = &mut ctx.workspace.attn_scores[qh_in_group * n_cached..(qh_in_group + 1) * n_cached];
-                        math::softmax_inplace(s);
-                    }
-
-                    // 阶段 3: V 复用 — 一次读 V[c][kvh],做 group_size 个 qh 的 V 加权
-                    for c in 0..n_cached {
-                        let v_head = kv.v_head_at(kvh, c);
-                        for qh_in_group in 0..group_size {
-                            let qh = kvh * group_size + qh_in_group;
-                            let out_head = &mut out_t[qh * head_dim..(qh + 1) * head_dim];
-                            let s = ctx.workspace.attn_scores[qh_in_group * n_cached + c];
-                            crate::math::simd_exp::saxpy_avx2(s, v_head, out_head, head_dim);
-                        }
+                        let qh = kvh * group_size + qh_in_group;
+                        let out_head = &mut out_t[qh * head_dim..(qh + 1) * head_dim];
+                        let inv_s = 1.0 / s[qh_in_group];
+                        crate::math::simd_exp::scale_avx2(
+                            &out[qh_in_group], inv_s, out_head, head_dim,
+                        );
                     }
                 }
 
@@ -607,8 +637,6 @@ pub fn forward_batch_with_vision(
                 ctx.workspace.ssm_conv_out.fill(0.0);
                 // ★ P2-2: 环形读取 — 第 ct 个历史 token 在 (conv_head + ct) % conv_k 行
                 // ★ P1-5: 权重已转置为 [conv_k, qkv_full_len], 每个 ct 的 w 连续, AVX2 FMA
-                #[cfg(target_arch = "x86_64")]
-                let use_avx2 = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
                 for ct in 0..conv_k {
                     let row = (ssm.conv_head + ct) % conv_k;
                     let hist_row = &ssm.conv_history[row * qkv_full_len..(row + 1) * qkv_full_len];
@@ -687,7 +715,7 @@ pub fn forward_batch_with_vision(
                         // ★ 与 ssm.rs 同算法, 内联此处因 y_off 是 per-v_head 偏移
                         //   head_dim=128 = 16×8-wide, 无尾处理
                         #[cfg(target_arch = "x86_64")]
-                        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                        if use_avx2 {
                             #[allow(unsafe_code)]
                             unsafe {
                                 use std::arch::x86_64::*;
@@ -773,7 +801,7 @@ pub fn forward_batch_with_vision(
                             // output gate (fused, per-v_head 独立, AVX2)
                             // ★ 与串行路径同算法, head_dim=128=16×8-wide
                             #[cfg(target_arch = "x86_64")]
-                            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                            if use_avx2 {
                                 #[allow(unsafe_code)]
                                 unsafe {
                                     use std::arch::x86_64::*;

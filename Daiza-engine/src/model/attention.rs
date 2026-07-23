@@ -125,7 +125,7 @@ pub fn attention_forward_into(
     // 新实现(online softmax 融合):
     //   对每个 kvh,同时处理 group_size 个 qh,每个 qh 独立维护 running max m / running sum s / running out
     //   逐 c 读取一份 K[c][kvh] + V[c][kvh],服务 group_size 个 qh
-    //   完全消除 attn_scores buffer(decode 路径;batch prefill 路径仍使用,见 forward.rs)
+    //   完全消除 attn_scores buffer (decode 与 batch prefill 路径均已采用 online softmax)
     //   保留 GQA K/V 复用(K/V cache 每 kvh 只读 1 次)
     //
     // online softmax 算法(per qh):
@@ -159,8 +159,8 @@ pub fn attention_forward_into(
 
                 let m_old = m[qh_in_group];
                 let m_new = if m_old > score { m_old } else { score };
-                let alpha = if m_old == f32::NEG_INFINITY { 0.0 } else { (m_old - m_new).exp() };
-                let beta = (score - m_new).exp();
+                let alpha = if m_old == f32::NEG_INFINITY { 0.0 } else { crate::math::simd_exp::exp_fast(m_old - m_new) };
+                let beta = crate::math::simd_exp::exp_fast(score - m_new);
 
                 let s_old = s[qh_in_group];
                 s[qh_in_group] = s_old * alpha + beta;

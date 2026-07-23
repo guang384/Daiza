@@ -112,6 +112,21 @@ pub fn sigmoid_fast(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// SIMD exp 标量入口 (broadcast + exp_ps + extract low lane)
+/// ★ 用于 online softmax 内层循环的 alpha/beta 计算, 替代 libm expf (~30c → ~12c)
+pub fn exp_fast(x: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if simd_available() {
+        #[allow(unsafe_code)]
+        unsafe {
+            let v = _mm256_set1_ps(x);
+            let r = exp_ps(v);
+            return _mm256_cvtss_f32(r);
+        }
+    }
+    x.exp()
+}
+
 // ============================================================================
 // 批量版本(对整个 slice 操作)
 // ============================================================================
@@ -285,6 +300,28 @@ pub fn dot_product_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
     }
 }
 
+/// AVX2 水平求和: __m256 → f32 (纯寄存器内 SSE, 无 store)
+///
+/// 公共实现, 替代 quant.rs / layernorm.rs / rmsnorm.rs / softmax.rs / ssm.rs /
+/// forward.rs / vision/weights.rs / vision/encoder.rs 中重复的 `hsum_ps` /
+/// `horizontal_sum_avx2` / `horizontal_sum_ps` 局部定义。
+///
+/// 算法: 把 256-bit 拆成两个 128-bit, 相加后用 movhdup + movhl 三步 reduce 到标量。
+/// 约 3 cycle (vs store + 7 次标量 add ~5c)。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[inline]
+pub unsafe fn hsum_ps(v: __m256) -> f32 {
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(hi, lo);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+}
+
 /// AVX2 8-wide saxpy: y[i] += scale * x[i]
 /// head_dim (128 或 256) 是 8 的倍数,无需尾处理。
 #[allow(unsafe_code)]
@@ -330,10 +367,25 @@ pub fn online_softmax_v_update_avx2(
         let av = _mm256_set1_ps(alpha);
         let bv = _mm256_set1_ps(beta);
         let mut i = 0;
+        // ★ 2x unroll: 打破 mul(4c) → fma(4c) 依赖链, 两独立链交错
+        //   head_dim=256 = 32×8-wide, 足够迭代做 unroll
+        while i + 16 <= len {
+            let vy0 = _mm256_loadu_ps(y.as_ptr().add(i));
+            let vx0 = _mm256_loadu_ps(x.as_ptr().add(i));
+            let vy1 = _mm256_loadu_ps(y.as_ptr().add(i + 8));
+            let vx1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+            let sy0 = _mm256_mul_ps(av, vy0);
+            let sy1 = _mm256_mul_ps(av, vy1);
+            let r0 = _mm256_fmadd_ps(bv, vx0, sy0);
+            let r1 = _mm256_fmadd_ps(bv, vx1, sy1);
+            _mm256_storeu_ps(y.as_mut_ptr().add(i), r0);
+            _mm256_storeu_ps(y.as_mut_ptr().add(i + 8), r1);
+            i += 16;
+        }
+        // tail (len 通常是 8 的倍数, 但保留鲁棒性)
         while i + 8 <= len {
             let vy = _mm256_loadu_ps(y.as_ptr().add(i));
             let vx = _mm256_loadu_ps(x.as_ptr().add(i));
-            // y = alpha * y + beta * x = FMA(beta, x, alpha*y)
             let scaled_y = _mm256_mul_ps(av, vy);
             let result = _mm256_fmadd_ps(bv, vx, scaled_y);
             _mm256_storeu_ps(y.as_mut_ptr().add(i), result);

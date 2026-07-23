@@ -35,6 +35,20 @@ fn q8_path_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("DAIZA_Q8_PATH").is_ok())
 }
 
+/// DAIZA_KERNEL_MODE 缓存 (避免热路径 matvec 每次调用 env::var)
+fn kernel_mode() -> &'static str {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<String> = OnceLock::new();
+    FLAG.get_or_init(|| std::env::var("DAIZA_KERNEL_MODE").unwrap_or_default())
+}
+
+/// DAIZA_INT_KERNEL 缓存 (避免热路径 matvec 每次调用 env::var)
+fn int_kernel_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("DAIZA_INT_KERNEL").is_ok())
+}
+
 /// 如果 Q8_PATH 启用, 把 x 量化为 Q8_0 再反量化回 F32 (引入量化误差), 返回 Cow::Owned
 /// 否则返回 Cow::Borrowed(x), 零开销
 pub(crate) fn maybe_quantize_x_q8<'a>(x: &'a [f32]) -> std::borrow::Cow<'a, [f32]> {
@@ -102,9 +116,9 @@ impl Q1_0Matrix {
         // quad: 8 FMA 链/group (默认, 最高功耗密度)
         // dual: 4 FMA 链/group (降功耗密度 50%)
         // single: 2 FMA 链/group (降功耗密度 75%)
-        let kernel_mode = std::env::var("DAIZA_KERNEL_MODE").unwrap_or_default();
+        let kernel_mode = kernel_mode();
         // ★ 实验: DAIZA_INT_KERNEL=1 走整数乘加 kernel (模仿 llama.cpp, 降低功耗密度)
-        let use_int_kernel = use_avx2 && std::env::var("DAIZA_INT_KERNEL").is_ok();
+        let use_int_kernel = use_avx2 && int_kernel_enabled();
         // ★ P2-5: 阈值从 4096 降到 1024, 让 attn_k/v (1024 rows) 也走线程池
         if n_threads <= 1 || n < 1024 {
             #[cfg(target_arch = "x86_64")]
@@ -171,7 +185,7 @@ impl Q1_0Matrix {
             let y_addr = y.as_mut_ptr() as usize;
             // ★ Work-stealing: chunk_size=256 改善负载均衡
             let steal_chunk = 256;
-            let km = kernel_mode.clone();
+            let km = kernel_mode;
 
             // ★ 整数乘加 kernel 路径 (模仿 llama.cpp)
             if use_int_kernel {

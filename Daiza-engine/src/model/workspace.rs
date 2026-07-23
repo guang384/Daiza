@@ -38,6 +38,20 @@ use crate::model::config::Config;
 static GLOBAL_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
+// Worker 等待模式 (OnceLock 缓存, worker_loop 与 scatter_wait 共享读取)
+//   yield 模式 (默认): active worker spin + yield_now, 永不 park
+//     → scatter_wait 无需 unpark (worker 自旋检测 generation 变化)
+//   park 模式 (DAIZA_WAIT_MODE=park): active worker spin + park
+//     → scatter_wait 必须 unpark 唤醒 park 中的 worker
+// ---------------------------------------------------------------------------
+static WAIT_MODE_PARK: OnceLock<bool> = OnceLock::new();
+
+/// 当前是否为 park 等待模式 (yield 模式下 scatter_wait 可跳过 unpark syscall)
+fn use_park_mode() -> bool {
+    *WAIT_MODE_PARK.get_or_init(|| std::env::var("DAIZA_WAIT_MODE").as_deref() == Ok("park"))
+}
+
+// ---------------------------------------------------------------------------
 // 嵌套并行检测: 防止 matvec_into_slice 在 par_for_patches 闭包内再次调度
 // ---------------------------------------------------------------------------
 // thread_local 标志: 当前线程是否正在执行 scatter_wait 分发的任务.
@@ -144,7 +158,7 @@ struct Shared {
 
     // --- Line 4: shutdown (cold path) ---
     shutdown: AtomicBool,
-    _pad4: [u8; 64 - 8],
+    _pad4: [u8; 64 - 1], // AtomicBool 实际 1 字节, 补满 64B cache line
 }
 
 /// 类型擦除 trampoline: 把 *const () 转回 &F 并调用 F(i)
@@ -194,10 +208,7 @@ fn worker_loop(shared: Arc<Shared>, tid: usize) {
             .and_then(|s| s.parse().ok())
             .unwrap_or(SPIN_ROUNDS_DEFAULT)
     });
-    static WAIT_MODE_PARK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let use_park = *WAIT_MODE_PARK.get_or_init(|| {
-        std::env::var("DAIZA_WAIT_MODE").as_deref() == Ok("park")
-    });
+    let use_park = use_park_mode();
     let mut last_gen: u64 = 0;
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
@@ -292,7 +303,7 @@ impl ThreadPool {
             done: AtomicUsize::new(0),
             _pad3: [0; 64 - 8],
             shutdown: AtomicBool::new(false),
-            _pad4: [0; 64 - 8],
+            _pad4: [0; 64 - 1],
         });
 
         let mut threads = Vec::with_capacity(n_workers);
@@ -364,8 +375,12 @@ impl ThreadPool {
 
             self.shared.generation.fetch_add(1, Ordering::Release);
 
-            for i in 0..n_dispatch {
-                self.threads[i].unpark();
+            // ★ yield 模式下 active worker 自旋检测 generation, 无需 unpark (省 syscall)
+            //   park 模式下 worker 可能已 park, 必须 unpark 唤醒
+            if use_park_mode() {
+                for i in 0..n_dispatch {
+                    self.threads[i].unpark();
+                }
             }
 
             // main 执行 stride 循环: f(n_active), f(n_active+stride), ...
@@ -408,9 +423,12 @@ impl ThreadPool {
         // 递增 generation (Release: 让 worker 看到 ctx/func/n_dispatch 写入)
         self.shared.generation.fetch_add(1, Ordering::Release);
 
-        // 唤醒 worker (unpark 是 sticky 的, 即使 worker 尚未 park 也不会丢失)
-        for i in 0..n_dispatch {
-            self.threads[i].unpark();
+        // ★ yield 模式下 active worker 自旋检测 generation, 无需 unpark (省 syscall)
+        //   park 模式下 worker 可能已 park, 必须 unpark 唤醒
+        if use_park_mode() {
+            for i in 0..n_dispatch {
+                self.threads[i].unpark();
+            }
         }
 
         // 主线程执行最后一个 chunk (tid = n-1)
@@ -486,9 +504,12 @@ impl ThreadPool {
         // 递增 generation (Release: 让 worker 看到 ctx/func/n_dispatch/next_chunk 写入)
         self.shared.generation.fetch_add(1, Ordering::Release);
 
-        // 唤醒 worker
-        for i in 0..n_dispatch {
-            self.threads[i].unpark();
+        // ★ yield 模式下 active worker 自旋检测 generation, 无需 unpark (省 syscall)
+        //   park 模式下 worker 可能已 park, 必须 unpark 唤醒
+        if use_park_mode() {
+            for i in 0..n_dispatch {
+                self.threads[i].unpark();
+            }
         }
 
         // 主线程也参与抢 chunk (像 llama.cpp)

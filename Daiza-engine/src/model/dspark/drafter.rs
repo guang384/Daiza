@@ -21,6 +21,27 @@ use crate::tensor::quant::dequantize_q1_0_row_into;
 
 use super::weights::DrafterWeights;
 
+// ---------------------------------------------------------------------------
+// env var 缓存 (drafter 每次 draft_forward 调用, 避免重复 env::var syscall)
+// ---------------------------------------------------------------------------
+fn no_kv_cache() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("DAIZA_DSPARK_NO_KV_CACHE").is_ok())
+}
+
+fn no_snr() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("DAIZA_DSPARK_NO_SNR").is_ok())
+}
+
+fn no_fc_cache() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("DAIZA_DSPARK_NO_FC_CACHE").is_ok())
+}
+
 /// DSpark drafter 运行时上下文 (持有 workspace buffers)
 pub struct DrafterContext {
     pub weights: DrafterWeights,
@@ -178,12 +199,9 @@ impl DrafterContext {
             for i in 0..cfg.embedding_length {
                 self.ws_snr_hidden[pos * cfg.embedding_length + i] += self.weights.log_snr_fc1_b.data[i];
             }
-            // SiLU: x * sigmoid(x)
-            for i in 0..cfg.embedding_length {
-                let x = self.ws_snr_hidden[pos * cfg.embedding_length + i];
-                let sig = 1.0 / (1.0 + (-x).exp());
-                self.ws_snr_hidden[pos * cfg.embedding_length + i] = x * sig;
-            }
+            // SiLU: x * sigmoid(x) — AVX2 向量化
+            let silu_slice = &mut self.ws_snr_hidden[pos * cfg.embedding_length..(pos + 1) * cfg.embedding_length];
+            crate::math::simd_exp::silu_inplace_simd(silu_slice);
         }
 
         // Step 3: FC2 → snr_embed [bs, hidden]
@@ -227,13 +245,13 @@ impl DrafterContext {
              c.log_snr_conditioning, c.mask_token_id, c.n_embd_cap(), c.rms_eps, c.vocab_size)
         };
         let n_total = ctx_len + bs;
-        let profile = std::env::var("DAIZA_PROFILE").is_ok();
+        let profile = crate::model::forward::profile_enabled();
         let t0 = if profile { Some(std::time::Instant::now()) } else { None };
 
         // ★ K/V cache 回退保护: 若 ctx_len < cached_kv_len (异常, 理论不发生),
         // 重置缓存标志, 全量重算 (与 fc cache 的回退保护一致)。
         // ★ DAIZA_DSPARK_NO_KV_CACHE=1: 强制禁用 K/V cache 复用 (A/B 测试用)
-        if ctx_len < self.cached_kv_len || std::env::var("DAIZA_DSPARK_NO_KV_CACHE").is_ok() {
+        if ctx_len < self.cached_kv_len || no_kv_cache() {
             self.cached_kv_len = 0;
         }
 
@@ -253,7 +271,7 @@ impl DrafterContext {
 
         // 2. Log-SNR conditioning: snr_embed 加到 embedding (AVX2 saxpy)
         //    DAIZA_DSPARK_NO_SNR=1 禁用 (调试用, 隔离 snr 是否有 bug)
-        let t_snr = if log_snr_conditioning && std::env::var("DAIZA_DSPARK_NO_SNR").is_err() {
+        let t_snr = if log_snr_conditioning && !no_snr() {
             let t = if profile { Some(std::time::Instant::now()) } else { None };
             self.compute_log_snr();
             crate::math::simd_exp::saxpy_avx2(1.0, &self.ws_snr_embed[..bs * h], &mut self.ws_embd[..bs * h], bs * h);
@@ -276,7 +294,7 @@ impl DrafterContext {
             debug_assert_eq!(fc.rows, h);
             let hidden_norm = &self.weights.hidden_norm.data;
 
-            if ctx_len < self.cached_ctx_len || std::env::var("DAIZA_DSPARK_NO_FC_CACHE").is_ok() {
+            if ctx_len < self.cached_ctx_len || no_fc_cache() {
                 // ctx_len 回退 (异常): 重置缓存, 全量重投影
                 self.cached_ctx_len = 0;
             }
