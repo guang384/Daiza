@@ -54,8 +54,9 @@ impl MarkovContext {
     ///
     /// 输出:
     /// - `out_tokens`: 长度 block_size 的 resampled token IDs
-    /// - `out_logits`: 长度 block_size * vocab 的 step_logits (供 confidence head 用)
+    /// - `out_logits`: 长度 block_size * vocab 的 step_logits (供 confidence head / sample_bonus 用)
     ///   (写入 self.step_logit 复用, 每位置覆盖前先 copy 到 caller buffer)
+    ///   ★ 传入 None 时跳过复制 (greedy 模式下 sample_bonus 不需要 q, 省 4 × 248KB/cycle copy)
     /// - `out_prev_embds`: 长度 block_size * rank 的 prev_embd 副本 (供 confidence head 用)
     ///   每位置 k 的 prev_embd = W1[prev_token_k], prev_token_k = (k==0 ? anchor : out[k-1])
     ///   与 DeepSpec prev_token_ids = [anchor, sampled[:-1]] 一致。
@@ -66,7 +67,7 @@ impl MarkovContext {
         base_logits: &[f32],
         anchor_token: u32,
         out_tokens: &mut Vec<u32>,
-        out_step_logits: &mut Vec<f32>,
+        mut out_step_logits: Option<&mut Vec<f32>>,
         mut out_prev_embds: Option<&mut Vec<f32>>,
     ) {
         let cfg = &weights.cfg;
@@ -76,8 +77,10 @@ impl MarkovContext {
         debug_assert_eq!(base_logits.len(), bs * vocab);
         out_tokens.clear();
         out_tokens.reserve(bs);
-        out_step_logits.clear();
-        out_step_logits.reserve(bs * vocab);
+        if let Some(buf) = out_step_logits.as_mut() {
+            buf.clear();
+            buf.reserve(bs * vocab);
+        }
         if let Some(buf) = out_prev_embds.as_mut() {
             buf.clear();
             buf.reserve(bs * rank);
@@ -85,6 +88,11 @@ impl MarkovContext {
 
         // prev_token 初始为 anchor
         let mut prev_token = anchor_token;
+
+        // ★ 优化: env var 查询移出循环,OnceLock 缓存避免每位置一次 syscall
+        //   (bs=4 时 4 次 env::var/call, 在 draft 热路径上)
+        static NO_MARKOV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_markov = *NO_MARKOV.get_or_init(|| std::env::var("DAIZA_DSPARK_NO_MARKOV").is_ok());
 
         for k in 0..bs {
             // Step 1: 抽取 prev-token 的 256 维 embedding (W1[prev_token])
@@ -109,7 +117,7 @@ impl MarkovContext {
             //   vocab=248320, 4 位置/cycle, 内存 traffic 从 4MB 降到 3MB (-25%)
             // DAIZA_DSPARK_NO_MARKOV=1: 禁用 markov bias, 直接用 base_logits (调试用)
             let base_row = &base_logits[k * vocab..(k + 1) * vocab];
-            if std::env::var("DAIZA_DSPARK_NO_MARKOV").is_ok() {
+            if no_markov {
                 self.step_logit[..vocab].copy_from_slice(base_row);
             } else {
                 crate::math::simd_exp::add_avx2(
@@ -121,54 +129,18 @@ impl MarkovContext {
             }
 
             // Step 4: argmax → best_id
-            // ★ P6: AVX2 向量化 argmax
+            // ★ P6: AVX2 向量化 argmax (复用 simd_exp::argmax_avx2)
             //   每 8 元素: AVX2 compare + movemask 检测是否有 > best_val
             //   若有, 标量扫描 8 个找 max (避免 horizontal reduce + index 跟踪复杂度)
             //   大多数块 (best_val 已接近 max) 直接跳过, 节省 ~70% 标量比较
-            let mut best_id = 0u32;
-            let mut best_val = f32::NEG_INFINITY;
-            #[cfg(target_arch = "x86_64")]
-            if crate::math::simd_exp::simd_available() && vocab >= 8 {
-                #[allow(unsafe_code)]
-                unsafe {
-                    use std::arch::x86_64::*;
-                    let ptr = self.step_logit.as_ptr();
-                    let mut i = 0;
-                    let n8 = (vocab / 8) * 8;
-                    while i < n8 {
-                        let v = _mm256_loadu_ps(ptr.add(i));
-                        let bv = _mm256_set1_ps(best_val);
-                        let cmp = _mm256_cmp_ps(v, bv, _CMP_GT_OQ);
-                        if _mm256_movemask_ps(cmp) != 0 {
-                            // 本 8 元素块内有 > best_val, 标量扫描找 max
-                            for j in 0..8 {
-                                let val = *self.step_logit.get_unchecked(i + j);
-                                if val > best_val {
-                                    best_val = val;
-                                    best_id = (i + j) as u32;
-                                }
-                            }
-                        }
-                        i += 8;
-                    }
-                    for v in n8..vocab {
-                        if self.step_logit[v] > best_val {
-                            best_val = self.step_logit[v];
-                            best_id = v as u32;
-                        }
-                    }
-                }
-            } else {
-                for v in 0..vocab {
-                    if self.step_logit[v] > best_val {
-                        best_val = self.step_logit[v];
-                        best_id = v as u32;
-                    }
-                }
-            }
+            let (best_id, _) = crate::math::simd_exp::argmax_avx2(&self.step_logit[..vocab]);
+            let best_id = best_id as u32;
 
-            // 保存 step_logit 副本 (供 confidence head 用)
-            out_step_logits.extend_from_slice(&self.step_logit[..vocab]);
+            // 保存 step_logit 副本 (供 confidence head / sample_bonus 用)
+            // ★ greedy 模式下传入 None, 跳过 4 × 248KB/cycle copy
+            if let Some(buf) = out_step_logits.as_mut() {
+                buf.extend_from_slice(&self.step_logit[..vocab]);
+            }
             // 保存 prev_embd 副本 (供 confidence head 用, 与 step_logit 对齐位置 k)
             if let Some(buf) = out_prev_embds.as_mut() {
                 buf.extend_from_slice(&self.prev_embd[..rank]);

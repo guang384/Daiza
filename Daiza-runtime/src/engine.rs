@@ -797,7 +797,11 @@ impl Engine {
         let n_tap_layers = ctx.hidden_tap_layers.len();
         let hidden = cfg.hidden;
         let n_embd_cap = n_tap_layers * hidden;
-        let mut target_tap_history: Vec<f32> = Vec::new();
+        // ★ 预分配: 避免 extend_from_slice 触发 Vec realloc (200 token × 100KB = 20MB 累积,
+        //   每次 realloc 复制已有 buffer, log2(N)≈18 次 realloc 累积 ~2x final size copy)
+        //   上界 = (prefill_tokens + anchor + max_tokens) * n_embd_cap
+        let est_rows = n_input.saturating_add(max_tokens);
+        let mut target_tap_history: Vec<f32> = Vec::with_capacity(est_rows * n_embd_cap);
 
         // prefill 阶段: forward_batch 已捕获 hidden_tap_batch_buf [n_batch, n_tap, hidden]
         // 累积到 history (行优先 token-major, 与 set_target_tap 期望一致)
@@ -873,7 +877,7 @@ impl Engine {
                 &target_tap_history[..ctx_len * n_embd_cap],
                 ctx_len,
             );
-                let dt = spec.draft(anchor_token, start_pos).to_vec();
+                let dt = spec.draft(anchor_token, start_pos, params.temperature > 0.0).to_vec();
                 draft_tokens = dt;
             }
             t_draft += draft_start.elapsed().as_millis();
@@ -914,19 +918,36 @@ impl Engine {
             for (i, &dt) in draft_tokens[..n_draft_to_verify].iter().enumerate() {
                 // ctx.logits_buf = 预测 draft[i] 的 target 分布 (前一个 forward 的输出)
                 let target_logits_i = &ctx.logits_buf[..cfg.vocab_size];
-                let draft_logits_i = &self.spec_ctx.as_ref().unwrap().draft_logits
-                    [i * cfg.vocab_size..(i + 1) * cfg.vocab_size];
 
-                let accepted = leviathan_check(
-                    target_logits_i, draft_logits_i, dt, params, &mut || rng.next_f32(),
-                );
+                // ★ greedy 模式跳过 step_logits 复制 (draft_logits 为空)
+                //   leviathan_check greedy 路径只需 target argmax, 不读 draft_logits
+                //   reject 时 greedy 直接 argmax target 作为 bonus, 无需 q
+                let accepted = if params.temperature <= 0.0 {
+                    leviathan_check_greedy(target_logits_i, dt)
+                } else {
+                    let draft_logits_i = &self.spec_ctx.as_ref().unwrap().draft_logits
+                        [i * cfg.vocab_size..(i + 1) * cfg.vocab_size];
+                    leviathan_check(
+                        target_logits_i, draft_logits_i, dt, params, &mut || rng.next_f32(),
+                    )
+                };
 
                 if !accepted {
                     // Reject: 用 ctx.logits_buf 采样 bonus (预测 draft[i] 的分布)
-                    bonus_token = Some(sample_bonus(
-                        target_logits_i, draft_logits_i, params,
-                        &mut || rng.next_f32(), &mut sampling_buf, &mut bonus_buf,
-                    ));
+                    bonus_token = Some(if params.temperature <= 0.0 {
+                        // greedy: 直接 argmax target (省 sample_bonus 的 p/q softmax)
+                        sample_top_k_top_p_into(
+                            target_logits_i, params,
+                            &mut || rng.next_f32(), &mut sampling_buf,
+                        )
+                    } else {
+                        let draft_logits_i = &self.spec_ctx.as_ref().unwrap().draft_logits
+                            [i * cfg.vocab_size..(i + 1) * cfg.vocab_size];
+                        sample_bonus(
+                            target_logits_i, draft_logits_i, params,
+                            &mut || rng.next_f32(), &mut sampling_buf, &mut bonus_buf,
+                        )
+                    });
                     break;
                 }
 
@@ -1261,15 +1282,9 @@ fn leviathan_check(
     let dt = draft_token as usize;
 
     // greedy 模式: argmax 比较 (与 llama.cpp dspark target verify temp=0 一致)
+    // ★ AVX2 向量化 argmax (vocab=248320, 每 cycle 多次调用)
     if params.temperature <= 0.0 {
-        let mut target_argmax = 0usize;
-        let mut target_max = f32::NEG_INFINITY;
-        for (i, &l) in target_logits.iter().enumerate() {
-            if l > target_max {
-                target_max = l;
-                target_argmax = i;
-            }
-        }
+        let (target_argmax, _) = daiza_engine::math::simd_exp::argmax_avx2(target_logits);
         return target_argmax == dt;
     }
 
@@ -1280,6 +1295,14 @@ fn leviathan_check(
     let r = if q_dt > 1e-12 { p_dt / q_dt } else { 0.0 };
     let u = rng();
     u < r
+}
+
+/// Greedy 专用 Leviathan check: 只比较 target argmax 与 draft_token
+/// ★ 跳过 draft_logits 参数 (greedy 模式下未填充, 省全 vocab copy)
+#[inline]
+fn leviathan_check_greedy(target_logits: &[f32], draft_token: u32) -> bool {
+    let (target_argmax, _) = daiza_engine::math::simd_exp::argmax_avx2(target_logits);
+    target_argmax == draft_token as usize
 }
 
 /// 从 residual 分布 norm(max(0, p - q)) 采样 bonus token

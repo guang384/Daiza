@@ -104,6 +104,14 @@ pub fn attention_forward_into(
         math::rmsnorm_inplace(&mut ws.attn_q[hs..he], &w.attn_q_norm.data, rms_eps);
         math::apply_rope_partial(&mut ws.attn_q[hs..hs + head_dim], rope_dim, cos, sin);
     }
+    // ★ scale 预烘焙到 Q (一次扫描 attn_q, 消除内层 n_cached×group_size 次 *scale)
+    //   dot_product 后直接是 score, 省 1 条 vmulps / iter
+    let q_scale = 1.0 / (head_dim as f32).sqrt();
+    let total_q = n_q_heads * head_dim;
+    debug_assert!(ws.attn_q.len() >= total_q);
+    for v in &mut ws.attn_q[..total_q] {
+        *v *= q_scale;
+    }
     for h_i in 0..n_kv_heads {
         let hs = h_i * head_dim;
         let he = hs + head_dim;
@@ -131,7 +139,7 @@ pub fn attention_forward_into(
     // online softmax 算法(per qh):
     //   m = -inf, s = 0, out = 0
     //   for c in 0..n_cached:
-    //       score = (q · K[c]) * scale
+    //       score = q · K[c]   (scale 已预烘焙进 Q, 见上方 q_scale)
     //       m_new = max(m, score)
     //       alpha = exp(m - m_new)      // 旧贡献的衰减因子
     //       beta = exp(score - m_new)   // 新贡献
@@ -140,7 +148,6 @@ pub fn attention_forward_into(
     //       m = m_new
     //   out /= s
     let n_cached = kv_cache.len;
-    let scale = 1.0 / (head_dim as f32).sqrt();
 
     for kvh in 0..n_kv_heads {
         // group_size 个 qh 的 running state(stack 数组,group_size=6 很小)
@@ -155,11 +162,12 @@ pub fn attention_forward_into(
             for qh_in_group in 0..group_size {
                 let qh = kvh * group_size + qh_in_group;
                 let q_head = &ws.attn_q[qh * head_dim..(qh + 1) * head_dim];
-                let score = crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * scale;
+                let score = crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim);
 
                 let m_old = m[qh_in_group];
-                let m_new = if m_old > score { m_old } else { score };
-                let alpha = if m_old == f32::NEG_INFINITY { 0.0 } else { crate::math::simd_exp::exp_fast(m_old - m_new) };
+                // ★ branch 消除: m_new = max(m_old, score); 当 m_old=-inf, exp(-inf)=0, 与原 branch 等价
+                let m_new = m_old.max(score);
+                let alpha = crate::math::simd_exp::exp_fast(m_old - m_new);
                 let beta = crate::math::simd_exp::exp_fast(score - m_new);
 
                 let s_old = s[qh_in_group];

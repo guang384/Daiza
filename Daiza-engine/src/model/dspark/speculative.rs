@@ -111,10 +111,11 @@ impl SpeculativeContext {
     /// 输入:
     /// - `anchor_token`: 上一个被 target 接受的 token
     /// - `start_pos`: anchor 的绝对位置 (drafter RoPE 用)
+    /// - `need_logits`: 是否填充 self.draft_logits (greedy 模式下采样不需要 q, 省大块 copy)
     ///
-    /// 输出: `&[u32]` 长度 = block_size, 同时 self.draft_logits 被填充。
+    /// 输出: `&[u32]` 长度 = block_size, 当 need_logits=true 时 self.draft_logits 被填充。
     /// 若 confidence_head 启用, 同时填充 self.confidence_logits (调用方据此早停)。
-    pub fn draft(&mut self, anchor_token: u32, start_pos: usize) -> &[u32] {
+    pub fn draft(&mut self, anchor_token: u32, start_pos: usize, need_logits: bool) -> &[u32] {
         let bs = self.drafter.weights.cfg.block_size;
         let vocab = self.drafter.weights.cfg.vocab_size;
         let has_conf = self.drafter.weights.confidence_head_w.is_some();
@@ -142,12 +143,18 @@ impl SpeculativeContext {
         } else {
             None
         };
+        let step_logits_buf: Option<&mut Vec<f32>> = if need_logits {
+            Some(&mut self.draft_logits)
+        } else {
+            self.draft_logits.clear();
+            None
+        };
         self.markov.resample_chain(
             weights,
             base_logits,
             anchor_token,
             &mut self.draft_tokens,
-            &mut self.draft_logits,
+            step_logits_buf,
             prev_embds_buf,
         );
         let t_markov = t1.map(|t| t.elapsed().as_millis());

@@ -29,9 +29,19 @@ const LN2_INV: f32 = 1.0 / LN2_F; // 1.4426950
 ///
 /// 精度:误差 < 2^-23 (1e-7),远小于 softmax/silu 的精度需求
 /// 输入范围:x ∈ [-88, 88](超出范围返回 0 或 inf,与 libm 一致)
+///
+/// ★ 输入 clamp: online softmax 首次 iter 时 m_old=-inf, m_old-m_new=-inf
+///   原 exp_ps(-inf) 产生 NaN (r = -inf - (-inf*ln2) = -inf + inf = NaN),
+///   导致 attention output 全 NaN。clamp x 到 [-88, 88] 使 exp(-88)≈0 (denormal),
+///   既消除 NaN 又与 libm 行为一致 (超出 [-88, 88] 返回 0/inf)。
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
 pub unsafe fn exp_ps(x: __m256) -> __m256 {
+    // 0. clamp x 到 [-88, 88] 防止 inf/NaN 传播 (exp(-88)≈6e-39, exp(88)≈1.65e38)
+    let x_lo = _mm256_set1_ps(-88.0);
+    let x_hi = _mm256_set1_ps(88.0);
+    let x = _mm256_max_ps(_mm256_min_ps(x, x_hi), x_lo);
+
     // 1. n = round(x / ln2) — 用 round_ps (round to nearest, ties to even)
     let n_f = _mm256_mul_ps(x, _mm256_set1_ps(LN2_INV));
     let n_f = _mm256_round_ps(n_f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
@@ -447,4 +457,59 @@ pub fn add_avx2(a: &[f32], b: &[f32], dst: &mut [f32], len: usize) {
     for i in 0..len {
         dst[i] = a[i] + b[i];
     }
+}
+
+/// AVX2 向量化 argmax: 返回 (argmax_index, max_value)
+///
+/// ★ 用于 leviathan_check greedy verify (vocab=248320, 每 cycle 多次调用)
+///   算法: 每 8 元素 AVX2 compare + movemask 检测是否有 > best_val
+///   - 大多数块 (best_val 已接近 max) 直接跳过, 节省 ~70% 标量比较
+///   - 命中块内标量扫描 8 个找 max (避免 horizontal reduce + index 跟踪复杂度)
+pub fn argmax_avx2(x: &[f32]) -> (usize, f32) {
+    let len = x.len();
+    if len == 0 {
+        return (0, f32::NEG_INFINITY);
+    }
+    let mut best_id = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    #[cfg(target_arch = "x86_64")]
+    if simd_available() && len >= 8 {
+        #[allow(unsafe_code)]
+        unsafe {
+            use std::arch::x86_64::*;
+            let ptr = x.as_ptr();
+            let mut i = 0;
+            let n8 = (len / 8) * 8;
+            while i < n8 {
+                let v = _mm256_loadu_ps(ptr.add(i));
+                let bv = _mm256_set1_ps(best_val);
+                let cmp = _mm256_cmp_ps(v, bv, _CMP_GT_OQ);
+                if _mm256_movemask_ps(cmp) != 0 {
+                    // 本 8 元素块内有 > best_val, 标量扫描找 max
+                    for j in 0..8 {
+                        let val = *x.get_unchecked(i + j);
+                        if val > best_val {
+                            best_val = val;
+                            best_id = i + j;
+                        }
+                    }
+                }
+                i += 8;
+            }
+            for v in n8..len {
+                if x[v] > best_val {
+                    best_val = x[v];
+                    best_id = v;
+                }
+            }
+        }
+        return (best_id, best_val);
+    }
+    for (i, &v) in x.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_id = i;
+        }
+    }
+    (best_id, best_val)
 }

@@ -26,6 +26,8 @@
 //! AVX-512 上的 popcount 位运算方案在本项目目标 CPU (Meteor Lake, 无 AVX-512) 不可用。
 
 use crate::tensor::dtype::{Q1_0_BLOCK_BYTES, Q1_0_GROUP_SIZE, Q4_1_BLOCK_BYTES, Q4_1_GROUP_SIZE};
+#[cfg(target_arch = "x86_64")]
+use crate::math::simd_exp::hsum_ps;
 
 /// IEEE 754 半精度 (binary16) → f32 转换
 ///
@@ -269,8 +271,9 @@ pub unsafe fn dot_q1_0_row_avx2(
             *data.get_unchecked(block_start + 1),
         ]);
 
-        let scale_xmm = _mm_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
-        let scale_v = _mm256_broadcastss_ps(scale_xmm);
+        // ★ _mm256_cvtph_ps 直接 8-lane f16→f32 (set1 填充 8 个相同 f16, 结果天然 broadcast)
+        //   原 _mm_cvtph_ps(4 lane) + _mm256_broadcastss_ps(扩 8 lane) = 2 条指令
+        let scale_v = _mm256_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
 
         let sign_ptr = data.as_ptr().add(block_start + 2);
         let x_ptr = x.as_ptr().add(g * Q1_0_GROUP_SIZE);
@@ -360,12 +363,12 @@ pub unsafe fn dot_q1_0_row_dual_avx2(
         let bs0 = row_off0 + g * Q1_0_BLOCK_BYTES;
         let bs1 = row_off1 + g * Q1_0_BLOCK_BYTES;
 
-        let scale0 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+        let scale0 = _mm256_cvtph_ps(_mm_set1_epi16(
             u16::from_le_bytes([*data.get_unchecked(bs0), *data.get_unchecked(bs0 + 1)]) as i16,
-        )));
-        let scale1 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+        ));
+        let scale1 = _mm256_cvtph_ps(_mm_set1_epi16(
             u16::from_le_bytes([*data.get_unchecked(bs1), *data.get_unchecked(bs1 + 1)]) as i16,
-        )));
+        ));
 
         let sp0 = data.as_ptr().add(bs0 + 2);
         let sp1 = data.as_ptr().add(bs1 + 2);
@@ -487,15 +490,15 @@ pub unsafe fn dot_q1_0_row_triple_avx2(
         let bs1 = row_off1 + g * Q1_0_BLOCK_BYTES;
         let bs2 = row_off2 + g * Q1_0_BLOCK_BYTES;
 
-        let scale0 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+        let scale0 = _mm256_cvtph_ps(_mm_set1_epi16(
             u16::from_le_bytes([*data.get_unchecked(bs0), *data.get_unchecked(bs0 + 1)]) as i16,
-        )));
-        let scale1 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+        ));
+        let scale1 = _mm256_cvtph_ps(_mm_set1_epi16(
             u16::from_le_bytes([*data.get_unchecked(bs1), *data.get_unchecked(bs1 + 1)]) as i16,
-        )));
-        let scale2 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+        ));
+        let scale2 = _mm256_cvtph_ps(_mm_set1_epi16(
             u16::from_le_bytes([*data.get_unchecked(bs2), *data.get_unchecked(bs2 + 1)]) as i16,
-        )));
+        ));
 
         let sp0 = data.as_ptr().add(bs0 + 2);
         let sp1 = data.as_ptr().add(bs1 + 2);
@@ -555,9 +558,9 @@ pub unsafe fn dot_q1_0_row_triple_avx2(
         acc2 = _mm256_fmadd_ps(scale2, g2, acc2);
     }
 
-    let r0 = horizontal_sum_avx2(acc0);
-    let r1 = horizontal_sum_avx2(acc1);
-    let r2 = horizontal_sum_avx2(acc2);
+    let r0 = hsum_ps(acc0);
+    let r1 = hsum_ps(acc1);
+    let r2 = hsum_ps(acc2);
 
     (r0, r1, r2)
 }
@@ -605,18 +608,18 @@ pub unsafe fn dot_q1_0_row_quad_avx2(
         let bs2 = row_off2 + g * Q1_0_BLOCK_BYTES;
         let bs3 = row_off3 + g * Q1_0_BLOCK_BYTES;
 
-        let scale0 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+        let scale0 = _mm256_cvtph_ps(_mm_set1_epi16(
             u16::from_le_bytes([*data.get_unchecked(bs0), *data.get_unchecked(bs0 + 1)]) as i16,
-        )));
-        let scale1 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+        ));
+        let scale1 = _mm256_cvtph_ps(_mm_set1_epi16(
             u16::from_le_bytes([*data.get_unchecked(bs1), *data.get_unchecked(bs1 + 1)]) as i16,
-        )));
-        let scale2 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+        ));
+        let scale2 = _mm256_cvtph_ps(_mm_set1_epi16(
             u16::from_le_bytes([*data.get_unchecked(bs2), *data.get_unchecked(bs2 + 1)]) as i16,
-        )));
-        let scale3 = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(
+        ));
+        let scale3 = _mm256_cvtph_ps(_mm_set1_epi16(
             u16::from_le_bytes([*data.get_unchecked(bs3), *data.get_unchecked(bs3 + 1)]) as i16,
-        )));
+        ));
 
         let sp0 = data.as_ptr().add(bs0 + 2);
         let sp1 = data.as_ptr().add(bs1 + 2);
@@ -691,10 +694,10 @@ pub unsafe fn dot_q1_0_row_quad_avx2(
         acc3 = _mm256_fmadd_ps(scale3, g3, acc3);
     }
 
-    let r0 = horizontal_sum_avx2(acc0);
-    let r1 = horizontal_sum_avx2(acc1);
-    let r2 = horizontal_sum_avx2(acc2);
-    let r3 = horizontal_sum_avx2(acc3);
+    let r0 = hsum_ps(acc0);
+    let r1 = hsum_ps(acc1);
+    let r2 = hsum_ps(acc2);
+    let r3 = hsum_ps(acc3);
 
     (r0, r1, r2, r3)
 }
@@ -952,8 +955,8 @@ pub unsafe fn dot_q1_0_row_batch_avx2(
                 *data.get_unchecked(block_start + 1),
             ]);
             // ★ scale F16C + broadcast 每 group 只做一次, 2 token 共享
-            let scale_xmm = _mm_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
-            let scale_v = _mm256_broadcastss_ps(scale_xmm);
+            //   _mm256_cvtph_ps 直接 8-lane (set1 填充 8 个相同 f16 → 8 个相同 f32)
+            let scale_v = _mm256_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
             let sign_ptr = data.as_ptr().add(block_start + 2);
             let x_base0 = x.as_ptr().add(t_start * x_stride + g * Q1_0_GROUP_SIZE);
             let x_base1 = x
@@ -1011,9 +1014,9 @@ pub unsafe fn dot_q1_0_row_batch_avx2(
         }
 
         // 行末一次性横向求和
-        *y.get_unchecked_mut(t_start * y_stride) = horizontal_sum_avx2(row_acc0);
+        *y.get_unchecked_mut(t_start * y_stride) = hsum_ps(row_acc0);
         if has_pair {
-            *y.get_unchecked_mut((t_start + 1) * y_stride) = horizontal_sum_avx2(row_acc1);
+            *y.get_unchecked_mut((t_start + 1) * y_stride) = hsum_ps(row_acc1);
         }
 
         t_start += if has_pair { 2 } else { 1 };
@@ -1066,8 +1069,8 @@ pub unsafe fn dot_q1_0_row_batch4_avx2(
             *data.get_unchecked(block_start + 1),
         ]);
         // scale F16C + broadcast 每 group 只做一次, 4 x 共享
-        let scale_xmm = _mm_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
-        let scale_v = _mm256_broadcastss_ps(scale_xmm);
+        //   _mm256_cvtph_ps 直接 8-lane (set1 填充 8 个相同 f16 → 8 个相同 f32)
+        let scale_v = _mm256_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
         let sign_ptr = data.as_ptr().add(block_start + 2);
 
         // 4 个 x base (不同 x, 同一 group)
@@ -1124,26 +1127,10 @@ pub unsafe fn dot_q1_0_row_batch4_avx2(
     }
 
     // 行末一次性横向求和
-    *y.get_unchecked_mut(0) = horizontal_sum_avx2(row_acc0);
-    *y.get_unchecked_mut(1) = horizontal_sum_avx2(row_acc1);
-    *y.get_unchecked_mut(2) = horizontal_sum_avx2(row_acc2);
-    *y.get_unchecked_mut(3) = horizontal_sum_avx2(row_acc3);
-}
-
-/// __m256 → f32 横向求和 (纯寄存器内 SSE, 无 store)
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[allow(unsafe_code)]
-#[inline]
-unsafe fn horizontal_sum_avx2(v: std::arch::x86_64::__m256) -> f32 {
-    use std::arch::x86_64::*;
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let sum128 = _mm_add_ps(hi, lo);
-    let shuf = _mm_movehdup_ps(sum128);
-    let sums = _mm_add_ps(sum128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+    *y.get_unchecked_mut(0) = hsum_ps(row_acc0);
+    *y.get_unchecked_mut(1) = hsum_ps(row_acc1);
+    *y.get_unchecked_mut(2) = hsum_ps(row_acc2);
+    *y.get_unchecked_mut(3) = hsum_ps(row_acc3);
 }
 
 // ============================================================================
@@ -1326,8 +1313,8 @@ pub unsafe fn dot_q4_1_row_avx2(
         // Load d, m (f16) → broadcast to f32
         let d_bits = u16::from_le_bytes([*data.get_unchecked(bs), *data.get_unchecked(bs + 1)]);
         let m_bits = u16::from_le_bytes([*data.get_unchecked(bs + 2), *data.get_unchecked(bs + 3)]);
-        let d_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(d_bits as i16)));
-        let m_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(m_bits as i16)));
+        let d_v = _mm256_cvtph_ps(_mm_set1_epi16(d_bits as i16));
+        let m_v = _mm256_cvtph_ps(_mm_set1_epi16(m_bits as i16));
 
         // Load 16 bytes nibbles
         let nibbles = _mm_loadu_si128(data.as_ptr().add(bs + 4) as *const __m128i);
@@ -1426,8 +1413,8 @@ pub unsafe fn dot_q4_1_row_batch_avx2(
             // Load d, m (f16) → broadcast (shared across 4 tokens)
             let d_bits = u16::from_le_bytes([*data.get_unchecked(bs), *data.get_unchecked(bs + 1)]);
             let m_bits = u16::from_le_bytes([*data.get_unchecked(bs + 2), *data.get_unchecked(bs + 3)]);
-            let d_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(d_bits as i16)));
-            let m_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(m_bits as i16)));
+            let d_v = _mm256_cvtph_ps(_mm_set1_epi16(d_bits as i16));
+            let m_v = _mm256_cvtph_ps(_mm_set1_epi16(m_bits as i16));
 
             // Unpack nibbles → 4 w vectors (shared across 4 tokens)
             let nibbles = _mm_loadu_si128(data.as_ptr().add(bs + 4) as *const __m128i);
@@ -1468,10 +1455,10 @@ pub unsafe fn dot_q4_1_row_batch_avx2(
             row_acc3 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(x3_ptr.add(24)), row_acc3);
         }
 
-        *y.get_unchecked_mut(t_start * y_stride + row_idx) = horizontal_sum_avx2(row_acc0);
-        *y.get_unchecked_mut((t_start + 1) * y_stride + row_idx) = horizontal_sum_avx2(row_acc1);
-        *y.get_unchecked_mut((t_start + 2) * y_stride + row_idx) = horizontal_sum_avx2(row_acc2);
-        *y.get_unchecked_mut((t_start + 3) * y_stride + row_idx) = horizontal_sum_avx2(row_acc3);
+        *y.get_unchecked_mut(t_start * y_stride + row_idx) = hsum_ps(row_acc0);
+        *y.get_unchecked_mut((t_start + 1) * y_stride + row_idx) = hsum_ps(row_acc1);
+        *y.get_unchecked_mut((t_start + 2) * y_stride + row_idx) = hsum_ps(row_acc2);
+        *y.get_unchecked_mut((t_start + 3) * y_stride + row_idx) = hsum_ps(row_acc3);
 
         t_start += 4;
     }
@@ -1488,8 +1475,8 @@ pub unsafe fn dot_q4_1_row_batch_avx2(
 
             let d_bits = u16::from_le_bytes([*data.get_unchecked(bs), *data.get_unchecked(bs + 1)]);
             let m_bits = u16::from_le_bytes([*data.get_unchecked(bs + 2), *data.get_unchecked(bs + 3)]);
-            let d_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(d_bits as i16)));
-            let m_v = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_set1_epi16(m_bits as i16)));
+            let d_v = _mm256_cvtph_ps(_mm_set1_epi16(d_bits as i16));
+            let m_v = _mm256_cvtph_ps(_mm_set1_epi16(m_bits as i16));
 
             let nibbles = _mm_loadu_si128(data.as_ptr().add(bs + 4) as *const __m128i);
             let low = _mm_and_si128(nibbles, nibble_mask);
@@ -1515,9 +1502,9 @@ pub unsafe fn dot_q4_1_row_batch_avx2(
             }
         }
 
-        *y.get_unchecked_mut(t_start * y_stride + row_idx) = horizontal_sum_avx2(row_acc0);
+        *y.get_unchecked_mut(t_start * y_stride + row_idx) = hsum_ps(row_acc0);
         if has_pair {
-            *y.get_unchecked_mut((t_start + 1) * y_stride + row_idx) = horizontal_sum_avx2(row_acc1);
+            *y.get_unchecked_mut((t_start + 1) * y_stride + row_idx) = hsum_ps(row_acc1);
         }
 
         t_start += if has_pair { 2 } else { 1 };

@@ -440,8 +440,7 @@ pub fn forward_batch_with_vision(
         if is_full {
             let kv = ctx.state.kv_caches[blk_idx].as_mut().unwrap();
             let w = block_w.as_full_attention();
-            // ★ 优化: scale 提到 token 循环外 (原每 token 重新计算 1/sqrt(head_dim))
-            let attn_scale = 1.0 / (head_dim as f32).sqrt();
+            // ★ scale 已预烘焙到 Q (见 token 循环内 q_scale_t), 这里不再保留 attn_scale
             let group_size = n_q_heads / n_kv_heads;
 
             // 3a. Batch rmsnorm
@@ -485,6 +484,12 @@ pub fn forward_batch_with_vision(
                     let hs = h_i * head_dim;
                     math::rmsnorm_inplace(&mut ctx.workspace.attn_q[hs..hs + head_dim], &w.attn_q_norm.data, cfg.rms_eps);
                     math::apply_rope_partial(&mut ctx.workspace.attn_q[hs..hs + head_dim], rope_dim, cos, sin);
+                }
+                // ★ scale 预烘焙到 Q (一次扫描 attn_q, 消除内层 n_cached×group_size 次 *attn_scale)
+                //   attn_q 是 per-token workspace, [0..attn_out_dim] 即当前 token 的所有 Q heads
+                let q_scale_t = 1.0 / (head_dim as f32).sqrt();
+                for v in &mut ctx.workspace.attn_q[..attn_out_dim] {
+                    *v *= q_scale_t;
                 }
                 // K norm + RoPE in-place on k_buf (省一次 K copy 到 workspace)
                 let kv_off = t * n_kv_heads * head_dim;
@@ -534,11 +539,12 @@ pub fn forward_batch_with_vision(
                         for qh_in_group in 0..group_size {
                             let qh = kvh * group_size + qh_in_group;
                             let q_head = &ctx.workspace.attn_q[qh * head_dim..(qh + 1) * head_dim];
-                            let score = crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim) * attn_scale;
+                            let score = crate::math::simd_exp::dot_product_avx2(q_head, k_head, head_dim);
 
                             let m_old = m[qh_in_group];
-                            let m_new = if m_old > score { m_old } else { score };
-                            let alpha = if m_old == f32::NEG_INFINITY { 0.0 } else { crate::math::simd_exp::exp_fast(m_old - m_new) };
+                            // ★ branch 消除: m_new = max(m_old, score); 当 m_old=-inf, exp(-inf)=0, 与原 branch 等价
+                            let m_new = m_old.max(score);
+                            let alpha = crate::math::simd_exp::exp_fast(m_old - m_new);
                             let beta = crate::math::simd_exp::exp_fast(score - m_new);
 
                             let s_old = s[qh_in_group];

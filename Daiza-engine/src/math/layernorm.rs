@@ -65,18 +65,21 @@ unsafe fn layernorm_into_avx2(
     let mean = sum / nf;
     let var = sq / nf - mean * mean;
     let inv_std = 1.0 / (var + eps).sqrt();
-    let mean_v = _mm256_set1_ps(mean);
+    // ★ 2-FMA 优化: (x - mean) * inv_std = FMA(x, inv_std, -mean*inv_std)
+    //   原 sub+mul+fma = 3 op, 现 fmadd+fmadd = 2 op, 消除 sub/mul 中间步骤
+    let mean_neg_inv = -mean * inv_std;
+    let mean_v = _mm256_set1_ps(mean_neg_inv);
     let inv_std_v = _mm256_set1_ps(inv_std);
 
-    // Pass 2: dst[i] = (src[i] - mean) * inv_std * w[i] + b[i]
+    // Pass 2: dst[i] = FMA(FMA(src[i], inv_std, -mean*inv_std), w[i], b[i])
     let mut i = 0;
     while i + 32 <= n {
         for off in (0..32).step_by(8) {
             let v = _mm256_loadu_ps(src.as_ptr().add(i + off));
             let wv = _mm256_loadu_ps(w.as_ptr().add(i + off));
             let bv = _mm256_loadu_ps(b.as_ptr().add(i + off));
-            let centered = _mm256_sub_ps(v, mean_v);
-            let r = _mm256_fmadd_ps(_mm256_mul_ps(centered, inv_std_v), wv, bv);
+            let centered = _mm256_fmadd_ps(v, inv_std_v, mean_v);
+            let r = _mm256_fmadd_ps(centered, wv, bv);
             _mm256_storeu_ps(dst.as_mut_ptr().add(i + off), r);
         }
         i += 32;
@@ -85,13 +88,13 @@ unsafe fn layernorm_into_avx2(
         let v = _mm256_loadu_ps(src.as_ptr().add(i));
         let wv = _mm256_loadu_ps(w.as_ptr().add(i));
         let bv = _mm256_loadu_ps(b.as_ptr().add(i));
-        let centered = _mm256_sub_ps(v, mean_v);
-        let r = _mm256_fmadd_ps(_mm256_mul_ps(centered, inv_std_v), wv, bv);
+        let centered = _mm256_fmadd_ps(v, inv_std_v, mean_v);
+        let r = _mm256_fmadd_ps(centered, wv, bv);
         _mm256_storeu_ps(dst.as_mut_ptr().add(i), r);
         i += 8;
     }
     for j in i..n {
-        dst[j] = (src[j] - mean) * inv_std * w[j] + b[j];
+        dst[j] = (src[j] * inv_std + mean_neg_inv) * w[j] + b[j];
     }
 }
 
