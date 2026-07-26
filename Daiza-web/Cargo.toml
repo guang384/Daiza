@@ -5,6 +5,10 @@ edition = "2021"
 description = "Web GUI for Daiza inference engine (HTTP + SSE)"
 license = "Apache-2.0"
 
+[lib]
+name = "daiza_web"
+path = "src/lib.rs"
+
 [[bin]]
 name = "daiza-web"
 path = "src/main.rs"

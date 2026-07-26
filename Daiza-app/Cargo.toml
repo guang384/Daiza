@@ -9,13 +9,17 @@ license = "Apache-2.0"
 name = "daiza-app"
 path = "src/main.rs"
 
+[features]
+app = []
+
 [dependencies]
-daiza-engine = { path = "../Daiza-engine" }
-daiza-runtime = { path = "../Daiza-runtime" }
-tauri = { version = "2" }
-ureq = { version = "3" }
-base64 = { version = "0.22" }
+tauri = { version = "2", features = [] }
+ureq = { version = "3", default-features = false }
 serde = { version = "1", features = ["derive"] }
+rfd = "0.15"
+daiza-web = { path = "../Daiza-web" }
+daiza-runtime = { path = "../Daiza-runtime" }
+daiza-engine = { path = "../Daiza-engine" }
 
 [build-dependencies]
-tauri-build = { version = "2" }
+tauri-build = { version = "2", features = [] }
