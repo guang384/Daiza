@@ -43,31 +43,33 @@ Daiza/
                     │  math/model/    │
                     │  cache          │
                     └────────┬────────┘
-                             │
+                             │ Cargo 依赖
                     ┌────────▼────────┐
                     │  Daiza-runtime  │  Layer 1  编排层 (lib, 依赖 engine)
                     │  engine/session │
                     │  tokenizer/     │
                     │  tool_call      │
                     └────────┬────────┘
-                             │
-          ┌──────────────────┼──────────────────┐
-          │                  │                  │
-   ┌──────▼──────┐    ┌──────▼──────┐    ┌──────▼──────┐
-   │  Daiza-cli  │    │  Daiza-web  │    │  Daiza-app  │  Layer 2  二进制入口
-   │  (CLI bin)  │    │  (HTTP bin) │    │  (Tauri bin)│
-   └─────────────┘    └─────────────┘    └──────┬──────┘
-                                               │ 运行时启动 daiza-web.exe 子进程
-                                               ▼
-                                      (非 Cargo 依赖,仅运行时)
+                             │ Cargo 依赖
+                   ┌─────────┴─────────┐
+                   │                   │
+            ┌──────▼──────┐     ┌──────▼──────┐
+            │  Daiza-cli  │     │  Daiza-web  │  Layer 2  推理二进制入口
+            │  (CLI bin)  │     │  (HTTP bin) │
+            └─────────────┘     └──────▲──────┘
+                                       │ 运行时 spawn daiza-web.exe 子进程
+                                ┌──────┴──────┐
+                                │  Daiza-app  │  Layer 3  Tauri 桌面壳
+                                │  (Tauri bin)│  (仅依赖 tauri/ureq/serde/base64,
+                                └─────────────┘   不依赖 engine/runtime)
 ```
 
 - **Daiza-engine** (Layer 0):推理核心,零内部依赖。GGUF 解析、Q1_0 反量化、AVX2 GEMM 内核、SSM/Attention/MLP 前向、线程池。
 - **Daiza-runtime** (Layer 1):编排层,依赖 engine。Engine 顶层封装、会话管理、GPT-2 BPE 分词器、工具调用、SSD 持久化。
-- **Daiza-cli / Daiza-web / Daiza-app** (Layer 2):三个二进制入口,**平级**,各自依赖 engine+runtime。
+- **Daiza-cli / Daiza-web** (Layer 2):推理二进制入口,Cargo 依赖 engine+runtime。
   - cli:命令行交互
-  - web:HTTP+SSE 聊天界面
-  - app:Tauri 桌面壳,运行时启动 `daiza-web.exe` 子进程(非 Cargo 依赖,仅打包/运行时关联)
+  - web:HTTP+SSE 聊天服务,可独立运行(`daiza-web --model xxx.gguf` 浏览器访问 127.0.0.1:8787)
+- **Daiza-app** (Layer 3):Tauri 桌面壳,**不依赖 engine/runtime**,仅依赖 tauri/ureq/serde/base64。运行时 spawn `daiza-web.exe` 子进程提供推理服务,自身负责窗口管理 + SSE 转发(绕过 WebView2 对 127.0.0.1 的 mixed-content 拦截)
 
 > `lto = "fat"` + `codegen-units = 1` 合并所有 crate IR 为单一编译单元,保证跨 crate 内联等效于同 crate(热路径 runtime → engine 的 forward/matvec/AVX2 kernel 调用可被内联)。
 

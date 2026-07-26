@@ -34,7 +34,7 @@ if (-not (Test-Path $Bin)) {
     Push-Location $ProjectRoot
     $tempOut = [System.IO.Path]::GetTempFileName()
     $tempErr = [System.IO.Path]::GetTempFileName()
-    Start-Process -FilePath "cargo" -ArgumentList "build --release" -NoNewWindow -Wait -RedirectStandardOutput $tempOut -RedirectStandardError $tempErr
+    Start-Process -FilePath "cargo" -ArgumentList "build --release --locked" -NoNewWindow -Wait -RedirectStandardOutput $tempOut -RedirectStandardError $tempErr
     $buildOutput = (Get-Content $tempOut -Raw) + "`n" + (Get-Content $tempErr -Raw)
     Remove-Item $tempOut, $tempErr -Force
     Pop-Location
