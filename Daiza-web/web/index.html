@@ -1,19 +1,21 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Daiza Chat</title>
 <style>
   :root {
-    --bg: #07070f;
-    --panel: rgba(255,255,255,.045);
-    --border: rgba(255,255,255,.09);
-    --text: #e8e8f2;
-    --dim: #9a9ab0;
-    --accent1: #7c5cff;
-    --accent2: #00e0c6;
-    --accent3: #ff5c8a;
+    --bg: #f5f6fa;
+    --panel: rgba(255,255,255,.7);
+    --border: rgba(15,23,42,.1);
+    --text: #1e2330;
+    --dim: #6b7280;
+    --accent1: #6d4bff;
+    --accent2: #0bbf9f;
+    --accent3: #e53e6f;
+    --sidebar-bg: rgba(255,255,255,.6);
+    --sidebar-w: 260px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
@@ -25,7 +27,7 @@
   }
   .aurora {
     position: fixed; inset: -20%; z-index: 0; pointer-events: none;
-    filter: blur(90px); opacity: .5;
+    filter: blur(90px); opacity: .35;
   }
   .aurora div { position: absolute; border-radius: 50%; }
   .a1 { width: 45vw; height: 45vw; left: -8%; top: -10%;
@@ -41,15 +43,31 @@
   @keyframes drift2 { to { transform: translate(-7vw, 9vh) scale(0.9); } }
   @keyframes drift3 { to { transform: translate(6vw, -8vh) scale(1.1); } }
 
+  /* === App layout: sidebar + main === */
   #app {
     position: relative; z-index: 1;
-    display: flex; flex-direction: column;
-    height: 100vh; max-width: 860px; margin: 0 auto;
-    padding: 20px 18px 14px;
+    display: flex; flex-direction: row;
+    height: 100vh;
   }
-  header { text-align: center; padding: 8px 0 18px; flex: 0 0 auto; }
+
+  /* === Sidebar === */
+  #sidebar {
+    width: var(--sidebar-w);
+    flex: 0 0 var(--sidebar-w);
+    background: var(--sidebar-bg);
+    border-right: 1px solid var(--border);
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    display: flex; flex-direction: column;
+    transition: transform .25s ease;
+    min-width: 0;
+  }
+  .sidebar-header {
+    flex: 0 0 auto;
+    padding: 20px 18px 16px;
+    border-bottom: 1px solid var(--border);
+  }
   .logo {
-    font-size: 34px; font-weight: 800; letter-spacing: 2px;
+    font-size: 26px; font-weight: 800; letter-spacing: 2px;
     background: linear-gradient(90deg, var(--accent1), var(--accent2), var(--accent3), var(--accent1));
     background-size: 300% 100%;
     -webkit-background-clip: text; background-clip: text;
@@ -57,47 +75,505 @@
     animation: sheen 6s linear infinite;
   }
   @keyframes sheen { to { background-position: 300% 0; } }
+
+  /* Sessions list (scrollable middle of sidebar) */
+  .sessions-section {
+    flex: 1 1 auto; display: flex; flex-direction: column;
+    padding: 12px 10px; min-height: 0;
+  }
+  .sessions-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 4px 8px 10px; flex: 0 0 auto;
+  }
+  .sessions-label {
+    font-size: 11px; font-weight: 700; color: var(--dim);
+    text-transform: uppercase; letter-spacing: 1.2px;
+  }
+  #session-new {
+    width: 26px; height: 26px; border: 1px solid var(--border); border-radius: 7px;
+    background: var(--panel); color: var(--text); cursor: pointer;
+    display: grid; place-items: center; transition: filter .15s, border-color .15s, color .15s;
+    padding: 0;
+  }
+  #session-new svg { width: 14px; height: 14px; }
+  #session-new:hover { filter: brightness(1.2); border-color: var(--accent2); color: var(--accent2); }
+  #session-select {
+    flex: 1 1 auto; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 2px;
+    min-height: 0;
+  }
+  #session-select::-webkit-scrollbar { width: 6px; }
+  #session-select::-webkit-scrollbar-thumb { background: rgba(15,23,42,.15); border-radius: 3px; }
+  .session-item {
+    display: flex; align-items: center; gap: 6px;
+    padding: 9px 10px 9px 12px; border-radius: 8px;
+    color: var(--dim); font-size: 13px; cursor: pointer;
+    border-left: 3px solid transparent;
+    transition: background .15s, color .15s, border-color .15s;
+    user-select: none;
+  }
+  .session-item:hover { background: rgba(15,23,42,.05); color: var(--text); }
+  .session-item.active {
+    background: rgba(124,92,255,.14);
+    border-left-color: var(--accent1);
+    color: var(--text);
+  }
+  .session-item .session-name {
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .session-item .session-del-btn {
+    width: 22px; height: 22px; border: none; border-radius: 5px;
+    background: transparent; color: var(--dim); cursor: pointer;
+    display: none; place-items: center; padding: 0; flex: 0 0 auto;
+  }
+  .session-item .session-del-btn svg { width: 13px; height: 13px; }
+  .session-item:hover .session-del-btn { display: grid; }
+  .session-item .session-del-btn:hover { background: rgba(255,92,138,.2); color: var(--accent3); }
+  .session-item .session-rename-btn {
+    width: 22px; height: 22px; border: none; border-radius: 5px;
+    background: transparent; color: var(--dim); cursor: pointer;
+    display: none; place-items: center; padding: 0; flex: 0 0 auto;
+  }
+  .session-item .session-rename-btn svg { width: 13px; height: 13px; }
+  .session-item:hover .session-rename-btn { display: grid; }
+  .session-item .session-rename-btn:hover { background: rgba(124,92,255,.2); color: var(--accent1); }
+  /* 内联重命名输入框 */
+  .session-item .session-rename-input {
+    flex: 1; min-width: 0; font: inherit; font-size: 13px;
+    padding: 2px 6px; border: 1px solid var(--accent1); border-radius: 4px;
+    background: var(--bg, #fff); color: var(--text); outline: none;
+  }
+  .session-empty {
+    padding: 18px 10px; text-align: center; color: var(--dim); font-size: 12.5px;
+  }
+  /* Hidden delete button (kept for ID compatibility, per-item × used instead) */
+  #session-del { display: none; }
+
+  /* Sidebar footer: settings toggle + status */
+  .sidebar-footer {
+    flex: 0 0 auto; border-top: 1px solid var(--border);
+    padding: 10px;
+  }
+  .footer-row {
+    display: flex; align-items: center; gap: 10px;
+  }
+  #settings-toggle {
+    width: 32px; height: 32px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--panel); color: var(--text); cursor: pointer;
+    display: grid; place-items: center; transition: filter .15s, border-color .15s, color .15s, transform .2s;
+    flex: 0 0 auto; padding: 0;
+  }
+  #settings-toggle svg { width: 16px; height: 16px; }
+  #settings-toggle:hover { filter: brightness(1.2); border-color: var(--accent1); color: var(--accent1); }
+  #settings-toggle.active { transform: rotate(90deg); border-color: var(--accent1); color: var(--accent1); }
   #status {
-    margin-top: 6px; font-size: 12.5px; color: var(--dim);
+    flex: 1; font-size: 11.5px; color: var(--dim);
     display: inline-flex; align-items: center; gap: 7px;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
   }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: #888;
-         box-shadow: 0 0 8px currentColor; }
+         box-shadow: 0 0 8px currentColor; flex: 0 0 auto; }
   .dot.ok   { background: var(--accent2); color: var(--accent2); }
   .dot.warn { background: #ffb454; color: #ffb454; animation: pulse 1.2s ease-in-out infinite; }
   .dot.err  { background: var(--accent3); color: var(--accent3); }
   @keyframes pulse { 50% { opacity: .35; } }
 
+  /* === Settings panel (collapsible, in sidebar footer) === */
+  #settings-panel {
+    display: none; flex-direction: column; gap: 10px; margin-bottom: 10px; padding: 12px;
+    background: rgba(15,23,42,.04); border: 1px solid var(--border); border-radius: 10px;
+    max-height: 50vh; overflow-y: auto;
+    animation: slideDown .2s ease-out;
+  }
+  #settings-panel.open { display: flex; }
+  @keyframes slideDown { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+  #settings-panel::-webkit-scrollbar { width: 6px; }
+  #settings-panel::-webkit-scrollbar-thumb { background: rgba(15,23,42,.15); border-radius: 3px; }
+  #settings-panel label {
+    display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--dim);
+  }
+  #settings-panel input[type="number"] {
+    width: 100%; height: 30px; padding: 0 10px; font: inherit; font-size: 12.5px;
+    color: var(--text); background: rgba(15,23,42,.04); border: 1px solid var(--border);
+    border-radius: 6px; outline: none; transition: border-color .15s;
+  }
+  #settings-panel input[type="number"]:focus { border-color: var(--accent1); }
+  #composer-toolbar .switch-row {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; padding: 0;
+    background: rgba(15,23,42,.04); border: 1px solid var(--border); border-radius: 6px;
+    cursor: pointer; user-select: none;
+    transition: filter .15s, border-color .15s, background .15s;
+  }
+  #composer-toolbar .switch-row input { display: none; }
+  #composer-toolbar .switch-row svg { width: 16px; height: 16px; color: var(--dim); flex: 0 0 auto; }
+  #composer-toolbar .switch-row:has(input:checked) { background: rgba(109,75,255,.12); border-color: var(--accent1); }
+  #composer-toolbar .switch-row:has(input:checked) svg { color: var(--accent1); }
+  #composer-toolbar .switch-row:hover { filter: brightness(.96); }
+  /* busy 期间 think 开关禁用样式 */
+  #composer-toolbar .switch-row:has(input:disabled) {
+    cursor: not-allowed; opacity: .4;
+    filter: grayscale(.6);
+    transform: scale(.98);
+    pointer-events: none;
+  }
+  #settings-panel button#param-greedy {
+    height: 30px; padding: 0 12px; font: inherit; font-size: 12px; font-weight: 600;
+    color: var(--text); background: rgba(15,23,42,.04); border: 1px solid var(--border);
+    border-radius: 6px; cursor: pointer; transition: filter .15s, border-color .15s;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  #settings-panel button#param-greedy svg { width: 13px; height: 13px; }
+  #settings-panel button#param-greedy:hover { filter: brightness(1.2); border-color: var(--accent1); }
+  #settings-panel button#param-greedy.active {
+    background: linear-gradient(135deg, var(--accent3), var(--accent1));
+    color: #fff; border: none;
+  }
+  /* DSpark 模式三选一按钮组 (Off / Auto / Force) */
+  #composer-toolbar .dspark-mode-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 8px; background: rgba(15,23,42,.04);
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  #composer-toolbar .dspark-mode-row .mode-label {
+    font-size: 11px; color: var(--dim); min-width: 50px; font-weight: 600;
+  }
+  #composer-toolbar .dspark-mode-row .mode-btns {
+    display: flex; gap: 4px; flex: 1;
+  }
+  #composer-toolbar .dspark-mode-row .mode-btn {
+    flex: 1; height: 24px; padding: 0 8px; font-size: 11px; font-weight: 600;
+    color: var(--dim); background: transparent;
+    border: 1px solid transparent; border-radius: 5px;
+    cursor: pointer; transition: all .15s;
+  }
+  #composer-toolbar .dspark-mode-row .mode-btn:hover:not(:disabled) {
+    color: var(--text); border-color: var(--border);
+  }
+  #composer-toolbar .dspark-mode-row .mode-btn.active {
+    background: linear-gradient(135deg, var(--accent1), var(--accent2));
+    color: #07070f; border: none;
+  }
+  #composer-toolbar .dspark-mode-row .mode-btn:disabled {
+    cursor: not-allowed; opacity: .4;
+    filter: grayscale(.6);
+    transform: scale(.98);
+  }
+  /* busy 期间整个 dspark-mode-row 弱化提示 */
+  #composer-toolbar.busy .dspark-mode-row {
+    opacity: .55;
+  }
+  /* busy 期间 session 列表项禁用样式 */
+  #session-select.busy .session-item {
+    pointer-events: none;
+    opacity: .5;
+  }
+  #session-select.busy .session-item.active {
+    opacity: .75;
+  }
+
+  /* === Tools (工具箱 + 管理面板 + tool_call 卡片) === */
+  #tools-toggle .tools-badge {
+    position: absolute; top: -4px; right: -4px;
+    min-width: 16px; height: 16px; padding: 0 4px;
+    background: var(--accent3); color: #fff;
+    border-radius: 8px; font-size: 10px; font-weight: 700;
+    display: grid; place-items: center;
+    border: 2px solid var(--bg);
+  }
+  #tools-toggle:has(~ #tools-panel:not([hidden])) {
+    background: rgba(109,75,255,.12); border-color: var(--accent1);
+  }
+  #tools-toggle:has(~ #tools-panel:not([hidden])) svg { color: var(--accent1); }
+
+  #tools-panel {
+    flex: 0 0 auto; padding: 8px 16px;
+    background: rgba(15,23,42,.04); border-top: 1px solid var(--border);
+    max-height: 40vh; overflow-y: auto;
+    animation: slideDown .2s ease-out;
+  }
+  #tools-panel[hidden] { display: none; }
+  #tools-panel::-webkit-scrollbar { width: 6px; }
+  #tools-panel::-webkit-scrollbar-thumb { background: rgba(15,23,42,.15); border-radius: 3px; }
+  .tools-panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .tools-panel-title {
+    font-size: 11px; font-weight: 700; color: var(--dim);
+    text-transform: uppercase; letter-spacing: 1.2px;
+  }
+  .tool-add-btn {
+    height: 24px; padding: 0 10px; font-size: 11px; font-weight: 600;
+    color: var(--accent1); background: rgba(109,75,255,.1);
+    border: 1px solid rgba(109,75,255,.3); border-radius: 5px;
+    cursor: pointer; transition: all .15s;
+  }
+  .tool-add-btn:hover { background: rgba(109,75,255,.2); border-color: var(--accent1); }
+
+  .tool-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; margin-bottom: 4px;
+    background: rgba(255,255,255,.6); border: 1px solid var(--border);
+    border-radius: 6px; transition: border-color .15s;
+  }
+  .tool-item:hover { border-color: var(--accent1); }
+  .tool-item-info { flex: 1; min-width: 0; }
+  .tool-item-name {
+    font-size: 13px; font-weight: 600; color: var(--text);
+    font-family: "Cascadia Code", "Consolas", monospace;
+  }
+  .tool-item-desc {
+    font-size: 11px; color: var(--dim); margin-top: 2px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tool-item-actions { display: flex; gap: 4px; flex: 0 0 auto; }
+  .tool-item-btn {
+    width: 24px; height: 24px; border: none; border-radius: 5px;
+    background: transparent; color: var(--dim); cursor: pointer;
+    display: grid; place-items: center; padding: 0; transition: all .15s;
+  }
+  .tool-item-btn:hover { background: rgba(15,23,42,.08); }
+  .tool-item-btn.delete:hover { background: rgba(255,92,138,.15); color: var(--accent3); }
+  .tool-item-btn svg { width: 14px; height: 14px; }
+  .tool-item-params {
+    font-size: 10px; color: var(--dim); margin-top: 2px;
+    font-family: "Cascadia Code", "Consolas", monospace;
+  }
+  .tools-empty {
+    padding: 16px; text-align: center; color: var(--dim); font-size: 12.5px;
+  }
+
+  /* Tool editor form */
+  #tool-editor {
+    margin-top: 8px; padding: 10px;
+    background: rgba(255,255,255,.8); border: 1px solid var(--accent1);
+    border-radius: 6px;
+  }
+  .tool-editor-row { display: flex; gap: 6px; margin-bottom: 8px; }
+  .tool-input {
+    flex: 1; height: 28px; padding: 0 8px; font-size: 12.5px;
+    color: var(--text); background: rgba(15,23,42,.04);
+    border: 1px solid var(--border); border-radius: 5px; outline: none;
+    transition: border-color .15s;
+  }
+  .tool-input:focus { border-color: var(--accent1); }
+  .tool-params-header {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px; color: var(--dim); margin-bottom: 6px;
+  }
+  .tool-param-add {
+    height: 20px; padding: 0 8px; font-size: 10px; font-weight: 600;
+    color: var(--accent1); background: transparent;
+    border: 1px solid rgba(109,75,255,.3); border-radius: 4px;
+    cursor: pointer; transition: all .15s;
+  }
+  .tool-param-add:hover { background: rgba(109,75,255,.1); }
+  .tool-param-row {
+    display: flex; gap: 4px; margin-bottom: 4px; align-items: center;
+  }
+  .tool-param-row .tool-input { height: 24px; font-size: 11px; }
+  .tool-param-row .param-name { flex: 1; min-width: 0; }
+  .tool-param-row .param-type { flex: 0 0 70px; }
+  .tool-param-row .param-required {
+    flex: 0 0 auto; width: 18px; height: 18px; cursor: pointer;
+  }
+  .tool-param-row .param-del {
+    flex: 0 0 auto; width: 22px; height: 22px; border: none; border-radius: 4px;
+    background: transparent; color: var(--accent3); cursor: pointer;
+    display: grid; place-items: center; padding: 0;
+  }
+  .tool-param-row .param-del:hover { background: rgba(255,92,138,.15); }
+  .tool-param-row .param-del svg { width: 12px; height: 12px; }
+  .tool-editor-actions { display: flex; gap: 6px; margin-top: 8px; }
+  .tool-btn-primary, .tool-btn-secondary {
+    height: 28px; padding: 0 14px; font-size: 12px; font-weight: 600;
+    border: 1px solid var(--border); border-radius: 5px; cursor: pointer;
+    transition: all .15s;
+  }
+  .tool-btn-primary {
+    color: #fff; background: linear-gradient(135deg, var(--accent1), var(--accent2));
+    border: none;
+  }
+  .tool-btn-primary:hover { filter: brightness(1.1); }
+  .tool-btn-secondary { color: var(--text); background: rgba(15,23,42,.04); }
+  .tool-btn-secondary:hover { border-color: var(--dim); }
+
+  /* tool_call 卡片 (聊天中显示) - 终端代码块风格 */
+  .bubble .tool-call-block {
+    margin: 10px 0; padding: 0;
+    border: 1px solid var(--border); border-radius: 10px;
+    background: linear-gradient(180deg, rgba(109,75,255,.04), rgba(229,62,111,.03));
+    box-shadow: 0 2px 8px rgba(15,23,42,.05);
+    overflow: hidden;
+    font-family: "Cascadia Code", "Consolas", monospace;
+  }
+  .bubble .tool-call-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px;
+    background: linear-gradient(90deg, rgba(109,75,255,.1), rgba(229,62,111,.08));
+    border-bottom: 1px solid var(--border);
+    font-size: 11px; font-weight: 700; color: var(--accent1);
+    text-transform: uppercase; letter-spacing: 1px;
+  }
+  .bubble .tool-call-header svg { width: 13px; height: 13px; flex: 0 0 auto; }
+  .bubble .tool-call-header .tc-status-pill {
+    margin-left: auto; padding: 2px 8px;
+    font-size: 10px; font-weight: 600; text-transform: none; letter-spacing: 0;
+    color: #fff; background: var(--accent3);
+    border-radius: 10px; display: inline-flex; align-items: center; gap: 4px;
+  }
+  .bubble .tool-call-header .tc-status-pill::before {
+    content: ''; width: 6px; height: 6px; border-radius: 50%;
+    background: #fff; animation: tcPulse 1.2s ease-in-out infinite;
+  }
+  .bubble .tool-call-header .tc-status-pill.sending { background: #ffb454; }
+  .bubble .tool-call-header .tc-status-pill.done { background: var(--accent2); }
+  .bubble .tool-call-header .tc-status-pill.done::before { animation: none; }
+  @keyframes tcPulse { 50% { opacity: .35; } }
+  .bubble .tool-call-body { padding: 10px 12px; }
+  .bubble .tool-call-name {
+    font-size: 13px; font-weight: 600; color: var(--text);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .bubble .tool-call-name::before {
+    content: '▶'; color: var(--accent1); font-size: 10px;
+  }
+  .bubble .tool-call-args-label {
+    margin-top: 8px; font-size: 10px; color: var(--dim);
+    text-transform: uppercase; letter-spacing: 1px;
+  }
+  .bubble .tool-call-args {
+    margin-top: 4px; padding: 8px 10px;
+    background: rgba(15,23,42,.06); border: 1px solid var(--border);
+    border-radius: 6px; font-size: 12px;
+    color: var(--text); white-space: pre-wrap; word-break: break-word;
+    position: relative;
+  }
+  .bubble .tool-call-args::before {
+    content: '{ }'; position: absolute; top: 4px; right: 6px;
+    font-size: 9px; color: var(--dim); opacity: .5;
+  }
+  .bubble .tool-call-arg { margin: 1px 0; }
+  .bubble .tool-call-arg-key { color: var(--accent1); }
+  .bubble .tool-call-arg-val { color: var(--accent2); }
+  .bubble .tool-call-arg-empty {
+    color: var(--dim); font-style: italic; font-size: 11px;
+  }
+  .bubble .tool-response-input {
+    display: flex; gap: 6px; margin-top: 8px;
+  }
+  .bubble .tool-response-input textarea {
+    flex: 1; min-height: 36px; max-height: 100px; padding: 6px 8px;
+    font: inherit; font-size: 12px; resize: vertical;
+    border: 1px solid var(--border); border-radius: 5px;
+    background: rgba(255,255,255,.85); color: var(--text); outline: none;
+    transition: border-color .15s;
+  }
+  .bubble .tool-response-input textarea:focus { border-color: var(--accent1); }
+  .bubble .tool-response-input button {
+    flex: 0 0 auto; height: 28px; padding: 0 14px;
+    font-size: 12px; font-weight: 600; color: #fff;
+    background: linear-gradient(135deg, var(--accent1), var(--accent2));
+    border: none; border-radius: 5px; cursor: pointer;
+    align-self: flex-end; transition: filter .15s;
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+  .bubble .tool-response-input button:hover { filter: brightness(1.1); }
+  .bubble .tool-response-input button:disabled {
+    opacity: .5; cursor: not-allowed;
+  }
+  .bubble .tool-response-input button svg { width: 11px; height: 11px; }
+  .bubble .tool-call-status {
+    margin-top: 6px; font-size: 11px; color: var(--dim);
+    display: flex; align-items: center; gap: 5px;
+  }
+  .bubble .tool-call-status.done { color: var(--accent2); }
+  .bubble .tool-call-status .tc-spinner {
+    width: 10px; height: 10px; border: 1.5px solid var(--dim);
+    border-top-color: transparent; border-radius: 50%;
+    animation: tcSpin .8s linear infinite; display: none;
+  }
+  .bubble .tool-call-status.active .tc-spinner { display: inline-block; }
+  .bubble .tool-call-status.done .tc-spinner { display: none; }
+  @keyframes tcSpin { to { transform: rotate(360deg); } }
+
+  /* === Composer toolbar (thinking + DSpark, above composer) === */
+  #composer-toolbar {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+    padding: 6px 16px; border-top: 1px solid var(--border);
+  }
+  #composer-toolbar .spacer { flex: 1; }
+
+  /* === Global progress bar (above composer-toolbar: vision + prefill) === */
+  #prefill-progress {
+    flex: 0 0 auto; padding: 6px 16px; background: transparent;
+  }
+  #prefill-progress[hidden] { display: none; }
+  .prefill-progress-label {
+    font-size: 11px; color: var(--dim); margin-bottom: 4px;
+  }
+  .prefill-progress-bar {
+    height: 3px; background: rgba(15,23,42,.08);
+    border-radius: 2px; overflow: hidden;
+  }
+  .prefill-progress-fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--accent2), #5cf0ff);
+    transition: width .2s ease; border-radius: 2px;
+  }
+  .prefill-progress-fill.vision {
+    background: linear-gradient(90deg, #7c5cff, #a78bfa);
+  }
+
+  /* === Main chat area === */
+  #main {
+    flex: 1 1 auto; display: flex; flex-direction: column;
+    min-width: 0; padding: 16px 18px 14px;
+  }
+  .main-topbar {
+    display: none; flex: 0 0 auto; align-items: center; gap: 10px;
+    padding: 0 0 10px;
+  }
+  #sidebar-toggle {
+    width: 34px; height: 34px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--panel); color: var(--text); cursor: pointer;
+    display: grid; place-items: center; padding: 0;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  }
+  #sidebar-toggle svg { width: 16px; height: 16px; }
+  #sidebar-toggle:hover { border-color: var(--accent1); color: var(--accent1); }
+
   #chat {
-    flex: 1 1 auto; overflow-y: auto; padding: 18px 14px;
+    flex: 1 1 auto; overflow-y: auto; padding: 18px 16px;
     display: flex; flex-direction: column; gap: 14px;
     background: var(--panel); border: 1px solid var(--border);
-    border-radius: 20px;
+    border-radius: 18px;
     backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-    box-shadow: 0 18px 60px rgba(0,0,0,.45);
+    box-shadow: 0 18px 60px rgba(15,23,42,.12);
   }
   #chat::-webkit-scrollbar { width: 8px; }
-  #chat::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 4px; }
+  #chat::-webkit-scrollbar-thumb { background: rgba(15,23,42,.15); border-radius: 4px; }
 
   .msg { display: flex; animation: pop .35s cubic-bezier(.2,1.4,.4,1); }
   @keyframes pop { from { opacity: 0; transform: translateY(14px) scale(.97); } }
   .msg.user { justify-content: flex-end; }
   .bubble {
-    max-width: 78%; padding: 12px 16px; border-radius: 18px;
+    max-width: 78%; padding: 12px 16px; border-radius: 16px;
     font-size: 14.5px; line-height: 1.75;
     white-space: pre-wrap; word-break: break-word;
   }
   .msg.user .bubble {
     color: #fff;
     background: linear-gradient(135deg, #6a4dff, #8f5cff);
-    border-bottom-right-radius: 6px;
+    border-bottom-right-radius: 5px;
     box-shadow: 0 6px 22px rgba(124,92,255,.35);
   }
   .msg.bot .bubble {
     color: var(--text);
-    background: rgba(255,255,255,.06);
+    background: var(--panel);
     border: 1px solid var(--border);
-    border-bottom-left-radius: 6px;
+    border-bottom-left-radius: 5px;
   }
   .avatar {
     flex: 0 0 auto; width: 34px; height: 34px; margin: 2px 10px 0 0;
@@ -113,13 +589,108 @@
     background: var(--accent2);
     animation: blink .8s steps(1) infinite;
   }
+  /* DSpark 乐观显示: drafter 预测的文本 (灰色), verify 通过后转黑 */
+  .bubble .draft-text {
+    color: rgba(15,23,42,.4);
+    transition: color 0.3s;
+  }
+  /* Inference metrics: TTFT + ms/tok, shown at end of bubble */
+  .bubble .metrics {
+    display: block; margin-top: 8px; padding-top: 6px;
+    font-size: 11.5px; color: var(--dim); font-style: normal;
+    border-top: 1px solid var(--border); user-select: none;
+  }
+  /* Progress bar: shown at top of bubble (vision purple / prefill cyan) */
+  .bubble .progress-wrap {
+    display: block; margin-bottom: 10px; padding: 6px 10px;
+    border-radius: 8px; background: rgba(15,23,42,.04);
+    border: 1px solid var(--border);
+  }
+  .bubble .progress-label {
+    display: block; font-size: 11.5px; color: var(--dim);
+    margin-bottom: 4px; font-style: normal;
+  }
+  .bubble .progress-bar {
+    display: block; height: 4px; border-radius: 2px;
+    background: rgba(15,23,42,.08); overflow: hidden;
+  }
+  .bubble .progress-fill {
+    display: block; height: 100%; width: 0%;
+    border-radius: 2px; transition: width .2s ease;
+  }
+  .bubble .progress-fill.vision { background: linear-gradient(90deg, #7c5cff, #a78bfa); }
+  .bubble .progress-fill.prefill { background: linear-gradient(90deg, #00e0c6, #5cf0ff); }
   @keyframes blink { 50% { opacity: 0; } }
 
-  #composer { flex: 0 0 auto; display: flex; gap: 10px; margin-top: 14px; }
+  /* Image attachment preview */
+  #attach-bar {
+    display: none; flex-wrap: wrap; gap: 8px; margin-bottom: 8px;
+    padding: 8px; border-radius: 12px; background: rgba(15,23,42,.04);
+    border: 1px solid var(--border);
+  }
+  #attach-bar.active { display: flex; }
+  .attach-thumb {
+    position: relative; width: 64px; height: 64px; border-radius: 8px; overflow: hidden;
+    border: 1px solid var(--border); background: var(--panel);
+  }
+  .attach-thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .attach-thumb .remove {
+    position: absolute; top: 2px; right: 2px; width: 18px; height: 18px;
+    border-radius: 50%; background: rgba(0,0,0,.7); color: #fff;
+    border: none; cursor: pointer; font-size: 11px; line-height: 18px;
+    text-align: center; padding: 0;
+  }
+  #attach-btn {
+    width: 44px; height: 50px; border: 1px solid var(--border); border-radius: 25px;
+    background: var(--panel); color: var(--text); cursor: pointer;
+    display: grid; place-items: center; transition: filter .15s, border-color .15s, color .15s;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); flex: 0 0 auto;
+  }
+  #attach-btn:hover { filter: brightness(1.2); border-color: var(--accent2); color: var(--accent2); }
+  #attach-btn:disabled { opacity: .4; cursor: not-allowed; }
+  #attach-btn svg { width: 20px; height: 20px; }
+  #attach-input { display: none; }
+
+  /* Markdown 渲染样式 */
+  .bubble pre {
+    background: #0d0d18; padding: 12px 14px; border-radius: 10px;
+    overflow-x: auto; margin: 8px 0; font-size: 13px; line-height: 1.6;
+    font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
+    border: 1px solid var(--border);
+  }
+  .bubble pre code { color: #c8e6c9; background: none; padding: 0; font-size: inherit; }
+  .bubble code.inline-code {
+    background: rgba(15,23,42,.08); padding: 1px 6px; border-radius: 5px;
+    font-family: "Cascadia Code", "Consolas", monospace; font-size: 13px;
+    color: #ffb454;
+  }
+  .bubble h1, .bubble h2, .bubble h3 { margin: 10px 0 6px; line-height: 1.3; }
+  .bubble h1 { font-size: 20px; }
+  .bubble h2 { font-size: 18px; }
+  .bubble h3 { font-size: 16px; }
+  .bubble h4, .bubble h5, .bubble h6 { font-size: 15px; margin: 8px 0 4px; }
+  .bubble p { margin: 6px 0; }
+  .bubble ul, .bubble ol { margin: 6px 0; padding-left: 22px; }
+  .bubble li { margin: 3px 0; }
+  .bubble a { color: var(--accent2); text-decoration: none; border-bottom: 1px solid rgba(0,224,198,.4); }
+  .bubble a:hover { border-bottom-color: var(--accent2); }
+  .bubble blockquote {
+    margin: 6px 0; padding: 4px 12px; border-left: 3px solid var(--accent1);
+    color: var(--dim); background: rgba(124,92,255,.08); border-radius: 0 8px 8px 0;
+  }
+  .bubble hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+  .bubble table { border-collapse: collapse; margin: 8px 0; font-size: 13.5px; display: block; overflow-x: auto; }
+  .bubble th, .bubble td { border: 1px solid var(--border); padding: 5px 10px; text-align: left; }
+  .bubble th { background: rgba(15,23,42,.05); font-weight: 600; }
+  .bubble strong { color: inherit; font-weight: 600; }
+  .bubble em { font-style: italic; }
+
+  #composer { flex: 0 0 auto; display: flex; gap: 10px; margin-top: 12px; align-items: flex-end; }
+
   #input {
     flex: 1; resize: none; height: 50px; max-height: 160px;
-    padding: 14px 18px; font: inherit; font-size: 14.5px; color: var(--text);
-    background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+    padding: 14px 20px; font: inherit; font-size: 14.5px; color: var(--text);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 25px;
     outline: none; transition: border-color .2s, box-shadow .2s;
     backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
   }
@@ -128,32 +699,163 @@
     box-shadow: 0 0 0 3px rgba(124,92,255,.18);
   }
   #send {
-    width: 52px; height: 50px; border: none; border-radius: 16px; cursor: pointer;
+    width: 50px; height: 50px; border: none; border-radius: 25px; cursor: pointer;
     display: grid; place-items: center; color: #fff;
     background: linear-gradient(135deg, var(--accent1), var(--accent3));
     box-shadow: 0 6px 20px rgba(255,92,138,.3);
     transition: transform .15s, filter .15s;
+    flex: 0 0 auto;
   }
   #send:hover:not(:disabled) { transform: translateY(-2px); filter: brightness(1.12); }
   #send:active:not(:disabled) { transform: translateY(0); }
   #send:disabled { filter: grayscale(.7); opacity: .5; cursor: not-allowed; }
   #send svg { width: 22px; height: 22px; }
+
+  /* === Thinking content styles === */
+  .bubble .think-block {
+    margin: 6px 0 10px; padding: 10px 14px; border-left: 3px solid var(--accent1);
+    background: rgba(15,23,42,.06); border: 1px solid var(--border); border-radius: 0 8px 8px 0;
+    color: var(--dim); font-size: 13px; line-height: 1.6; font-style: italic;
+    position: relative; overflow: hidden;
+    cursor: pointer; transition: max-height .2s ease;
+  }
+  .bubble .think-block::before {
+    content: "Thinking"; display: inline-block; margin-right: 8px;
+    font-size: 10.5px; font-weight: 700; font-style: normal; letter-spacing: 1px;
+    color: var(--accent1); text-transform: uppercase;
+    padding: 2px 7px; background: rgba(109,75,255,.15); border-radius: 4px;
+  }
+  .bubble .think-block.collapsed { max-height: 36px; }
+  .bubble .think-block.collapsed::after {
+    content: " · 点击展开"; font-size: 11px; color: var(--dim); font-style: normal;
+  }
+  .bubble .think-block:not(.collapsed)::after {
+    content: " · 点击折叠"; font-size: 11px; color: var(--dim); font-style: normal;
+  }
+  .bubble .think-block .think-content {
+    margin-top: 4px; white-space: pre-wrap; word-break: break-word;
+    display: block;
+  }
+  .bubble .think-block.collapsed .think-content { display: none; }
+
+  /* === Mobile responsive: sidebar off-canvas === */
+  @media (max-width: 768px) {
+    #sidebar {
+      position: fixed; top: 0; left: 0; bottom: 0; z-index: 100;
+      transform: translateX(-100%);
+      box-shadow: 0 0 40px rgba(15,23,42,.3);
+    }
+    #sidebar.open { transform: translateX(0); }
+    .main-topbar { display: flex; }
+    #main { padding: 12px 12px 10px; }
+    .bubble { max-width: 88%; }
+    #chat { padding: 14px 10px; border-radius: 14px; }
+  }
 </style>
 </head>
 <body>
   <div class="aurora"><div class="a1"></div><div class="a2"></div><div class="a3"></div></div>
   <div id="app">
-    <header>
-      <div class="logo">DAIZA</div>
-      <div id="status"><span class="dot warn" id="dot"></span><span id="statusText">连接中…</span></div>
-    </header>
-    <div id="chat"></div>
-    <div id="composer">
-      <textarea id="input" placeholder="输入消息,Enter 发送 (Shift+Enter 换行)"></textarea>
-      <button id="send" title="发送">
-        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3.4 20.6l17.4-7.5c.8-.35.8-1.45 0-1.8L3.4 3.8c-.66-.29-1.4.2-1.4.9v4.6c0 .5.36.93.86 1.02L16.8 12 2.86 13.68c-.5.09-.86.52-.86 1.02v4.6c0 .7.74 1.19 1.4.9z"/></svg>
-      </button>
-    </div>
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">DAIZA</div>
+      </div>
+      <div class="sessions-section">
+        <div class="sessions-header">
+          <span class="sessions-label">Chats</span>
+          <button id="session-new" title="New Chat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+        </div>
+        <div id="session-select"></div>
+      </div>
+      <div class="sidebar-footer">
+        <div id="settings-panel">
+          <label>temperature<input type="number" id="param-temp" step="0.1" min="0" max="2"></label>
+          <label>top_k<input type="number" id="param-topk" step="1" min="0" max="100"></label>
+          <label>top_p<input type="number" id="param-topp" step="0.05" min="0" max="1"></label>
+          <label>max_tokens<input type="number" id="param-maxtok" step="256" min="1" max="65536"></label>
+          <button id="param-greedy" title="Greedy decoding (temperature=0)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+            <span>Greedy</span>
+          </button>
+        </div>
+        <div class="footer-row">
+          <button id="settings-toggle" title="Settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+          <div id="status"><span class="dot warn" id="dot"></span><span id="statusText">Connecting…</span></div>
+        </div>
+      </div>
+      <button id="session-del" title="Delete" hidden></button>
+    </aside>
+    <main id="main">
+      <div class="main-topbar">
+        <button id="sidebar-toggle" title="Toggle sidebar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+        </button>
+      </div>
+      <div id="chat"></div>
+      <div id="prefill-progress" hidden>
+        <div class="prefill-progress-label"></div>
+        <div class="prefill-progress-bar"><div class="prefill-progress-fill"></div></div>
+      </div>
+      <div id="composer-toolbar">
+        <label class="switch-row" title="Thinking mode">
+          <input type="checkbox" id="param-think" checked>
+          <svg class="ico-brain" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg>
+        </label>
+        <div class="dspark-mode-row" id="dspark-toggle" title="DSpark speculative decoding (toggling resets session)" style="display:none;opacity:0.4">
+          <span class="mode-label">DSpark</span>
+          <div class="mode-btns">
+            <button type="button" id="dspark-off" class="mode-btn active" disabled>Off</button>
+            <button type="button" id="dspark-auto" class="mode-btn" disabled>Auto</button>
+            <button type="button" id="dspark-force" class="mode-btn" disabled>Force</button>
+          </div>
+        </div>
+        <button id="tools-toggle" class="switch-row" title="Tool calling" type="button" style="position:relative">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+          </svg>
+          <span id="tools-badge" class="tools-badge" style="display:none">0</span>
+        </button>
+        <div class="spacer"></div>
+      </div>
+      <div id="tools-panel" hidden>
+        <div class="tools-panel-header">
+          <span class="tools-panel-title">Tools</span>
+          <button type="button" id="tool-add-btn" class="tool-add-btn">+ Add</button>
+        </div>
+        <div id="tools-list"></div>
+        <div id="tool-editor" hidden>
+          <div class="tool-editor-row">
+            <input id="tool-name" placeholder="function name" class="tool-input">
+            <input id="tool-desc" placeholder="description" class="tool-input">
+          </div>
+          <div class="tool-params-header">
+            <span>Parameters</span>
+            <button type="button" id="tool-param-add" class="tool-param-add">+ Param</button>
+          </div>
+          <div id="tool-params"></div>
+          <div class="tool-editor-actions">
+            <button type="button" id="tool-save" class="tool-btn-primary">Save</button>
+            <button type="button" id="tool-cancel" class="tool-btn-secondary">Cancel</button>
+          </div>
+        </div>
+      </div>
+      <div id="attach-bar"></div>
+      <div id="composer">
+        <input id="attach-input" type="file" accept="image/*" multiple>
+        <button id="attach-btn" title="Add image" style="display:none">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        </button>
+        <textarea id="input" placeholder="Type a message, Enter to send (Shift+Enter for newline)"></textarea>
+        <button id="send" title="Send">
+          <svg class="icon-send" viewBox="0 0 24 24" fill="currentColor"><path d="M3.4 20.6l17.4-7.5c.8-.35.8-1.45 0-1.8L3.4 3.8c-.66-.29-1.4.2-1.4.9v4.6c0 .5.36.93.86 1.02L16.8 12 2.86 13.68c-.5.09-.86.52-.86 1.02v4.6c0 .7.74 1.19 1.4.9z"/></svg>
+          <svg class="icon-stop" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+      </div>
+    </main>
   </div>
 <script>
 const chat = document.getElementById('chat');
@@ -161,9 +863,514 @@ const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const dot = document.getElementById('dot');
 const statusText = document.getElementById('statusText');
+// ★ 事件委托: chat 容器内所有 .think-block 响应 click 切换折叠
+//   覆盖流式渲染 (innerHTML 重建) 和最终渲染两种场景, 避免重复绑定
+chat.addEventListener('click', (e) => {
+  const block = e.target.closest('.think-block');
+  if (block) block.classList.toggle('collapsed');
+});
+const iconSend = sendBtn.querySelector('.icon-send');
+const iconStop = sendBtn.querySelector('.icon-stop');
+const sessionSelect = document.getElementById('session-select');
+const sessionNewBtn = document.getElementById('session-new');
+const sessionDelBtn = document.getElementById('session-del');
+const attachBtn = document.getElementById('attach-btn');
+const attachInput = document.getElementById('attach-input');
+const attachBar = document.getElementById('attach-bar');
+// IS_TAURI: enable IPC mode only under Tauri app origin (tauri:// or https://tauri.localhost)
+// After navigating to http://127.0.0.1:8787, __TAURI__ still exists but IPC is unavailable, must use browser mode
+const IS_TAURI = !!window.__TAURI__ && (
+  location.protocol === 'tauri:' ||
+  location.hostname === 'tauri.localhost'
+);
 let busy = false;
+let abortController = null; // browser mode abort (Tauri mode uses abort_chat command)
+// pending image attachments: [{file, dataUrl, uploadedPath}]
+let pendingAttachments = [];
+// currently active session ID (replaces <select>.value, since session-select is now a div list)
+let activeSessionId = null;
 
-const IS_TAURI = !!window.__TAURI__;
+// === Mobile sidebar collapse ===
+const sidebarToggle = document.getElementById('sidebar-toggle');
+const sidebar = document.getElementById('sidebar');
+sidebarToggle.addEventListener('click', () => {
+  sidebar.classList.toggle('open');
+});
+
+// 图片上传: 文件 → base64 → POST /api/upload → 返回服务器路径
+async function uploadImage(file) {
+  const dataUrl = await new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
+  // dataUrl format: data:image/png;base64,<...>
+  const commaIdx = dataUrl.indexOf(',');
+  const b64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
+  // Browser mode: POST /api/upload; Tauri mode: also goes through /api/upload (daiza-web backend)
+  const r = await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/upload' : '/api/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: file.name, data: b64 }),
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    throw new Error(j.error || ('HTTP ' + r.status));
+  }
+  const j = await r.json();
+  return { dataUrl, path: j.path };
+}
+
+// Render attachment preview bar
+function renderAttachments() {
+  attachBar.innerHTML = '';
+  if (pendingAttachments.length === 0) {
+    attachBar.classList.remove('active');
+    return;
+  }
+  attachBar.classList.add('active');
+  pendingAttachments.forEach((att, idx) => {
+    const div = document.createElement('div');
+    div.className = 'attach-thumb';
+    const img = document.createElement('img');
+    img.src = att.dataUrl;
+    img.alt = att.name || '';
+    div.appendChild(img);
+    const rm = document.createElement('button');
+    rm.className = 'remove';
+    rm.textContent = '×';
+    rm.title = 'Remove';
+    rm.onclick = () => {
+      pendingAttachments.splice(idx, 1);
+      renderAttachments();
+    };
+    div.appendChild(rm);
+    attachBar.appendChild(div);
+  });
+}
+
+// attach button: trigger file picker
+attachBtn.addEventListener('click', () => attachInput.click());
+attachInput.addEventListener('change', async () => {
+  const files = Array.from(attachInput.files || []);
+  attachInput.value = ''; // clear, allow re-selecting the same file
+  if (files.length === 0) return;
+  setStatus('warn', 'Uploading…');
+  try {
+    for (const f of files) {
+      const { dataUrl, path } = await uploadImage(f);
+      pendingAttachments.push({ name: f.name, dataUrl, path });
+    }
+    renderAttachments();
+    setStatus('ok', `Added ${files.length} image(s)`);
+  } catch (e) {
+    setStatus('err', 'Upload failed: ' + e.message);
+  }
+});
+
+// Drag-and-drop upload: drop into composer area
+composer.dragover = false;
+document.getElementById('composer').addEventListener('dragover', e => {
+  e.preventDefault();
+});
+document.getElementById('composer').addEventListener('drop', async e => {
+  e.preventDefault();
+  const files = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('image/'));
+  if (files.length === 0) return;
+  setStatus('warn', 'Uploading…');
+  try {
+    for (const f of files) {
+      const { dataUrl, path } = await uploadImage(f);
+      pendingAttachments.push({ name: f.name, dataUrl, path });
+    }
+    renderAttachments();
+    setStatus('ok', `Added ${files.length} image(s)`);
+  } catch (e) {
+    setStatus('err', 'Upload failed: ' + e.message);
+  }
+});
+
+function abortCurrent() {
+  if (IS_TAURI) {
+    if (invokeChat) invokeChat('abort_chat');
+  } else if (abortController) {
+    abortController.abort();
+  }
+}
+
+// === Multi-session management ===
+function sessionsUrl(path) {
+  return IS_TAURI ? 'http://127.0.0.1:8787' + path : path;
+}
+
+async function loadSessions() {
+  try {
+    const r = await fetch(sessionsUrl('/api/sessions'));
+    if (!r.ok) return;
+    const j = await r.json();
+    const prev = activeSessionId;
+    sessionSelect.innerHTML = '';
+    activeSessionId = null;
+    if (j.sessions.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'session-empty';
+      empty.textContent = 'No sessions';
+      sessionSelect.appendChild(empty);
+      return;
+    }
+    for (const s of j.sessions) {
+      const item = document.createElement('div');
+      item.className = 'session-item' + (s.active ? ' active' : '');
+      item.dataset.id = s.id;
+      const name = document.createElement('span');
+      name.className = 'session-name';
+      name.textContent = s.id;
+      item.appendChild(name);
+      const renameBtn = document.createElement('button');
+      renameBtn.className = 'session-rename-btn';
+      renameBtn.title = 'Rename';
+      renameBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
+      renameBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        startRenameSession(item, s.id);
+      });
+      item.appendChild(renameBtn);
+      const delBtn = document.createElement('button');
+      delBtn.className = 'session-del-btn';
+      delBtn.title = 'Delete';
+      delBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6"/></svg>';
+      delBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteSessionById(s.id);
+      });
+      item.appendChild(delBtn);
+      item.addEventListener('click', () => switchSession(s.id));
+      if (s.active) activeSessionId = s.id;
+      sessionSelect.appendChild(item);
+    }
+    // Preserve selection after switch (if still present)
+    if (prev && j.sessions.some(s => s.id === prev)) {
+      // Server already marked active, no extra action needed here
+    }
+  } catch (e) { /* silent fail, don't break chat */ }
+}
+
+async function switchSession(id) {
+  if (!id || busy) return;
+  if (id === activeSessionId) return;
+  // ★ 切换 session 期间禁用 DSpark 模式按钮 (后端 unpark 恢复 KV/SSM state 时不可冲突)
+  busy = true;
+  setDsparkButtonsDisabled(true);
+  setStatus('warn', 'Switching session…');
+  try {
+    const r = await fetch(sessionsUrl('/api/sessions/switch'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+    if (r.ok) {
+      chat.innerHTML = '';
+      activeSessionId = id;
+      setStatus('ok', 'Switched to ' + id);
+      loadSessions();
+    } else {
+      const j = await r.json().catch(() => ({}));
+      setStatus('err', 'Switch failed: ' + (j.error || r.status));
+      loadSessions();
+    }
+  } catch (e) {
+    setStatus('err', 'Switch failed');
+  } finally {
+    busy = false;
+    setDsparkButtonsDisabled(false);
+  }
+}
+
+async function newSession() {
+  if (busy) return;
+  const id = 'Chat ' + Date.now().toString().slice(-6);
+  setStatus('warn', 'Creating session…');
+  try {
+    const r = await fetch(sessionsUrl('/api/sessions/new'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+    if (r.ok) {
+      chat.innerHTML = '';
+      activeSessionId = id;
+      setStatus('ok', 'Created ' + id);
+      loadSessions();
+    } else {
+      const j = await r.json().catch(() => ({}));
+      setStatus('err', 'Create failed: ' + (j.error || r.status));
+    }
+  } catch (e) {
+    setStatus('err', 'Create failed');
+  }
+}
+
+async function deleteSessionById(id) {
+  if (busy || !id) return;
+  if (!confirm('Delete session "' + id + '"?')) return;
+  setStatus('warn', 'Deleting…');
+  try {
+    const r = await fetch(sessionsUrl('/api/sessions/delete'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+    if (r.ok) {
+      if (id === activeSessionId) {
+        chat.innerHTML = '';
+        activeSessionId = null;
+      }
+      setStatus('ok', 'Deleted ' + id);
+      loadSessions();
+    } else {
+      const j = await r.json().catch(() => ({}));
+      setStatus('err', 'Delete failed: ' + (j.error || r.status));
+      loadSessions();
+    }
+  } catch (e) {
+    setStatus('err', 'Delete failed');
+  }
+}
+
+// Backward compat: session-del button deletes currently active session
+async function deleteSession() {
+  if (activeSessionId) await deleteSessionById(activeSessionId);
+}
+
+// 启动内联重命名: 把 .session-name 替换为 input, Enter 提交 / Esc 取消 / blur 提交
+function startRenameSession(item, oldId) {
+  if (item.querySelector('.session-rename-input')) return; // 已在编辑中
+  const nameSpan = item.querySelector('.session-name');
+  if (!nameSpan) return;
+  const input = document.createElement('input');
+  input.className = 'session-rename-input';
+  input.value = oldId;
+  input.maxLength = 64;
+  nameSpan.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const commit = async () => {
+    if (done) return;
+    done = true;
+    const newId = input.value.trim();
+    if (!newId || newId === oldId) {
+      // 空或未变: 取消, 恢复 span
+      const span = document.createElement('span');
+      span.className = 'session-name';
+      span.textContent = oldId;
+      input.replaceWith(span);
+      return;
+    }
+    await renameSession(oldId, newId);
+  };
+  const cancel = () => {
+    if (done) return;
+    done = true;
+    const span = document.createElement('span');
+    span.className = 'session-name';
+    span.textContent = oldId;
+    input.replaceWith(span);
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', commit);
+}
+
+async function renameSession(oldId, newId) {
+  setStatus('warn', 'Renaming…');
+  try {
+    const r = await fetch(sessionsUrl('/api/sessions/rename'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: oldId, new_id: newId })
+    });
+    if (r.ok) {
+      if (oldId === activeSessionId) activeSessionId = newId;
+      setStatus('ok', 'Renamed to ' + newId);
+      loadSessions();
+    } else {
+      const j = await r.json().catch(() => ({}));
+      setStatus('err', 'Rename failed: ' + (j.error || r.status));
+      loadSessions(); // 恢复显示原名
+    }
+  } catch (e) {
+    setStatus('err', 'Rename failed');
+    loadSessions();
+  }
+}
+
+sessionNewBtn.addEventListener('click', newSession);
+sessionDelBtn.addEventListener('click', deleteSession);
+loadSessions();
+
+// Minimal Markdown rendering (zero deps, DOM API construction to avoid XSS)
+// Supports: fenced code / heading / hr / blockquote / ul / ol / table / paragraph
+// Inline: `code` / **bold** / *italic* / [link](url)
+function isBlockStart(line) {
+  return /^```/.test(line)
+    || /^#{1,6}\s+/.test(line)
+    || /^(\*\*\*|---|___)\s*$/.test(line)
+    || /^[-*+]\s+/.test(line)
+    || /^\d+\.\s+/.test(line)
+    || line.startsWith('> ');
+}
+
+function renderInline(text, container) {
+  const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) container.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const tok = m[0];
+    if (tok.startsWith('`')) {
+      const code = document.createElement('code');
+      code.className = 'inline-code';
+      code.textContent = tok.slice(1, -1);
+      container.appendChild(code);
+    } else if (tok.startsWith('**')) {
+      const strong = document.createElement('strong');
+      renderInline(tok.slice(2, -2), strong);
+      container.appendChild(strong);
+    } else if (tok.startsWith('*')) {
+      const em = document.createElement('em');
+      renderInline(tok.slice(1, -1), em);
+      container.appendChild(em);
+    } else {
+      const label = tok.slice(1, tok.indexOf(']('));
+      const url = tok.slice(tok.indexOf('](') + 2, -1);
+      const a = document.createElement('a');
+      a.href = url; a.target = '_blank'; a.rel = 'noopener';
+      a.textContent = label;
+      container.appendChild(a);
+    }
+    last = m.index + tok.length;
+  }
+  if (last < text.length) container.appendChild(document.createTextNode(text.slice(last)));
+}
+
+function renderMarkdown(text, container) {
+  container.replaceChildren();
+  const lines = text.split('\n');
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    // fenced code block
+    const fence = line.match(/^```(\w*)/);
+    if (fence) {
+      const lang = fence[1];
+      const code = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith('```')) { code.push(lines[i]); i++; }
+      i++; // skip closing ```
+      const pre = document.createElement('pre');
+      const codeEl = document.createElement('code');
+      if (lang) codeEl.className = 'lang-' + lang;
+      codeEl.textContent = code.join('\n');
+      pre.appendChild(codeEl);
+      container.appendChild(pre);
+      continue;
+    }
+    // heading
+    const h = line.match(/^(#{1,6})\s+(.*)/);
+    if (h) {
+      const el = document.createElement('h' + h[1].length);
+      renderInline(h[2], el);
+      container.appendChild(el);
+      i++;
+      continue;
+    }
+    // hr
+    if (/^(\*\*\*|---|___)\s*$/.test(line)) {
+      container.appendChild(document.createElement('hr'));
+      i++;
+      continue;
+    }
+    // blockquote
+    if (line.startsWith('> ')) {
+      const quote = [];
+      while (i < lines.length && lines[i].startsWith('> ')) { quote.push(lines[i].slice(2)); i++; }
+      const bq = document.createElement('blockquote');
+      const p = document.createElement('p');
+      renderInline(quote.join(' '), p);
+      bq.appendChild(p);
+      container.appendChild(bq);
+      continue;
+    }
+    // unordered list
+    if (/^[-*+]\s+/.test(line)) {
+      const ul = document.createElement('ul');
+      while (i < lines.length && /^[-*+]\s+/.test(lines[i])) {
+        const li = document.createElement('li');
+        renderInline(lines[i].replace(/^[-*+]\s+/, ''), li);
+        ul.appendChild(li);
+        i++;
+      }
+      container.appendChild(ul);
+      continue;
+    }
+    // ordered list
+    if (/^\d+\.\s+/.test(line)) {
+      const ol = document.createElement('ol');
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+        const li = document.createElement('li');
+        renderInline(lines[i].replace(/^\d+\.\s+/, ''), li);
+        ol.appendChild(li);
+        i++;
+      }
+      container.appendChild(ol);
+      continue;
+    }
+    // table (header | separator | rows)
+    if (line.includes('|') && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1])) {
+      const parseRow = l => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim());
+      const header = parseRow(line);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].includes('|')) { rows.push(parseRow(lines[i])); i++; }
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      const htr = document.createElement('tr');
+      for (const hh of header) {
+        const th = document.createElement('th');
+        renderInline(hh, th);
+        htr.appendChild(th);
+      }
+      thead.appendChild(htr); table.appendChild(thead);
+      const tbody = document.createElement('tbody');
+      for (const r of rows) {
+        const tr = document.createElement('tr');
+        for (const c of r) {
+          const td = document.createElement('td');
+          renderInline(c, td);
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      container.appendChild(table);
+      continue;
+    }
+    // empty line
+    if (line.trim() === '') { i++; continue; }
+    // paragraph
+    const para = [];
+    while (i < lines.length && lines[i].trim() !== '' && !isBlockStart(lines[i])) {
+      para.push(lines[i]); i++;
+    }
+    const p = document.createElement('p');
+    renderInline(para.join(' '), p);
+    container.appendChild(p);
+  }
+}
+
 let invokeChat = null, listenChat = null;
 if (IS_TAURI) {
   invokeChat = window.__TAURI__.core.invoke;
@@ -179,18 +1386,367 @@ async function pollStatus() {
   try {
     const r = await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/status' : '/api/status');
     const j = await r.json();
-    if (j.ready) {
-      setStatus('ok', j.model + ' 已就绪');
+    // DSpark mode selector: always shown, disabled when drafter not loaded
+    const dsparkToggle = document.getElementById('dspark-toggle');
+    const modeBtns = ['dspark-off', 'dspark-auto', 'dspark-force'].map(id => document.getElementById(id));
+    if (j.dspark_available) {
+      dsparkToggle.style.display = 'flex';
+      dsparkToggle.style.opacity = '1';
+      dsparkAvailable = true;
+      setDsparkButtonsDisabled(false);
+      // Fetch DSpark state (enabled + fallback) to decide which button is active
+      try {
+        const fr = await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/dspark' : '/api/dspark');
+        const fj = await fr.json();
+        updateDsparkModeButtons(fj.enabled, fj.fallback);
+      } catch (_) {}
     } else {
-      setStatus('warn', '模型加载中… (~13GB, 请稍候)');
+      // 未加载 drafter: 显示但禁用, 默认 Off active
+      dsparkToggle.style.display = 'flex';
+      dsparkToggle.style.opacity = '0.4';
+      dsparkAvailable = false;
+      setDsparkButtonsDisabled(true, false);  // 仅禁用 DSpark 按钮, 不影响 think 开关
+      updateDsparkModeButtons(false, true);
+    }
+    // 上传图片按钮: 未加载 vision 模型时隐藏
+    const attachBtn = document.getElementById('attach-btn');
+    if (j.vision_available) {
+      attachBtn.style.display = '';
+    } else {
+      attachBtn.style.display = 'none';
+    }
+    if (j.ready) {
+      setStatus('ok', j.model + ' Ready');
+    } else {
+      setStatus('warn', 'Model loading… (~13GB)');
       setTimeout(pollStatus, 2000);
     }
   } catch (e) {
-    setStatus('err', '服务器连接失败');
+    setStatus('err', 'Server unreachable');
     setTimeout(pollStatus, 3000);
   }
 }
 pollStatus();
+// 初始化同步 thinking 复选框状态 (复选框已移到 composer-toolbar 始终可见, 需主动同步后端默认值)
+loadParams();
+
+// 根据 enabled + fallback 状态更新三个按钮的 active 类
+function updateDsparkModeButtons(enabled, fallback) {
+  const off = document.getElementById('dspark-off');
+  const auto = document.getElementById('dspark-auto');
+  const force = document.getElementById('dspark-force');
+  off.classList.toggle('active', !enabled);
+  if (enabled) {
+    auto.classList.toggle('active', fallback);
+    force.classList.toggle('active', !fallback);
+  } else {
+    auto.classList.remove('active');
+    force.classList.remove('active');
+  }
+}
+// 临时禁用/恢复 DSpark 模式按钮 (session 切换 / DSpark 切换期间, 防止冲突)
+// 恢复时根据 dsparkAvailable 决定是否启用
+// 同时切换 composer-toolbar 和 session-select 的 busy CSS 类, 提供视觉反馈
+let dsparkAvailable = false;
+function setDsparkButtonsDisabled(disabled, thinkDisabled = disabled) {
+  ['dspark-off', 'dspark-auto', 'dspark-force'].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.disabled = disabled || !dsparkAvailable;
+  });
+  // busy 期间同步禁用 think 开关 (消息回复 / session 切换 / DSpark 切换期间不可切换 think)
+  // 初始化场景 (drafter 不可用) 通过 thinkDisabled=false 跳过, 不影响 think 开关
+  const thinkInput = document.getElementById('param-think');
+  if (thinkInput) thinkInput.disabled = thinkDisabled;
+  // busy 期间弱化 DSpark 区域 + session 列表 (视觉提示不可点击)
+  const toolbar = document.getElementById('composer-toolbar');
+  const sessionSelect = document.getElementById('session-select');
+  if (disabled) {
+    toolbar?.classList.add('busy');
+    sessionSelect?.classList.add('busy');
+  } else {
+    toolbar?.classList.remove('busy');
+    sessionSelect?.classList.remove('busy');
+  }
+}
+
+// DSpark 模式按钮: Off / Auto / Force 互斥
+async function setDsparkMode(mode) {
+  if (busy) return;  // session 切换 / 发送消息期间不允许切换 DSpark
+  // mode: 'off' | 'auto' | 'force'
+  const enabled = mode !== 'off';
+  const fallback = mode === 'auto';  // auto = 允许降级, force = 不降级
+  // ★ 切换期间禁用 DSpark 按钮 + session 切换 (busy), 防止冲突
+  busy = true;
+  setDsparkButtonsDisabled(true);
+  // 乐观更新 UI
+  updateDsparkModeButtons(enabled, fallback);
+  try {
+    const body = { enabled };
+    if (enabled) body.fallback = fallback;
+    await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/dspark' : '/api/dspark', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    // 切换 enabled 后 session 已重置, 清空聊天显示
+    document.getElementById('chat').innerHTML = '';
+    activeSessionId = null;
+    loadSessions();
+  } catch (err) {
+    // 失败回滚: 重新拉取状态
+    try {
+      const fr = await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/dspark' : '/api/dspark');
+      const fj = await fr.json();
+      updateDsparkModeButtons(fj.enabled, fj.fallback);
+    } catch (_) {}
+  } finally {
+    busy = false;
+    setDsparkButtonsDisabled(false);
+  }
+}
+document.getElementById('dspark-off').addEventListener('click', () => {
+  if (!document.getElementById('dspark-off').disabled) setDsparkMode('off');
+});
+document.getElementById('dspark-auto').addEventListener('click', () => {
+  if (!document.getElementById('dspark-auto').disabled) setDsparkMode('auto');
+});
+document.getElementById('dspark-force').addEventListener('click', () => {
+  if (!document.getElementById('dspark-force').disabled) setDsparkMode('force');
+});
+
+// === 参数设置面板 ===
+const settingsToggle = document.getElementById('settings-toggle');
+const settingsPanel = document.getElementById('settings-panel');
+const paramTemp = document.getElementById('param-temp');
+const paramTopk = document.getElementById('param-topk');
+const paramTopp = document.getElementById('param-topp');
+const paramMaxtok = document.getElementById('param-maxtok');
+const paramThink = document.getElementById('param-think');
+const paramGreedy = document.getElementById('param-greedy');
+// 缓存进入 greedy 前的参数, 取消 greedy 时恢复
+let greedySaved = null;
+// 防止 loadParams 回填触发 change 事件循环
+let loadingParams = false;
+
+settingsToggle.addEventListener('click', () => {
+  const open = settingsPanel.classList.toggle('open');
+  settingsToggle.classList.toggle('active', open);
+  if (open) loadParams();
+});
+
+async function loadParams() {
+  try {
+    const r = await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/params' : '/api/params');
+    if (!r.ok) return;
+    const j = await r.json();
+    loadingParams = true;
+    paramTemp.value = j.temperature ?? '';
+    paramTopk.value = j.top_k ?? '';
+    paramTopp.value = j.top_p ?? '';
+    paramMaxtok.value = j.max_tokens ?? '';
+    paramThink.checked = !!j.think;
+    // Greedy 状态: temperature=0 视为 greedy 模式
+    const isGreedy = parseFloat(j.temperature) === 0;
+    paramGreedy.classList.toggle('active', isGreedy);
+    // 加载时清空缓存 (避免取消 greedy 时恢复到加载前的值)
+    greedySaved = null;
+    loadingParams = false;
+  } catch (e) { /* ignore */ }
+  // 同步 DSpark 状态 (从 /api/dspark GET 拉取, 避免 pollStatus 与面板不同步)
+  try {
+    const fr = await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/dspark' : '/api/dspark');
+    if (fr.ok) {
+      const fj = await fr.json();
+      updateDsparkModeButtons(fj.enabled, fj.fallback);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+// 即时上传参数: 改了即生效, 不需要"应用"按钮
+async function postParams(body) {
+  if (loadingParams) return;
+  try {
+    await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/params' : '/api/params', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  } catch (e) { /* ignore */ }
+}
+
+// number inputs: change 事件 (失焦或回车时触发, 避免输入过程中频繁 POST)
+[paramTemp, paramTopk, paramTopp, paramMaxtok].forEach(el => {
+  el.addEventListener('change', () => {
+    const body = {};
+    if (el === paramTemp) {
+      const t = parseFloat(paramTemp.value);
+      if (!isNaN(t)) { body.temperature = t; paramGreedy.classList.toggle('active', t === 0); }
+    } else if (el === paramTopk) {
+      const k = parseInt(paramTopk.value);
+      if (!isNaN(k)) body.top_k = k;
+    } else if (el === paramTopp) {
+      const p = parseFloat(paramTopp.value);
+      if (!isNaN(p)) body.top_p = p;
+    } else if (el === paramMaxtok) {
+      const m = parseInt(paramMaxtok.value);
+      if (!isNaN(m) && m > 0) body.max_tokens = m;
+    }
+    postParams(body);
+  });
+});
+
+// thinking 开关: change 事件即时上传
+paramThink.addEventListener('change', () => {
+  if (busy) return;  // 消息回复期间不允许切换 think
+  postParams({ think: paramThink.checked });
+});
+
+paramGreedy.addEventListener('click', async () => {
+  const active = paramGreedy.classList.toggle('active');
+  let body;
+  if (active) {
+    // 进入 greedy: 保存当前参数, 应用 greedy 参数
+    greedySaved = {
+      temperature: parseFloat(paramTemp.value),
+      top_p: parseFloat(paramTopp.value),
+      top_k: parseInt(paramTopk.value),
+    };
+    loadingParams = true;
+    paramTemp.value = '0';
+    paramTopp.value = '1';
+    paramTopk.value = '0';
+    loadingParams = false;
+    body = { temperature: 0, top_p: 1, top_k: 0 };
+  } else {
+    // 取消 greedy: 恢复之前保存的参数 (无保存则用默认值)
+    const saved = greedySaved || { temperature: 0.7, top_p: 0.95, top_k: 20 };
+    loadingParams = true;
+    paramTemp.value = String(saved.temperature);
+    paramTopp.value = String(saved.top_p);
+    paramTopk.value = String(saved.top_k);
+    loadingParams = false;
+    body = { temperature: saved.temperature, top_p: saved.top_p, top_k: saved.top_k };
+    greedySaved = null;
+  }
+  postParams(body);
+});
+
+// === Thinking 内容渲染 ===
+// 解析 <think>...</think> 块, 返回 [{type:'think', text, closed}, {type:'text', text}, ...]
+// thinking 关闭 (paramThink.checked=false) 时, think 块过滤掉不显示
+// 同时过滤特殊 token 文本 (<|im_start|> / <|im_end|> 等) 和空 think 块
+//
+// ★ think 开启时的流式渲染关键点:
+//   <think> 是 GGUF special token, 只出现在 input prompt 中, 不在模型输出里。
+//   think 模式下 prompt 末尾为 <think>\n, 模型从 think 内容开始生成,
+//   流式过程中输出不含 </think>, 直到 think 结束才输出 </think> + 正式回答。
+//   因此 think 开启且输出不含 </think> 时, 全部内容作为未闭合 think 块 (独立样式显示)。
+function parseThinking(text) {
+  const thinkOn = paramThink ? paramThink.checked : true;
+  // 过滤特殊 token 文本 (Qwen chat template 标记, 不应显示给用户)
+  let cleaned = text.replace(/<\|[^|]+\|>/g, '');
+  // ★ think 关闭时: 模型仍可能自发输出 <think>...</think> 格式 (Bonsai-27B 训练偏好)
+  //   - 已闭合 (含 </think>): 移除 </think> 及之前的内容, 只保留正式回答
+  //   - 未闭合 (只有 <think> 开头): 整个文本都是 think 内容, 返回空 (流式过程中不显示)
+  //   - 无 <think> 开头但有 </think>: 移除 </think> 及之前的内容
+  if (!thinkOn) {
+    const hasOpen = cleaned.includes('<think>');
+    const hasClose = cleaned.includes('</think>');
+    if (hasOpen && hasClose) {
+      const idx = cleaned.indexOf('</think>');
+      cleaned = cleaned.slice(idx + 8);
+    } else if (hasOpen && !hasClose) {
+      cleaned = '';
+    } else if (!hasOpen && hasClose) {
+      const idx = cleaned.indexOf('</think>');
+      cleaned = cleaned.slice(idx + 8);
+    }
+  }
+  // ★ think 开启时: 流式过程中输出不含 </think>, 全部内容视为未闭合 think 块
+  //   (prompt 已预填 <think>\n, 模型从 think 内容开始生成)
+  //   含 </think> 时: 补虚拟 <think> 使其符合正则, 分离 think 块和正式回答
+  let normalized = cleaned;
+  if (thinkOn) {
+    if (!normalized.includes('</think>')) {
+      // 流式中: 全部为 think 内容, 包装为未闭合 think 块
+      if (normalized.trim()) {
+        return [{ type: 'think', text: normalized, closed: false }];
+      }
+      return [];
+    }
+    // 含 </think>: 补虚拟 <think> (若缺少开头), 正则分离 think + 正式回答
+    if (!normalized.includes('<think>')) {
+      normalized = '<think>' + normalized;
+    }
+  }
+  const parts = [];
+  const re = /<think>([\s\S]*?)(<\/think>|$)/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(normalized)) !== null) {
+    if (m.index > last) parts.push({ type: 'text', text: normalized.slice(last, m.index) });
+    // 跳过空 think 块 (无内容或仅空白), 避免占用空间
+    if (thinkOn && m[1].trim()) {
+      parts.push({ type: 'think', text: m[1], closed: m[2] === '</think>' });
+    }
+    last = re.lastIndex;
+  }
+  if (last < normalized.length) parts.push({ type: 'text', text: normalized.slice(last) });
+  return parts;
+}
+
+// 流式渲染: 在 textSpan 内分离 think 块 (简单 textContent, 避免 markdown 重渲染开销)
+// ★ think-block 始终可点击折叠/展开, 流式过程中保持用户的折叠状态
+// ★ 使用 div (块级元素) 而非 span, 确保 margin/padding/max-height 等 CSS 生效
+function renderStreamingText(full, textSpan) {
+  const parts = parseThinking(full);
+  // 收集现有 think-block 的折叠状态 (按索引保持)
+  const prevStates = [];
+  textSpan.querySelectorAll('.think-block').forEach(el => {
+    prevStates.push(el.classList.contains('collapsed'));
+  });
+  let html = '';
+  let thinkIdx = 0;
+  for (const p of parts) {
+    if (p.type === 'think') {
+      // 默认: 流式中 think 块展开 (用户可随时点击折叠)
+      // 若用户之前折叠过该位置的块, 保持折叠状态
+      const userCollapsed = prevStates[thinkIdx] === true;
+      html += `<div class="think-block${userCollapsed ? ' collapsed' : ''}"><div class="think-content">${escapeHtml(p.text)}</div></div>`;
+      thinkIdx++;
+    } else if (p.text) {
+      html += `<span class="text-part">${escapeHtml(p.text)}</span>`;
+    }
+  }
+  textSpan.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// 最终渲染: think 块用 think-block, 其余用 renderMarkdown
+// ★ think-block 默认折叠 (流式结束后收起), 点击可展开
+function renderFinalText(full, bubble) {
+  bubble.textContent = '';
+  const parts = parseThinking(full);
+  for (const p of parts) {
+    if (p.type === 'think') {
+      const block = document.createElement('div');
+      block.className = 'think-block collapsed';
+      const content = document.createElement('div');
+      content.className = 'think-content';
+      content.textContent = p.text;
+      block.appendChild(content);
+      // 点击展开/折叠 (事件委托在 bubble 上统一处理, 避免重复绑定)
+      bubble.appendChild(block);
+    } else if (p.text) {
+      const span = document.createElement('span');
+      renderMarkdown(p.text, span);
+      bubble.appendChild(span);
+    }
+  }
+}
 
 function addMsg(role, text) {
   const wrap = document.createElement('div');
@@ -210,64 +1766,278 @@ function addMsg(role, text) {
 }
 
 function scrollBottom() { chat.scrollTop = chat.scrollHeight; }
+let _scrollRaf = 0;
+function scrollBottomThrottled() {
+  if (_scrollRaf) return;
+  _scrollRaf = requestAnimationFrame(() => { _scrollRaf = 0; chat.scrollTop = chat.scrollHeight; });
+}
 
 async function send() {
   const text = input.value.trim();
-  if (!text || busy) return;
+  // 允许仅有图片无文本发送 (但 bubble 仍需要非空 text 占位)
+  if (busy) return;
+  if (!text && pendingAttachments.length === 0) return;
+  // 取出待发送附件 (send 后清空预览栏)
+  const sendingAttachments = pendingAttachments.slice();
+  pendingAttachments = [];
+  renderAttachments();
+  // 首次 chat (无 session) 完成后需刷新会话列表
+  const needSessionRefresh = !activeSessionId;
   busy = true;
-  sendBtn.disabled = true;
+  setDsparkButtonsDisabled(true);  // 消息回复期间禁用 DSpark + think 开关
+  // 重置全局 prefill 进度条 (上次发送可能残留)
+  const _ppReset = document.getElementById('prefill-progress');
+  if (_ppReset) {
+    _ppReset.hidden = true;
+    _ppReset.querySelector('.prefill-progress-fill').style.width = '0%';
+  }
+  sendBtn.title = 'Stop';
+  iconSend.style.display = 'none';
+  iconStop.style.display = '';
   input.value = '';
   input.style.height = '50px';
-  addMsg('user', text);
+  // 用户气泡: 文本 + 图片缩略图 (如有)
+  const userBubble = addMsg('user', text || '');
+  if (sendingAttachments.length > 0) {
+    const thumbRow = document.createElement('div');
+    thumbRow.style.cssText = 'display:flex;gap:6px;margin-top:8px;flex-wrap:wrap';
+    for (const att of sendingAttachments) {
+      const t = document.createElement('div');
+      t.style.cssText = 'width:56px;height:56px;border-radius:8px;overflow:hidden;border:1px solid rgba(255,255,255,.2)';
+      const img = document.createElement('img');
+      img.src = att.dataUrl;
+      img.style.cssText = 'width:100%;height:100%;object-fit:cover';
+      t.appendChild(img);
+      thumbRow.appendChild(t);
+    }
+    userBubble.appendChild(thumbRow);
+  }
 
   const bubble = addMsg('bot', '');
   bubble.classList.add('thinking');
-  bubble.textContent = '思考中';
+  bubble.textContent = 'Thinking';
   let dots = 0;
   const thinkTimer = setInterval(() => {
     dots = (dots + 1) % 4;
-    if (bubble.classList.contains('thinking')) bubble.textContent = '思考中' + '.'.repeat(dots);
+    if (bubble.classList.contains('thinking')) bubble.textContent = 'Thinking' + '.'.repeat(dots);
   }, 400);
 
   let first = true;
-  const onEvent = (kind, text) => {
-    if (kind === 'delta') {
+  let textSpan = null;
+  let fullText = '';
+  let failed = false;
+  let aborted = false;
+  // DSpark: committedLen = 已确认文本长度 (delta/accept/reject 后更新)
+  // draft 时 fullText = committed + draft, renderStreamingText 解析整个 fullText
+  // draft 部分用灰色标记 (最后一个未确认的 text-part)
+  let committedLen = 0;
+  let draftTextLen = 0;
+  // tool_call: 收到的 tool_call 列表 (done 事件后渲染卡片)
+  let pendingToolCalls = [];
+  // tool_call: 是否有待处理的 tool_call (保持 busy 等待用户回传)
+  let hasToolCall = false;
+  // 推理指标 (done 事件携带)
+  let ttftMs = null, msPerTok = null, nTok = 0;
+  // 进度条: 仅使用全局 #prefill-progress (composer 上方), 不在 bubble 内创建局部进度条
+  // 首次 progress 事件时清理 thinking 状态
+  let progressStarted = false;
+  const ensureProgressUi = () => {
+    if (progressStarted) return;
+    progressStarted = true;
+    clearInterval(thinkTimer);
+    bubble.classList.remove('thinking');
+    bubble.textContent = '';
+  };
+  const onEvent = (kind, payload) => {
+    if (kind === 'progress') {
+      ensureProgressUi();
+      const pp = document.getElementById('prefill-progress');
+      if (!pp) return;
+      const ppLabel = pp.querySelector('.prefill-progress-label');
+      const ppFill = pp.querySelector('.prefill-progress-fill');
+      pp.hidden = false;
+      if (payload.stage === 'vision') {
+        // vision 阶段 (图片处理): preprocess → ViT encode → project
+        const idx = (payload.image_idx || 0) + 1;
+        const tot = payload.total || 1;
+        const phases = { preprocess: 'preprocess', encode: 'ViT encode', project: 'project' };
+        const phLabel = phases[payload.phase] || payload.phase;
+        if (ppLabel) ppLabel.textContent = `Vision · Image ${idx}/${tot} · ${phLabel}`;
+        // vision 阶段进度: (idx-1)/tot + phase 权重 (每图 3 阶段)
+        const phaseWeight = { preprocess: 0, encode: 0.6, project: 0.4 }[payload.phase] || 0;
+        const pct = ((idx - 1) + phaseWeight) / tot * 100;
+        if (ppFill) { ppFill.classList.add('vision'); ppFill.style.width = pct.toFixed(1) + '%'; }
+      } else if (payload.stage === 'prefill') {
+        // prefill 阶段 (token 前向传播填充 KV cache, vision 完成后执行)
+        const done = payload.done || 0;
+        const total = payload.total || 1;
+        const pct = Math.min(100, done / total * 100);
+        if (ppLabel) ppLabel.textContent = `Prefill ${done}/${total} tokens`;
+        if (ppFill) { ppFill.classList.remove('vision'); ppFill.style.width = pct.toFixed(1) + '%'; }
+      }
+      scrollBottomThrottled();
+    } else if (kind === 'loading') {
+      // 首次请求时懒加载权重, 显示提示
       if (first) {
         clearInterval(thinkTimer);
         bubble.classList.remove('thinking');
         bubble.textContent = '';
+        const loadEl = document.createElement('span');
+        loadEl.className = 'loading-hint';
+        loadEl.textContent = 'Loading model weights…';
+        bubble.appendChild(loadEl);
+      }
+    } else if (kind === 'delta') {
+      // 首个 delta: 隐藏全局 prefill 进度条 (prefill 结束, 进入 decode)
+      const pp = document.getElementById('prefill-progress');
+      if (pp) {
+        pp.hidden = true;
+        pp.querySelector('.prefill-progress-fill').style.width = '0%';
+      }
+      // 正常增量 (标准模式 / DSpark bonus / fallback)
+      if (first) {
+        clearInterval(thinkTimer);
+        bubble.classList.remove('thinking');
+        bubble.textContent = '';
+        textSpan = document.createElement('span');
         const cur = document.createElement('span');
         cur.className = 'cursor';
+        bubble.appendChild(textSpan);
         bubble.appendChild(cur);
         first = false;
       }
-      bubble.firstChild
-        ? bubble.insertBefore(document.createTextNode(text), bubble.lastChild)
-        : bubble.textContent += text;
-      scrollBottom();
+      // DSpark: delta 前 commit draft (灰色转黑), 避免混色
+      // ★ delta 是已确认文本, 走 renderStreamingText 解析 think 块
+      // ★ stripToolCallText: 过滤 <tool_call> 原始标签 (由卡片渲染, 不显示在文本气泡)
+      draftTextLen = 0;
+      fullText += payload.text || payload || '';
+      committedLen = fullText.length;
+      if (textSpan) renderStreamingText(stripToolCallText(fullText), textSpan);
+      scrollBottomThrottled();
+    } else if (kind === 'draft') {
+      // DSpark 乐观显示: drafter 预测的文本, 灰色显示
+      // 首个 draft 也表示 prefill 结束: 隐藏全局 prefill 进度条
+      const pp = document.getElementById('prefill-progress');
+      if (pp) {
+        pp.hidden = true;
+        pp.querySelector('.prefill-progress-fill').style.width = '0%';
+      }
+      if (first) {
+        clearInterval(thinkTimer);
+        bubble.classList.remove('thinking');
+        bubble.textContent = '';
+        textSpan = document.createElement('span');
+        const cur = document.createElement('span');
+        cur.className = 'cursor';
+        bubble.appendChild(textSpan);
+        bubble.appendChild(cur);
+        first = false;
+      }
+      // 上一个 draft 未配对 (全 accept 后无 reject): fullText 已包含其文本, committedLen 同步
+      if (committedLen < fullText.length) {
+        committedLen = fullText.length;
+      }
+      const dt = payload.text || '';
+      fullText += dt;
+      draftTextLen = dt.length;
+      // ★ draft 也走 renderStreamingText: 解析 think 块, 过滤 think 内容
+      //   避免模型自发生成的 <think>...</think> 作为纯文本显示给用户
+      // ★ stripToolCallText: 同 delta, 过滤 <tool_call> 原始标签
+      if (textSpan) renderStreamingText(stripToolCallText(fullText), textSpan);
+      scrollBottomThrottled();
+    } else if (kind === 'accept') {
+      // DSpark: draft 全部通过 verify, fullText 已包含 draft 文本, 标记为已确认
+      draftTextLen = 0;
+      committedLen = fullText.length;
+      if (textSpan) renderStreamingText(stripToolCallText(fullText), textSpan);
+    } else if (kind === 'reject') {
+      // DSpark: 部分 reject, 截断 draft, 用 accepted 替换
+      if (draftTextLen > 0) {
+        fullText = fullText.slice(0, -draftTextLen);
+        draftTextLen = 0;
+      }
+      const accepted = payload.accepted || '';
+      fullText += accepted;
+      committedLen = fullText.length;
+      // ★ reject 后用 renderStreamingText 统一渲染 (解析 think 块)
+      if (textSpan) renderStreamingText(stripToolCallText(fullText), textSpan);
+      scrollBottomThrottled();
+    } else if (kind === 'tool_call') {
+      // tool_call 事件: 累积到 pendingToolCalls (done 事件后统一渲染卡片)
+      const tc = payload.tool_call;
+      if (tc && tc.name) pendingToolCalls.push(tc);
     } else if (kind === 'done') {
-      if (text) setStatus('ok', text);
+      if (typeof payload.ttft_ms === 'number') ttftMs = payload.ttft_ms;
+      if (typeof payload.ms_per_tok === 'number') msPerTok = payload.ms_per_tok;
+      if (typeof payload.n_tokens === 'number') nTok = payload.n_tokens;
+      if (payload.stats) setStatus('ok', payload.stats);
+      // 隐藏全局 prefill 进度条 (保险起见)
+      const pp = document.getElementById('prefill-progress');
+      if (pp) {
+        pp.hidden = true;
+        pp.querySelector('.prefill-progress-fill').style.width = '0%';
+      }
+      // 若 decode 生成 0 个 token (模型立即 EOS), 显示提示避免空 bubble
+      if (first && nTok === 0 && pendingToolCalls.length === 0) {
+        clearInterval(thinkTimer);
+        bubble.classList.remove('thinking');
+        bubble.textContent = '(no output)';
+      }
+      // ★ tool_call 处理: 标记 hasToolCall, 卡片在最终渲染后统一渲染
+      //   (renderFinalText 会清空 bubble, 若在此处渲染卡片会被清掉)
+      if (pendingToolCalls.length > 0) {
+        hasToolCall = true;
+        clearInterval(thinkTimer);
+        bubble.classList.remove('thinking');
+        // 移除 cursor
+        const cur = bubble.querySelector('.cursor');
+        if (cur) cur.remove();
+        // pendingToolCalls 保留给最终渲染阶段使用
+      }
+    } else if (kind === 'aborted') {
+      aborted = true;
+      // 隐藏全局 prefill 进度条 (保险起见)
+      const pp = document.getElementById('prefill-progress');
+      if (pp) {
+        pp.hidden = true;
+        pp.querySelector('.prefill-progress-fill').style.width = '0%';
+      }
     } else if (kind === 'error') {
-      failErr = new Error(text || 'unknown error');
+      failErr = new Error((payload.text || payload) || 'unknown error');
+      // 隐藏全局 prefill 进度条 (保险起见)
+      const pp = document.getElementById('prefill-progress');
+      if (pp) {
+        pp.hidden = true;
+        pp.querySelector('.prefill-progress-fill').style.width = '0%';
+      }
     }
   };
   let failErr = null;
+  abortController = IS_TAURI ? null : new AbortController();
   try {
     if (IS_TAURI) {
       // Tauri 模式: 事件经 Rust 侧 ureq 流式转发 (避开 WebView2 mixed-content 拦截)
-      const un = await listenChat('chat', e => onEvent(e.payload.kind, e.payload.text));
+      // Tauri 传原始 JSON data 字符串, 这里 parse 成对象 (与浏览器模式一致)
+      const un = await listenChat('chat', e => {
+        let p = {};
+        try { p = JSON.parse(e.payload.data || '{}'); } catch (_) {}
+        onEvent(e.payload.kind, p);
+      });
       try {
-        await invokeChat('chat_send', { message: text });
+        const imagePaths = sendingAttachments.map(a => a.path).filter(Boolean);
+        await invokeChat('chat_send', { message: text || ' ', images: imagePaths });
       } finally {
         un();
       }
       if (failErr) throw failErr;
     } else {
       // 浏览器模式: fetch + ReadableStream 直读 SSE
+      const imagePaths = sendingAttachments.map(a => a.path).filter(Boolean);
       const resp = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text })
+        body: JSON.stringify({ message: text || ' ', images: imagePaths }),
+        signal: abortController.signal
       });
       if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
       const reader = resp.body.getReader();
@@ -291,37 +2061,543 @@ async function send() {
           let payload;
           try { payload = JSON.parse(data); } catch (e) { continue; }
           if (ev === 'error') {
-            onEvent('error', payload.error || 'unknown error');
+            onEvent('error', { text: payload.error || 'unknown error' });
             if (failErr) throw failErr;
           } else {
-            onEvent(ev, payload.text || payload.stats || '');
+            onEvent(ev, payload);
           }
         }
       }
     }
   } catch (e) {
-    clearInterval(thinkTimer);
-    bubble.classList.remove('thinking');
-    bubble.textContent = '出错了: ' + e.message;
+    if (aborted || e.name === 'AbortError') {
+      aborted = true; // 浏览器 abort 触发 AbortError, Tauri 通过 aborted 事件标记
+    } else {
+      failed = true;
+      clearInterval(thinkTimer);
+      bubble.classList.remove('thinking');
+      bubble.textContent = 'Error: ' + e.message;
+    }
   }
   if (first) { clearInterval(thinkTimer); bubble.classList.remove('thinking'); }
+  // 清理残留进度条 (异常路径下可能未移除)
+  const leftoverProg = bubble.querySelector('.progress-wrap');
+  if (leftoverProg) leftoverProg.remove();
+  // 最终保险: 隐藏全局 prefill 进度条
+  const _ppFinal = document.getElementById('prefill-progress');
+  if (_ppFinal) {
+    _ppFinal.hidden = true;
+    _ppFinal.querySelector('.prefill-progress-fill').style.width = '0%';
+  }
   const cur = bubble.querySelector('.cursor');
   if (cur) cur.remove();
+  if (failed) {
+    // 错误消息已在 catch 中写入
+  } else if (aborted && first) {
+    bubble.textContent = 'Stopped';
+  } else if (fullText) {
+    // ★ hasToolCall: 用 stripToolCallText 过滤原始 <tool_call> 标签 (由卡片渲染)
+    const displayText = hasToolCall ? stripToolCallText(fullText) : fullText;
+    if (displayText.trim()) {
+      renderFinalText(displayText, bubble);
+    } else {
+      // 纯 tool_call (无其他文本): 清空 streaming 残留的 textSpan
+      bubble.textContent = '';
+    }
+  }
+  // ★ hasToolCall: 在 renderFinalText 后渲染卡片 (避免被清空)
+  if (hasToolCall && pendingToolCalls.length > 0) {
+    for (const tc of pendingToolCalls) {
+      renderToolCallCard(bubble, tc);
+    }
+    pendingToolCalls = [];
+  }
+  // 追加推理指标 (TTFT + ms/tok), 仅在有数据且非错误/停止时显示
+  if (!failed && ttftMs !== null) {
+    const m = document.createElement('span');
+    m.className = 'metrics';
+    const parts = ['TTFT ' + ttftMs + 'ms'];
+    if (msPerTok !== null) parts.push(msPerTok + 'ms/tok');
+    if (nTok > 0) parts.push(nTok + ' tokens');
+    m.textContent = parts.join(' · ');
+    bubble.appendChild(m);
+  }
   scrollBottom();
+  // ★ tool_call: 有待处理 tool_call 时保持 busy (等待用户输入 tool_response)
+  if (hasToolCall) {
+    // 不结束 busy, 用户提交 tool_response 后由 sendToolResponse 结束
+    input.focus();
+    return;
+  }
   busy = false;
-  sendBtn.disabled = false;
+  setDsparkButtonsDisabled(false);  // 恢复 DSpark + think 开关
+  sendBtn.title = 'Send';
+  iconSend.style.display = '';
+  iconStop.style.display = 'none';
+  abortController = null;
+  if (needSessionRefresh) loadSessions();
   input.focus();
 }
 
-sendBtn.addEventListener('click', send);
+sendBtn.addEventListener('click', () => { if (busy) abortCurrent(); else send(); });
 input.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!busy) send(); }
 });
 input.addEventListener('input', () => {
   input.style.height = '50px';
   input.style.height = Math.min(input.scrollHeight, 160) + 'px';
 });
 input.focus();
+
+// === Tool calling: 渲染 tool_call 卡片 + 处理 tool_response 回传 ===
+
+/// 渲染 tool_call 卡片 (含输入框), 用户提交后调用 sendToolResponse
+function renderToolCallCard(bubble, tc) {
+  const block = document.createElement('div');
+  block.className = 'tool-call-block';
+  // header: 图标 + 标题 + 状态药丸
+  const header = document.createElement('div');
+  header.className = 'tool-call-header';
+  header.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg> Function Call';
+  const pill = document.createElement('span');
+  pill.className = 'tc-status-pill';
+  pill.textContent = 'Waiting';
+  header.appendChild(pill);
+  block.appendChild(header);
+
+  // body
+  const body = document.createElement('div');
+  body.className = 'tool-call-body';
+  // function name (带 ▶ 前缀)
+  const nameEl = document.createElement('div');
+  nameEl.className = 'tool-call-name';
+  nameEl.textContent = tc.name + '()';
+  body.appendChild(nameEl);
+  // arguments label + 代码块
+  const argsLabel = document.createElement('div');
+  argsLabel.className = 'tool-call-args-label';
+  argsLabel.textContent = 'Arguments';
+  body.appendChild(argsLabel);
+  const argsEl = document.createElement('div');
+  argsEl.className = 'tool-call-args';
+  if (Array.isArray(tc.arguments) && tc.arguments.length > 0) {
+    for (const arg of tc.arguments) {
+      const argEl = document.createElement('div');
+      argEl.className = 'tool-call-arg';
+      argEl.innerHTML = '<span class="tool-call-arg-key">' + escapeHtml(arg.name) + '</span>: <span class="tool-call-arg-val">' + escapeHtml(arg.value) + '</span>';
+      argsEl.appendChild(argEl);
+    }
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'tool-call-arg-empty';
+    empty.textContent = '(no arguments)';
+    argsEl.appendChild(empty);
+  }
+  body.appendChild(argsEl);
+  // status (带 spinner)
+  const statusEl = document.createElement('div');
+  statusEl.className = 'tool-call-status';
+  statusEl.innerHTML = '<span class="tc-spinner"></span><span class="tc-status-text">Awaiting tool response…</span>';
+  body.appendChild(statusEl);
+  // response input + Submit button (人工执行后回传结果)
+  const inputRow = document.createElement('div');
+  inputRow.className = 'tool-response-input';
+  const ta = document.createElement('textarea');
+  ta.placeholder = 'Enter tool execution result… (Ctrl+Enter to submit)';
+  const btn = document.createElement('button');
+  btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/><path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>Submit';
+  const submit = () => {
+    const content = ta.value.trim();
+    if (!content) return;
+    // 锁定输入 + 切换状态药丸
+    ta.disabled = true;
+    btn.disabled = true;
+    inputRow.style.opacity = '0.5';
+    pill.textContent = 'Submitted';
+    pill.classList.add('sending');
+    statusEl.classList.add('active');
+    statusEl.querySelector('.tc-status-text').textContent = 'Processing response…';
+    // 发送 tool_response, 回复追加到当前 bubble
+    sendToolResponse(bubble, tc.name, content, statusEl, pill, () => {
+      // tool_response 完成 (含链式 tool_call 已处理), 移除输入框
+      inputRow.remove();
+    });
+  };
+  btn.addEventListener('click', submit);
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      submit();
+    }
+  });
+  inputRow.appendChild(ta);
+  inputRow.appendChild(btn);
+  body.appendChild(inputRow);
+  block.appendChild(body);
+  bubble.appendChild(block);
+  scrollBottom();
+}
+
+/// 简易 HTML 转义
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/// 从显示文本中移除 <tool_call>...</tool_call> 块
+/// - 完整块: 移除整段 (tool_call 由卡片渲染, 不应在文本气泡里显示原始标签)
+/// - 不完整块 (流式中 <tool_call> 已出现但 </tool_call> 未到): 移除从 <tool_call> 到末尾
+///   避免流式过程中原始标签闪现给用户
+function stripToolCallText(text) {
+  let out = text;
+  while (true) {
+    const start = out.indexOf('<tool_call>');
+    if (start === -1) break;
+    const end = out.indexOf('</tool_call>', start);
+    if (end === -1) {
+      // 流式中不完整的 tool_call 块: 移除从 <tool_call> 到末尾
+      out = out.slice(0, start);
+      break;
+    }
+    out = out.slice(0, start) + out.slice(end + '</tool_call>'.length);
+  }
+  return out;
+}
+
+/// 发送 tool_response, 流式接收回复并追加到 bubble
+/// 回复中若再次包含 tool_call (链式调用), 渲染卡片并保持 busy
+async function sendToolResponse(bubble, toolName, toolContent, statusEl, pill, onComplete) {
+  const setStatus = (text, state) => {
+    if (statusEl) {
+      statusEl.classList.remove('active', 'done');
+      if (state) statusEl.classList.add(state);
+      const t = statusEl.querySelector('.tc-status-text');
+      if (t) t.textContent = text;
+    }
+    if (pill) {
+      pill.classList.remove('sending', 'done');
+      if (state === 'active') pill.classList.add('sending');
+      if (state === 'done') pill.classList.add('done');
+      if (state === 'done') pill.textContent = 'Done';
+      else if (state === 'active') pill.textContent = 'Running';
+    }
+  };
+  setStatus('Executing tool…', 'active');
+  let fullText = '';
+  let textSpan = null;
+  let first = true;
+  let pendingToolCalls = [];
+  let hasToolCall = false;
+
+  const onEvent = (kind, payload) => {
+    if (kind === 'delta') {
+      if (first) {
+        first = false;
+        // 在 bubble 末尾追加新的 textSpan (tool_response 的回复)
+        const sep = document.createElement('div');
+        sep.className = 'tool-response-sep';
+        sep.style.cssText = 'border-top:1px solid var(--border);margin-top:8px;padding-top:8px';
+        bubble.appendChild(sep);
+        textSpan = document.createElement('span');
+        const cur = document.createElement('span');
+        cur.className = 'cursor';
+        bubble.appendChild(textSpan);
+        bubble.appendChild(cur);
+        setStatus('Response received', 'done');
+      }
+      fullText += payload.text || payload || '';
+      // ★ stripToolCallText: 过滤 <tool_call> 原始标签 (由卡片渲染)
+      if (textSpan) renderStreamingText(stripToolCallText(fullText), textSpan);
+      scrollBottomThrottled();
+    } else if (kind === 'tool_call') {
+      const tc = payload.tool_call;
+      if (tc && tc.name) pendingToolCalls.push(tc);
+    } else if (kind === 'done') {
+      // ★ 标记 hasToolCall, 卡片在最终渲染后统一渲染 (避免被清空)
+      if (pendingToolCalls.length > 0) {
+        hasToolCall = true;
+        const cur = bubble.querySelector('.cursor:last-child');
+        if (cur) cur.remove();
+        // pendingToolCalls 保留给最终渲染阶段使用
+      }
+    }
+  };
+
+  try {
+    if (IS_TAURI) {
+      // Tauri 模式暂不支持 tool_response (走浏览器模式)
+      throw new Error('tool_response not supported in Tauri mode');
+    } else {
+      const resp = await fetch('/api/chat/tool_response', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: toolName, content: toolContent })
+      });
+      if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const raw = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const lines = raw.split('\n');
+          let ev = 'message', data = '';
+          for (const ln of lines) {
+            if (ln.startsWith('event:')) ev = ln.slice(6).trim();
+            else if (ln.startsWith('data:')) data += ln.slice(5).trim();
+          }
+          if (!data) continue;
+          let payload;
+          try { payload = JSON.parse(data); } catch (e) { continue; }
+          if (ev === 'error') {
+            onEvent('error', { text: payload.error || 'unknown error' });
+          } else {
+            onEvent(ev, payload);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    const errEl = document.createElement('div');
+    errEl.style.cssText = 'color:var(--accent3);font-size:12px;margin-top:6px';
+    errEl.textContent = 'Error: ' + e.message;
+    bubble.appendChild(errEl);
+  }
+
+  // 最终渲染
+  if (!first && fullText) {
+    const cur = bubble.querySelector('.cursor:last-child');
+    if (cur) cur.remove();
+    // ★ hasToolCall: 用 stripToolCallText 过滤原始 <tool_call> 标签, 重新渲染 textSpan
+    if (hasToolCall && textSpan) {
+      const displayText = stripToolCallText(fullText);
+      if (displayText.trim()) {
+        renderStreamingText(displayText, textSpan);
+      } else {
+        // 纯 tool_call (无其他文本): 移除 textSpan 和之前的分隔线
+        textSpan.remove();
+        const sep = bubble.querySelector('.tool-response-sep');
+        if (sep) sep.remove();
+      }
+    }
+    // 非 hasToolCall: 保持 renderStreamingText 的结果即可
+  }
+
+  // ★ hasToolCall: 渲染链式 tool_call 卡片 (在 textSpan 重新渲染后)
+  if (hasToolCall && pendingToolCalls.length > 0) {
+    for (const tc of pendingToolCalls) {
+      renderToolCallCard(bubble, tc);
+    }
+    pendingToolCalls = [];
+  }
+
+  if (!hasToolCall) {
+    // 无链式 tool_call: 结束 busy, 恢复 UI
+    busy = false;
+    setDsparkButtonsDisabled(false);
+    sendBtn.title = 'Send';
+    iconSend.style.display = '';
+    iconStop.style.display = 'none';
+    abortController = null;
+    if (typeof onComplete === 'function') onComplete();
+    input.focus();
+  } else {
+    if (typeof onComplete === 'function') onComplete();
+  }
+  scrollBottom();
+}
+
+// === Tools 管理 UI ===
+
+const toolsToggle = document.getElementById('tools-toggle');
+const toolsPanel = document.getElementById('tools-panel');
+const toolsList = document.getElementById('tools-list');
+const toolsBadge = document.getElementById('tools-badge');
+const toolAddBtn = document.getElementById('tool-add-btn');
+const toolEditor = document.getElementById('tool-editor');
+const toolNameInput = document.getElementById('tool-name');
+const toolDescInput = document.getElementById('tool-desc');
+const toolParamsContainer = document.getElementById('tool-params');
+const toolParamAddBtn = document.getElementById('tool-param-add');
+const toolSaveBtn = document.getElementById('tool-save');
+const toolCancelBtn = document.getElementById('tool-cancel');
+
+let toolsLoaded = false;
+let editingToolName = null;  // null=新增, 非null=编辑现有
+
+/// 加载工具列表
+async function loadTools() {
+  try {
+    const r = await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/tools' : '/api/tools');
+    const j = await r.json();
+    renderToolsList(j.tools || []);
+    toolsLoaded = true;
+  } catch (e) { /* silent */ }
+}
+
+/// 渲染工具列表 + 更新 badge
+function renderToolsList(tools) {
+  toolsList.innerHTML = '';
+  // 更新 badge
+  if (tools.length > 0) {
+    toolsBadge.textContent = tools.length;
+    toolsBadge.style.display = 'grid';
+  } else {
+    toolsBadge.style.display = 'none';
+  }
+  if (tools.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'tools-empty';
+    empty.textContent = 'No tools. Click "+ Add" to create one.';
+    toolsList.appendChild(empty);
+    return;
+  }
+  for (const t of tools) {
+    const item = document.createElement('div');
+    item.className = 'tool-item';
+    const info = document.createElement('div');
+    info.className = 'tool-item-info';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'tool-item-name';
+    nameEl.textContent = t.name;
+    info.appendChild(nameEl);
+    if (t.description) {
+      const descEl = document.createElement('div');
+      descEl.className = 'tool-item-desc';
+      descEl.textContent = t.description;
+      info.appendChild(descEl);
+    }
+    if (Array.isArray(t.parameters) && t.parameters.length > 0) {
+      const paramsEl = document.createElement('div');
+      paramsEl.className = 'tool-item-params';
+      paramsEl.textContent = t.parameters.map(p => p.name + (p.required ? '*' : '')).join(', ');
+      info.appendChild(paramsEl);
+    }
+    item.appendChild(info);
+    // actions
+    const actions = document.createElement('div');
+    actions.className = 'tool-item-actions';
+    // edit btn
+    const editBtn = document.createElement('button');
+    editBtn.className = 'tool-item-btn';
+    editBtn.title = 'Edit';
+    editBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
+    editBtn.addEventListener('click', () => openToolEditor(t));
+    actions.appendChild(editBtn);
+    // delete btn
+    const delBtn = document.createElement('button');
+    delBtn.className = 'tool-item-btn delete';
+    delBtn.title = 'Delete';
+    delBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
+    delBtn.addEventListener('click', () => deleteTool(t.name));
+    actions.appendChild(delBtn);
+    item.appendChild(actions);
+    toolsList.appendChild(item);
+  }
+}
+
+/// 打开工具编辑器 (新增或编辑)
+function openToolEditor(existing) {
+  editingToolName = existing ? existing.name : null;
+  toolNameInput.value = existing ? existing.name : '';
+  toolDescInput.value = existing ? existing.description : '';
+  toolParamsContainer.innerHTML = '';
+  if (existing && Array.isArray(existing.parameters)) {
+    for (const p of existing.parameters) {
+      addParamRow(p.name, p.description, p.param_type, p.required);
+    }
+  }
+  toolEditor.hidden = false;
+  toolNameInput.focus();
+}
+
+/// 添加参数行
+function addParamRow(name, desc, type, required) {
+  const row = document.createElement('div');
+  row.className = 'tool-param-row';
+  const nameInput = document.createElement('input');
+  nameInput.className = 'tool-input param-name';
+  nameInput.placeholder = 'param name';
+  nameInput.value = name || '';
+  const typeInput = document.createElement('input');
+  typeInput.className = 'tool-input param-type';
+  typeInput.placeholder = 'type';
+  typeInput.value = type || 'string';
+  const reqInput = document.createElement('input');
+  reqInput.type = 'checkbox';
+  reqInput.className = 'param-required';
+  reqInput.title = 'Required';
+  reqInput.checked = !!required;
+  const delBtn = document.createElement('button');
+  delBtn.className = 'param-del';
+  delBtn.type = 'button';
+  delBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+  delBtn.addEventListener('click', () => row.remove());
+  row.appendChild(nameInput);
+  row.appendChild(typeInput);
+  row.appendChild(reqInput);
+  row.appendChild(delBtn);
+  toolParamsContainer.appendChild(row);
+}
+
+/// 保存工具 (新增或更新)
+async function saveTool() {
+  const name = toolNameInput.value.trim();
+  if (!name) { toolNameInput.focus(); return; }
+  const description = toolDescInput.value.trim();
+  const parameters = [];
+  const rows = toolParamsContainer.querySelectorAll('.tool-param-row');
+  rows.forEach(row => {
+    const pName = row.querySelector('.param-name').value.trim();
+    if (!pName) return;
+    const pType = row.querySelector('.param-type').value.trim() || 'string';
+    const pReq = row.querySelector('.param-required').checked;
+    parameters.push({ name: pName, description: '', param_type: pType, required: pReq });
+  });
+  try {
+    const r = await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/tools' : '/api/tools', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, description, parameters })
+    });
+    if (r.ok) {
+      toolEditor.hidden = true;
+      loadTools();
+    } else {
+      const j = await r.json().catch(() => ({}));
+      alert('Save failed: ' + (j.error || r.status));
+    }
+  } catch (e) {
+    alert('Save failed: ' + e.message);
+  }
+}
+
+/// 删除工具
+async function deleteTool(name) {
+  if (!confirm('Delete tool "' + name + '"?')) return;
+  try {
+    const r = await fetch(IS_TAURI ? 'http://127.0.0.1:8787/api/tools/delete' : '/api/tools/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    if (r.ok) loadTools();
+  } catch (e) { /* silent */ }
+}
+
+// 工具箱图标点击: 展开/收起工具面板
+toolsToggle.addEventListener('click', () => {
+  toolsPanel.hidden = !toolsPanel.hidden;
+  if (!toolsPanel.hidden && !toolsLoaded) loadTools();
+});
+toolAddBtn.addEventListener('click', () => openToolEditor(null));
+toolParamAddBtn.addEventListener('click', () => addParamRow('', '', 'string', false));
+toolSaveBtn.addEventListener('click', saveTool);
+toolCancelBtn.addEventListener('click', () => { toolEditor.hidden = true; });
 </script>
 </body>
 </html>
