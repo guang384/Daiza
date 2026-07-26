@@ -932,7 +932,7 @@ fn run_self_test(mut engine: Engine, max_tokens: usize) -> Result<()> {
     println!();
 
     // ========== 总结 ==========
-    let total_pass = pass1 && r2_has_name && pass4 && pass5 && pass6;
+    let total_pass = pass1 && r2_has_name && r4_has_recall && pass4 && pass5 && pass6;
     println!("=== Summary ===");
     println!("  test 1 (single-turn token match):    {}", if pass1 { "PASS" } else { "FAIL" });
     println!("  test 2a (R2 mentions name):          {}", if r2_has_name { "PASS" } else { "FAIL" });
@@ -1137,7 +1137,11 @@ fn main() -> Result<()> {
         engine.generate_with_image(&prompt, &image_paths, max_tokens, params, Some(system))?
     } else if dspark_path.is_some() {
         let system = "You are a helpful assistant.";
-        engine.generate_with_dspark(&prompt, max_tokens, params, Some(system), confidence_threshold)?
+        let fallback = !matches!(
+            std::env::var("DAIZA_DSPARK_FALLBACK").as_deref(),
+            Ok("0") | Ok("false") | Ok("no")
+        );
+        engine.generate_with_dspark(&prompt, max_tokens, params, Some(system), confidence_threshold, fallback)?
     } else if raw_mode {
         engine.generate_raw(&prompt, max_tokens, params)?
     } else {

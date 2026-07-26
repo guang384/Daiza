@@ -1,0 +1,12 @@
+[package]
+name = "daiza-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "daiza-server"
+path = "src/main.rs"
+
+[dependencies]
+daiza-engine = { path = "../Daiza-engine" }
+daiza-runtime = { path = "../Daiza-runtime" }
