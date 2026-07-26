@@ -10,7 +10,8 @@
 //!   n_history: usize
 //!   n_blocks: u32 (=block_count)
 //!   think_enabled: u8
-//!   reserved: [u8; 83]  ← 预留扩展位
+//!   has_system_prompt: u8  (v1.1: 0=none, 1=present after blocks)
+//!   reserved: [u8; 82]  ← 预留扩展位
 //!
 //! [History Tokens]
 //!   [u32; n_history]
@@ -81,7 +82,8 @@ impl Session {
         header[24..32].copy_from_slice(&(self.history_tokens.len() as u64).to_le_bytes());
         header[32..36].copy_from_slice(&(cfg.block_count as u32).to_le_bytes());
         header[36] = self.think_enabled as u8;
-        // reserved: header[37..128] 已为零
+        header[37] = self.system_prompt.is_some() as u8;
+        // reserved: header[38..128] 已为零
         file.write_all(&header)
             .map_err(|e| crate::BonsaiError::Io(format!("write header: {e}")))?;
 
@@ -131,6 +133,14 @@ impl Session {
             }
         }
 
+        // === System prompt (可选, flag in header[37]) ===
+        if let Some(ref sys) = self.system_prompt {
+            let sys_bytes = sys.as_bytes();
+            file.write_all(&(sys_bytes.len() as u64).to_le_bytes())?;
+            file.write_all(sys_bytes)?;
+        }
+        // 注意: tools / messages 未持久化 (结构复杂, 需手动恢复)
+
         file.flush()?;
         Ok(())
     }
@@ -167,6 +177,8 @@ impl Session {
                 pending_images: Vec::new(),
                 tools: Vec::new(),
                 messages: Vec::new(),
+                dspark_tap_history: Vec::new(),
+                dspark_tap_layers: Vec::new(),
             };
             session.save_to_disk(&path, &cfg)
         })
@@ -205,6 +217,7 @@ impl Session {
         let n_history = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
         let n_blocks = u32::from_le_bytes(header[32..36].try_into().unwrap()) as usize;
         let think_enabled = header[36] != 0;
+        let has_system_prompt = header[37] != 0;
 
         if n_blocks != cfg.block_count {
             return Err(crate::BonsaiError::Io(format!(
@@ -268,6 +281,16 @@ impl Session {
         state.pos = pos;
         // rope_freqs / rope_sections 已由 ModelState::new 初始化
 
+        // === System prompt (可选) ===
+        let system_prompt = if has_system_prompt {
+            let sys_len = u64::from_le_bytes(read_u8x8(&mut file)? as [u8; 8]) as usize;
+            let mut sys_buf = vec![0u8; sys_len];
+            file.read_exact(&mut sys_buf)?;
+            Some(String::from_utf8_lossy(&sys_buf).into_owned())
+        } else {
+            None
+        };
+
         Ok(Self {
             state,
             workspace: daiza_engine::model::workspace::Workspace::new(cfg),
@@ -277,10 +300,12 @@ impl Session {
             cos_buf: vec![0.0; cfg.rope_dim],
             sin_buf: vec![0.0; cfg.rope_dim],
             think_enabled,
-            system_prompt: None,
+            system_prompt,
             pending_images: Vec::new(),
             tools: Vec::new(),
             messages: Vec::new(),
+            dspark_tap_history: Vec::new(),
+            dspark_tap_layers: Vec::new(),
         })
     }
 }

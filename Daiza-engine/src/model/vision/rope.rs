@@ -135,12 +135,20 @@ pub fn apply_vision_rope(x: &mut [f32], cos: &[f32], sin: &[f32]) {
     // x_new[i] = x[i] * cos[i] + rotate_half[i] * sin[i]
     //   for i in 0..half:    x_new[i] = x[i] * cos[i] + (-x[i + half]) * sin[i]
     //   for i in half..n:    x_new[i] = x[i] * cos[i] + x[i - half] * sin[i]
-    let mut new_x = vec![0.0f32; n];
+    //
+    // ★ P2: 改栈分配避免每 head 一次 heap alloc
+    //   调用频次: 27 layers × 16 heads × 2 (Q+K) × 2304 patches = 2M 次/forward
+    //   原 vec! 每次 alloc+dealloc ~50ns × 2M = 100ms (vision prefill)
+    //   栈数组 128 f32 = 512B, 在 L1 cache 内,零 alloc 开销
+    //   head_dim 上限 128 覆盖 Qwen3-VL (head_dim=72) 及常见 ViT 配置
+    debug_assert!(n <= 128, "head_dim > 128 not supported by stack buffer");
+    let mut stack_buf = [0.0f32; 128];
+    let new_x = &mut stack_buf[..n];
     for i in 0..half {
         new_x[i] = x[i] * cos[i] - x[i + half] * sin[i];
     }
     for i in half..n {
         new_x[i] = x[i] * cos[i] + x[i - half] * sin[i];
     }
-    x.copy_from_slice(&new_x);
+    x.copy_from_slice(new_x);
 }

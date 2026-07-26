@@ -87,12 +87,9 @@ impl BpeTokenizer {
                         for &b in bytes {
                             s.push(self.byte_to_unicode_char[b as usize]);
                         }
+                        // bpe_merge 直接返回 token id 序列
                         let merged = self.bpe_merge(&s);
-                        for tok in merged {
-                            if let Some(&id) = self.token_to_id.get(tok.as_str()) {
-                                all_ids.push(id);
-                            }
-                        }
+                        all_ids.extend(merged);
                     }
                 }
             }
@@ -164,9 +161,24 @@ impl BpeTokenizer {
     }
 
     /// 对单个预分词段做 BPE merge
-    fn bpe_merge(&self, s: &str) -> Vec<String> {
-        // 把字符串切成单字符(每个字符对应一个原始 byte)
-        let mut word: Vec<String> = s.chars().map(|c| c.to_string()).collect();
+    ///
+    /// 返回 token id 序列。使用 (id_a, id_b) pair 查 merges_by_id,
+    /// 避免每次 pair 检查都分配新 String。
+    fn bpe_merge(&self, s: &str) -> Vec<u32> {
+        // 把字符串切成单字符,每个字符查 token_to_id 得到 token id
+        let mut word: Vec<u32> = Vec::with_capacity(s.chars().count());
+        for c in s.chars() {
+            let cs = c.to_string();
+            match self.token_to_id.get(cs.as_str()) {
+                Some(&id) => word.push(id),
+                None => {
+                    eprintln!(
+                        "[tokenizer] warning: char not in vocab, skipping: {:?}",
+                        cs
+                    );
+                }
+            }
+        }
         if word.len() < 2 {
             return word;
         }
@@ -176,8 +188,8 @@ impl BpeTokenizer {
             let mut min_rank: Option<u32> = None;
             let mut min_idx: Option<usize> = None;
             for i in 0..word.len() - 1 {
-                let pair_str = format!("{} {}", word[i], word[i + 1]);
-                if let Some(&rank) = self.vocab.merges.get(&pair_str) {
+                let pair = (word[i], word[i + 1]);
+                if let Some(&rank) = self.vocab.merges_by_id.get(&pair) {
                     if min_rank.is_none() || rank < min_rank.unwrap() {
                         min_rank = Some(rank);
                         min_idx = Some(i);
@@ -186,15 +198,14 @@ impl BpeTokenizer {
             }
             match (min_rank, min_idx) {
                 (Some(_), Some(idx)) => {
-                    // merge word[idx] + word[idx+1]
-                    let merged = format!("{} {}", word[idx], word[idx + 1])
-                        .replace(' ', ""); // 合并后去掉空格(BPE 表示)
-                                          // 但 merges 用空格分隔两个 token,
-                                          // merge 后字符串本身就是两段拼接(无空格)
-                    let merged_str = format!("{}{}", word[idx], word[idx + 1]);
-                    let _ = merged;
-                    word[idx] = merged_str;
-                    word.remove(idx + 1);
+                    // merge word[idx] + word[idx+1] → 新 token id
+                    let pair = (word[idx], word[idx + 1]);
+                    if let Some(&merged_id) = self.vocab.merge_result.get(&pair) {
+                        word[idx] = merged_id;
+                        word.remove(idx + 1);
+                    } else {
+                        break;
+                    }
                 }
                 _ => break,
             }

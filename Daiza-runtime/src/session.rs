@@ -44,6 +44,11 @@ pub struct Session {
     /// 普通对话不会填充此字段 (走 history_tokens 增量路径)
     /// tool_call 模式下,每次 reply 后追加 Assistant 消息, ToolResponse 时追加 Tool 消息
     pub messages: Vec<ToolMessage>,
+    /// DSpark 跨轮 KV cache 复用: 累积所有已 forward token 的 hidden tap
+    /// 每个 token 一行 [n_tap_layers * hidden], 由 engine.generate_with_dspark_stream 维护
+    pub dspark_tap_history: Vec<f32>,
+    /// DSpark target tap 层配置 (首次 prefill 时从 spec_ctx 读, 跨轮复用)
+    pub dspark_tap_layers: Vec<usize>,
 }
 
 impl Session {
@@ -62,6 +67,8 @@ impl Session {
             pending_images: Vec::new(),
             tools: Vec::new(),
             messages: Vec::new(),
+            dspark_tap_history: Vec::new(),
+            dspark_tap_layers: Vec::new(),
         }
     }
 
@@ -71,7 +78,25 @@ impl Session {
         self.history_tokens.clear();
         self.pending_images.clear();
         self.messages.clear();
+        self.dspark_tap_history.clear();
     }
+}
+
+/// 将 ForwardContext 的状态移回 Session
+///
+/// ★ 错误安全的状态管理: 无论 prefill/decode 成功或失败, 都必须调用此函数,
+///   否则 ForwardContext 被 drop 时 ModelState (KV cache + SSM state + pos) 会随之丢失,
+///   导致下一轮对话从空状态开始 (表现为"多轮对话上下文丢失")。
+///
+/// 成功路径: 在 history_tokens.extend 之前调用;
+/// 错误路径: 在 `?` 传播错误之前调用 (本文件通过 IIFE 模式统一处理)。
+fn restore_ctx_state(session: &mut Session, ctx: &mut ForwardContext<'_>) {
+    session.state = std::mem::take(&mut ctx.state);
+    session.h_buf = std::mem::take(&mut ctx.h_buf);
+    session.workspace = std::mem::take(&mut ctx.workspace);
+    session.logits_buf = std::mem::take(&mut ctx.logits_buf);
+    session.cos_buf = std::mem::take(&mut ctx.cos_buf);
+    session.sin_buf = std::mem::take(&mut ctx.sin_buf);
 }
 
 /// 构造增量 token 文本 (普通对话路径)
@@ -84,8 +109,16 @@ impl Session {
 fn build_increment(session: &Session, user_msg: &str) -> String {
     let mut s = String::new();
     if session.history_tokens.is_empty() {
-        // 首轮:带 system prompt
-        if let Some(sys) = &session.system_prompt {
+        // 首轮: 带 system prompt (tools 非空时注入 tools 块)
+        if !session.tools.is_empty() {
+            s.push_str("<|im_start|>system\n");
+            s.push_str(&render_tools_block(&session.tools));
+            if let Some(sys) = &session.system_prompt {
+                s.push_str(sys);
+                s.push('\n');
+            }
+            s.push_str("<|im_end|>\n");
+        } else if let Some(sys) = &session.system_prompt {
             s.push_str("<|im_start|>system\n");
             s.push_str(sys);
             s.push_str("<|im_end|>\n");
@@ -99,11 +132,66 @@ fn build_increment(session: &Session, user_msg: &str) -> String {
     s.push_str("<|im_end|>\n");
     s.push_str("<|im_start|>assistant\n");
     if session.think_enabled {
-        // <think>\n 作为 byte sequence (memory 约束: 3c 74 68 69 6e 6b 3e 5c 6e)
-        // tokenizer 会编码成正确的 special token
+        // <think>\n (换行符) — <think> 作为 special token 被 tokenizer 识别,
+        // \n 作为普通 token 编码, 模型看到 <think> special token 后进入 thinking 模式
         s.push_str("<think>\n");
+    } else {
+        // ★ think 关闭: 追加空 think 块 <think></think>\n, 告诉模型 think 阶段已结束,
+        //   直接生成正式回答 (Qwen3 标准 enable_thinking=false 处理)
+        //   Bonsai-27B 训练时 assistant 总是以 <think> 开头, 若只写 assistant\n,
+        //   模型会自发生成 <think>...长篇think内容</think>, 浪费 token 和算力
+        s.push_str("<think></think>\n");
     }
     s
+}
+
+/// 渲染 tools 块 (注入到 system prompt)
+/// 格式参考 tool_call::render_chat_template 中的 tools 部分
+pub fn render_tools_block(tools: &[ToolDef]) -> String {
+    let mut s = String::new();
+    s.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>\n");
+    for tool in tools {
+        s.push_str(&format_tool_def_inline(tool));
+        s.push('\n');
+    }
+    s.push_str("</tools>\n\n");
+    s.push_str("If you choose to call a function ONLY reply in the following format with NO suffix:\n\n");
+    s.push_str("<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n");
+    s.push_str("<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n");
+    s.push_str("<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n");
+    s.push_str("- Required parameters MUST be specified\n");
+    s.push_str("- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n");
+    s.push_str("- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n");
+    s.push_str("</IMPORTANT>\n");
+    s
+}
+
+/// 渲染单个 tool 定义为 JSON schema 格式 (与 tool_call::format_tool_def 一致, 内联避免可见性冲突)
+fn format_tool_def_inline(tool: &ToolDef) -> String {
+    let mut s = String::new();
+    s.push_str("{\"type\": \"function\", \"function\": {");
+    s.push_str(&format!("\"name\": \"{}\", ", escape_json_inline(&tool.name)));
+    s.push_str(&format!("\"description\": \"{}\", ", escape_json_inline(&tool.description)));
+    s.push_str("\"parameters\": {\"type\": \"object\", \"properties\": {");
+    for (i, p) in tool.parameters.iter().enumerate() {
+        if i > 0 { s.push_str(", "); }
+        s.push_str(&format!("\"{}\": {{\"type\": \"{}\", \"description\": \"{}\"}}",
+            escape_json_inline(&p.name), escape_json_inline(&p.param_type), escape_json_inline(&p.description)));
+    }
+    s.push_str("}, \"required\": [");
+    let mut first_req = true;
+    for p in tool.parameters.iter() {
+        if !p.required { continue; }
+        if !first_req { s.push_str(", "); }
+        first_req = false;
+        s.push_str(&format!("\"{}\"", escape_json_inline(&p.name)));
+    }
+    s.push_str("]}}");
+    s
+}
+
+fn escape_json_inline(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
 /// 分批 prefill: forward_batch 内部 tmp 数组限制 n_batch ≤ 64,
@@ -111,12 +199,28 @@ fn build_increment(session: &Session, user_msg: &str) -> String {
 const MAX_PREFILL_BATCH: usize = 64;
 
 fn prefill_batched(ctx: &mut ForwardContext<'_>, input_ids: &[u32], start_pos: usize) -> Result<()> {
+    prefill_batched_with_progress(ctx, input_ids, start_pos, None)
+}
+
+/// 分批 prefill + 进度上报
+///
+/// `on_progress`: 若 Some, 每完成一批 forward_batch 调用一次 (done_tokens, total_tokens)
+fn prefill_batched_with_progress(
+    ctx: &mut ForwardContext<'_>,
+    input_ids: &[u32],
+    start_pos: usize,
+    mut on_progress: Option<&mut dyn FnMut(usize, usize)>,
+) -> Result<()> {
     let n = input_ids.len();
     if n == 0 {
         return Ok(());
     }
     if n <= MAX_PREFILL_BATCH {
-        return forward_batch(ctx, input_ids, start_pos, None);
+        forward_batch(ctx, input_ids, start_pos, None)?;
+        if let Some(cb) = on_progress {
+            cb(n, n);
+        }
+        return Ok(());
     }
     // 分批: 每批 MAX_PREFILL_BATCH 个 token, pos 自动累加
     let mut offset = 0usize;
@@ -125,6 +229,9 @@ fn prefill_batched(ctx: &mut ForwardContext<'_>, input_ids: &[u32], start_pos: u
         let batch = &input_ids[offset..end];
         forward_batch(ctx, batch, start_pos + offset, None)?;
         offset = end;
+        if let Some(cb) = on_progress.as_deref_mut() {
+            cb(offset, n);
+        }
     }
     Ok(())
 }
@@ -148,10 +255,9 @@ pub fn session_reply(
     max_tokens: usize,
     params: SamplingParams,
 ) -> Result<String> {
-    // tool_call 模式: 走完整 messages 重新渲染路径
-    if !session.tools.is_empty() {
-        return session_reply_with_tools(cfg, weights, tokenizer, session, user_msg, max_tokens, params);
-    }
+    // tool_call 模式: 走增量 prefill 路径 (build_increment 首轮注入 tools 块)
+    // 完整重渲染路径 session_reply_with_tools 保留供 REPL 或 tool_response 回传使用
+    // web 层通过流式 delta 检测 <tool_call> 标签, 不走 session_reply_with_tools
 
     // 1. 构造增量 token
     let increment = build_increment(session, user_msg);
@@ -178,38 +284,40 @@ pub fn session_reply(
         hidden_tap_batch_buf: Vec::new(),
     };
 
-    // 3. 增量 prefill(从 start_pos 继续, KV/SSM 已持有历史)
-    let n_input = input_ids.len();
-    if n_input == 1 {
-        forward_single_token(&mut ctx, input_ids[0])?;
-    } else if n_input > 1 {
-        prefill_batched(&mut ctx, &input_ids, start_pos)?;
-    }
-
-    // 4. decode 循环
-    let mut rng = LcgRng::new(0xC0FFEE);
-    let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
-    let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
-
-    for _step in 0..max_tokens {
-        let next_id = sample_top_k_top_p_into(
-            &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
-        );
-        // EOS:停止生成,不 forward EOS(EOS 的 KV 在下一轮 increment 补入)
-        if next_id as u32 == cfg.eos_token_id {
-            break;
+    // 3-4. prefill + decode 封装到 IIFE
+    // ★ 错误安全: inner 内任何 `?` 失败都会让闭包返回 Err, 但 ctx 不会被 drop
+    //   (闭包只持有 &mut ctx, 所有权在外层), 外层 restore_ctx_state 仍会执行,
+    //   保证 KV cache + pos 正确回移到 session, 下一轮对话可复用历史上下文。
+    let inner_result: Result<Vec<u32>> = (|| {
+        let n_input = input_ids.len();
+        if n_input == 1 {
+            forward_single_token(&mut ctx, input_ids[0])?;
+        } else if n_input > 1 {
+            prefill_batched(&mut ctx, &input_ids, start_pos)?;
         }
-        generated_ids.push(next_id as u32);
-        forward_single_token(&mut ctx, next_id as u32)?;
-    }
 
-    // 5. state/buffers 移回 session(关键:不 drop!)
-    session.state = std::mem::take(&mut ctx.state);
-    session.h_buf = std::mem::take(&mut ctx.h_buf);
-    session.workspace = std::mem::take(&mut ctx.workspace);
-    session.logits_buf = std::mem::take(&mut ctx.logits_buf);
-    session.cos_buf = std::mem::take(&mut ctx.cos_buf);
-    session.sin_buf = std::mem::take(&mut ctx.sin_buf);
+        let mut rng = LcgRng::new(0xC0FFEE);
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
+        let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
+
+        for _step in 0..max_tokens {
+            let next_id = sample_top_k_top_p_into(
+                &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
+            );
+            // EOS:停止生成,不 forward EOS(EOS 的 KV 在下一轮 increment 补入)
+            if next_id as u32 == cfg.eos_token_id {
+                break;
+            }
+            generated_ids.push(next_id as u32);
+            forward_single_token(&mut ctx, next_id as u32)?;
+        }
+        Ok(generated_ids)
+    })();
+
+    // 5. state/buffers 移回 session(关键:无论成功失败都执行, 不 drop!)
+    restore_ctx_state(session, &mut ctx);
+
+    let generated_ids = inner_result?;
     session.history_tokens.extend(&input_ids);
     session.history_tokens.extend(&generated_ids);
 
@@ -218,6 +326,57 @@ pub fn session_reply(
 
     // 7. decode token ids 为字符串
     Ok(tokenizer.decode(&generated_ids))
+}
+
+/// 解码单个 token 为原始字节 (与 BpeTokenizer::decode 的字节收集逻辑一致,
+/// 但不做 UTF-8 lossy 转换, 保留跨 token 的不完整字节供增量对齐)。
+pub fn decode_token_bytes(tokenizer: &BpeTokenizer, id: u32, buf: &mut Vec<u8>) {
+    if let Some(token_text) = tokenizer.vocab.tokens.get(id as usize) {
+        for ch in token_text.chars() {
+            if let Some(&b) = tokenizer.unicode_char_to_byte.get(&ch) {
+                buf.push(b);
+            }
+        }
+    }
+}
+
+/// 从 `pending` 中解码出所有完整的 UTF-8 字符并返回, 不完整的尾部字节保留到下次。
+/// 遇到真正的非法字节时用 U+FFFD 替换 (与 `String::from_utf8_lossy` 行为一致)。
+pub fn drain_complete_utf8(pending: &mut Vec<u8>) -> String {
+    if pending.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut consumed = 0usize;
+    let n = pending.len();
+    while consumed < n {
+        match std::str::from_utf8(&pending[consumed..]) {
+            Ok(s) => {
+                out.push_str(s);
+                consumed = n;
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if valid > 0 {
+                    out.push_str(std::str::from_utf8(&pending[consumed..consumed + valid]).unwrap());
+                    consumed += valid;
+                }
+                match e.error_len() {
+                    None => break, // 尾部不完整多字节序列, 保留到下次
+                    Some(len) => {
+                        // 非法字节, 用 U+FFFD 替换 (与 from_utf8_lossy 一致)
+                        out.push('\u{FFFD}');
+                        consumed += len;
+                    }
+                }
+            }
+        }
+    }
+    if consumed > 0 {
+        pending.drain(..consumed);
+    }
+    out
 }
 
 /// 流式版 session_reply: 每生成一个 token 就回调一次增量文本
@@ -238,15 +397,61 @@ pub fn session_reply_stream(
     params: SamplingParams,
     on_delta: &mut dyn FnMut(&str) -> bool,
 ) -> Result<String> {
-    // tool_call 模式: 不支持流式 (需要完整文本解析 <tool_call>), 退化为一次性回调
-    if !session.tools.is_empty() {
-        let out = session_reply_with_tools(cfg, weights, tokenizer, session, user_msg, max_tokens, params)?;
-        on_delta(&out);
-        return Ok(out);
-    }
-
+    // tool_call 模式: 走增量 prefill 流式路径 (build_increment 首轮注入 tools 块)
+    // web 层通过 on_delta 回调累积文本, 检测 <tool_call> 标签
     let increment = build_increment(session, user_msg);
-    let input_ids = tokenizer.encode(&increment);
+    reply_with_increment_stream(cfg, weights, tokenizer, session, &increment, max_tokens, params, on_delta)
+}
+
+/// tool_response 回传后的流式生成
+///
+/// 构造 `<|im_end|>\n<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n<|im_start|>assistant\n` 增量 prompt,
+/// 复用 reply_with_increment_stream 核心逻辑。
+pub fn session_reply_tool_response_stream(
+    cfg: &Config,
+    weights: &LoadedWeights,
+    tokenizer: &BpeTokenizer,
+    session: &mut Session,
+    tool_content: &str,
+    max_tokens: usize,
+    params: SamplingParams,
+    on_delta: &mut dyn FnMut(&str) -> bool,
+) -> Result<String> {
+    let increment = build_tool_response_increment(session, tool_content);
+    reply_with_increment_stream(cfg, weights, tokenizer, session, &increment, max_tokens, params, on_delta)
+}
+
+/// 构造 tool_response 增量 prompt
+///
+/// 格式: `<|im_end|>\n<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n<|im_start|>assistant\n` [+ think 头]
+fn build_tool_response_increment(session: &Session, content: &str) -> String {
+    let mut s = String::new();
+    // tool_response 一定在后续轮 (首轮不可能有 tool_call), 补上上一轮 EOS
+    s.push_str("<|im_end|>\n");
+    s.push_str("<|im_start|>user\n<tool_response>\n");
+    s.push_str(content);
+    s.push_str("\n</tool_response><|im_end|>\n");
+    s.push_str("<|im_start|>assistant\n");
+    if session.think_enabled {
+        s.push_str("<think>\n");
+    } else {
+        s.push_str("<think></think>\n");
+    }
+    s
+}
+
+/// 核心流式生成: 接收已构造好的 increment, 执行 prefill + decode + on_delta 回调
+fn reply_with_increment_stream(
+    cfg: &Config,
+    weights: &LoadedWeights,
+    tokenizer: &BpeTokenizer,
+    session: &mut Session,
+    increment: &str,
+    max_tokens: usize,
+    params: SamplingParams,
+    on_delta: &mut dyn FnMut(&str) -> bool,
+) -> Result<String> {
+    let input_ids = tokenizer.encode(increment);
     if input_ids.is_empty() {
         return Err(crate::BonsaiError::Tokenizer(
             "increment encode returned empty".into(),
@@ -269,45 +474,69 @@ pub fn session_reply_stream(
     };
 
     let n_input = input_ids.len();
-    if n_input == 1 {
-        forward_single_token(&mut ctx, input_ids[0])?;
-    } else if n_input > 1 {
-        prefill_batched(&mut ctx, &input_ids, start_pos)?;
-    }
 
-    let mut rng = LcgRng::new(0xC0FFEE);
-    let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
-    let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
-    let mut emitted_len = 0usize; // 已上报的文本字节数
-
-    for _step in 0..max_tokens {
-        let next_id = sample_top_k_top_p_into(
-            &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
-        );
-        if next_id as u32 == cfg.eos_token_id {
-            break;
+    // ★ 错误安全: prefill + decode 封装到 IIFE, 任何 `?` 失败都不会 drop ctx,
+    //   外层 restore_ctx_state 保证 KV cache + pos 回移到 session。
+    let inner_result: Result<Vec<u32>> = (|| {
+        let prefill_start = std::time::Instant::now();
+        if n_input == 1 {
+            forward_single_token(&mut ctx, input_ids[0])?;
+        } else if n_input > 1 {
+            prefill_batched(&mut ctx, &input_ids, start_pos)?;
         }
-        generated_ids.push(next_id as u32);
-        forward_single_token(&mut ctx, next_id as u32)?;
+        let prefill_ms = prefill_start.elapsed().as_millis();
 
-        // 增量解码: 只上报新增的字节 (from_utf8_lossy 对跨 token 的
-        // 多字节字符会暂存半个字符, 等下一个 token 补齐后自然上报完整字符)
-        let full = tokenizer.decode(&generated_ids);
-        if full.len() > emitted_len {
-            let delta = &full[emitted_len..];
-            emitted_len = full.len();
-            if !on_delta(delta) {
+        let mut rng = LcgRng::new(0xC0FFEE);
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
+        let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
+        let decode_start = std::time::Instant::now();
+        // 增量解码缓冲: 跨 token 的不完整 UTF-8 字节暂存于此。
+        // 每 token 只追加本 token 的 bytes 并对齐 UTF-8 边界, 不再重解整个历史 (O(N) 而非 O(N²))。
+        let mut pending_bytes: Vec<u8> = Vec::new();
+        let mut broke = false;
+
+        for _step in 0..max_tokens {
+            let next_id = sample_top_k_top_p_into(
+                &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
+            );
+            if next_id as u32 == cfg.eos_token_id {
                 break;
             }
-        }
-    }
+            generated_ids.push(next_id as u32);
+            forward_single_token(&mut ctx, next_id as u32)?;
 
-    session.state = std::mem::take(&mut ctx.state);
-    session.h_buf = std::mem::take(&mut ctx.h_buf);
-    session.workspace = std::mem::take(&mut ctx.workspace);
-    session.logits_buf = std::mem::take(&mut ctx.logits_buf);
-    session.cos_buf = std::mem::take(&mut ctx.cos_buf);
-    session.sin_buf = std::mem::take(&mut ctx.sin_buf);
+            // 增量解码: 仅追加本 token 的 bytes, 再对齐 UTF-8 边界输出 delta
+            decode_token_bytes(tokenizer, next_id as u32, &mut pending_bytes);
+            let delta = drain_complete_utf8(&mut pending_bytes);
+            if !delta.is_empty() {
+                if !on_delta(&delta) {
+                    broke = true;
+                    break;
+                }
+            }
+        }
+        // 收尾: 未提前中断时, 把残留的不完整字节以 lossy 形式上报
+        // (与旧实现最终 from_utf8_lossy 一致; 完整文本通常无残留)
+        if !broke && !pending_bytes.is_empty() {
+            let tail = String::from_utf8_lossy(&pending_bytes);
+            if !tail.is_empty() {
+                on_delta(&tail);
+            }
+        }
+
+        let decode_ms = decode_start.elapsed().as_millis();
+        let n_gen = generated_ids.len();
+        eprintln!("[bench] session_reply: prefill({n_input}t)={prefill_ms}ms, decode({n_gen}t)={decode_ms}ms (~{}ms/tok ~{:.2} tok/s)",
+            if n_gen > 0 { decode_ms / n_gen as u128 } else { 0 },
+            if decode_ms > 0 { n_gen as f64 * 1000.0 / decode_ms as f64 } else { 0.0 });
+
+        Ok(generated_ids)
+    })();
+
+    // 无论成功失败都移回状态 (关键: 避免 KV cache 丢失)
+    restore_ctx_state(session, &mut ctx);
+
+    let generated_ids = inner_result?;
     session.history_tokens.extend(&input_ids);
     session.history_tokens.extend(&generated_ids);
 
@@ -337,13 +566,69 @@ pub fn session_reply_with_vision(
     n_vision_per_image: usize,
     image_token_id: u32,
 ) -> Result<String> {
+    // 文本路径无进度回调 (兼容旧调用方)
+    session_reply_with_vision_inner(
+        cfg, weights, tokenizer, session, user_msg, max_tokens, params,
+        vision_embeddings, n_vision_per_image, image_token_id,
+        None, None,
+    )
+}
+
+/// 流式版 session_reply_with_vision: 支持 on_delta 增量文本 + on_progress 进度上报
+///
+/// 与 session_reply_with_vision 的区别:
+/// - decode 循环中每步通过 on_delta 上报增量文本 (UTF-8 边界对齐)
+/// - prefill 阶段每批 forward_batch 完成后通过 on_progress 上报 (done_tokens, total_tokens)
+pub fn session_reply_with_vision_stream(
+    cfg: &Config,
+    weights: &LoadedWeights,
+    tokenizer: &BpeTokenizer,
+    session: &mut Session,
+    user_msg: &str,
+    max_tokens: usize,
+    params: SamplingParams,
+    vision_embeddings: &[f32],
+    n_vision_per_image: usize,
+    image_token_id: u32,
+    on_delta: &mut dyn FnMut(&str) -> bool,
+    on_progress: &mut dyn FnMut(crate::engine::ProgressEvent),
+) -> Result<String> {
+    use crate::engine::ProgressEvent;
+    session_reply_with_vision_inner(
+        cfg, weights, tokenizer, session, user_msg, max_tokens, params,
+        vision_embeddings, n_vision_per_image, image_token_id,
+        Some(on_delta),
+        Some(on_progress as &mut dyn FnMut(ProgressEvent)),
+    )
+}
+
+fn session_reply_with_vision_inner(
+    cfg: &Config,
+    weights: &LoadedWeights,
+    tokenizer: &BpeTokenizer,
+    session: &mut Session,
+    user_msg: &str,
+    max_tokens: usize,
+    params: SamplingParams,
+    vision_embeddings: &[f32],
+    n_vision_per_image: usize,
+    image_token_id: u32,
+    mut on_delta: Option<&mut dyn FnMut(&str) -> bool>,
+    on_progress: Option<&mut dyn FnMut(crate::engine::ProgressEvent)>,
+) -> Result<String> {
     use daiza_engine::model::forward::{forward_batch_with_vision, VisionInject};
+    use crate::engine::ProgressEvent;
 
     // 1. 构造带 image_token 占位符的增量文本
+    // n_images 从 vision_embeddings 反推 (engine.rs 已 drain pending_images, 不能依赖其长度)
+    let hidden = cfg.hidden;
+    let n_images = if n_vision_per_image > 0 && hidden > 0 {
+        vision_embeddings.len() / (n_vision_per_image * hidden)
+    } else { 0 };
     let image_token_str = tokenizer.vocab.tokens.get(image_token_id as usize)
         .cloned().unwrap_or_else(|| "<|image_pad|>".to_string());
     let mut image_section = String::new();
-    for _ in 0..session.pending_images.len() {
+    for _ in 0..n_images {
         image_section.push_str(&image_token_str);
     }
 
@@ -364,7 +649,12 @@ pub fn session_reply_with_vision(
     increment.push_str("<|im_end|>\n");
     increment.push_str("<|im_start|>assistant\n");
     if session.think_enabled {
+        // <think>\n (换行符) — <think> special token + \n 普通 token
         increment.push_str("<think>\n");
+    } else {
+        // ★ think 关闭: 追加空 think 块 <think></think>\n (与普通 session_reply 一致)
+        //   避免模型自发生成 <think>...长篇think内容</think> 浪费算力
+        increment.push_str("<think></think>\n");
     }
 
     let input_ids = tokenizer.encode(&increment);
@@ -389,85 +679,126 @@ pub fn session_reply_with_vision(
         hidden_tap_batch_buf: Vec::new(),
     };
 
-    // 3. prefill: text + vision 混合注入
-    //    策略: 逐 token 扫描, image_token 位置批量注入 vision embeddings,
-    //    其他 token 累积成 text batch 走 forward_batch
-    let hidden = cfg.hidden;
-    const MAX_TEXT_BATCH: usize = 32;
-    const MAX_VISION_BATCH: usize = 64;
-    let mut text_batch: Vec<u32> = Vec::with_capacity(MAX_TEXT_BATCH);
-    let mut vision_offset = 0usize;
+    // 3-4. prefill + decode 封装到 IIFE
+    // ★ 错误安全: vision prefill 中 flush_text/flush_vision 的 `?` 失败, 或 decode 中
+    //   forward_single_token 的 `?` 失败, 都会让闭包返回 Err, 但 ctx 不会被 drop,
+    //   外层 restore_ctx_state 保证 KV cache + pos 回移到 session。
+    //   这对 vision 模式尤其重要: vision embeddings 已注入 KV cache, 若错误路径丢失,
+    //   下一轮普通模式将完全失去图片上下文 (用户反馈"每次对话都是独立的"的根因之一)。
+    let inner_result: Result<Vec<u32>> = (|| {
+        // 3. prefill: text + vision 混合注入 + 进度上报
+        //    总 token 数 = input_ids.len() + n_images * (n_vision_per_image - 1)
+        //    (每个 image_token 占位符展开为 n_vision_per_image 个 vision token)
+        let total_prefill_tokens = input_ids.len() + n_images * n_vision_per_image.saturating_sub(1);
+        let mut done_prefill_tokens = 0usize;
+        const MAX_TEXT_BATCH: usize = 32;
+        const MAX_VISION_BATCH: usize = 64;
+        let mut text_batch: Vec<u32> = Vec::with_capacity(MAX_TEXT_BATCH);
+        let mut vision_offset = 0usize;
 
-    let flush_text = |batch: &mut Vec<u32>, ctx: &mut ForwardContext<'_>| -> crate::Result<()> {
-        if batch.is_empty() { return Ok(()); }
-        if batch.len() == 1 {
-            forward_single_token(ctx, batch[0])?;
-        } else {
-            forward_batch(ctx, batch, ctx.state.pos, None)?;
-        }
-        batch.clear();
-        Ok(())
-    };
-    let flush_vision = |ctx: &mut ForwardContext<'_>, emb: &[f32]| -> crate::Result<()> {
-        let n = emb.len() / hidden;
-        debug_assert_eq!(emb.len(), n * hidden);
-        let token_ids: Vec<u32> = vec![image_token_id; n];
-        let inject = VisionInject {
-            image_token_id,
-            vision_embeddings: emb,
-            n_vision_per_image: 1,
+        // flush_text + flush_vision: 内联闭包, 完成后上报 prefill 进度
+        // (text batch: +batch.len(); vision batch: +bs)
+        let flush_text = |batch: &mut Vec<u32>, ctx: &mut ForwardContext<'_>,
+                          done: &mut usize, prog: &mut Option<&mut dyn FnMut(ProgressEvent)>| -> crate::Result<()> {
+            if batch.is_empty() { return Ok(()); }
+            let n = batch.len();
+            if n == 1 {
+                forward_single_token(ctx, batch[0])?;
+            } else {
+                forward_batch(ctx, batch, ctx.state.pos, None)?;
+            }
+            batch.clear();
+            *done += n;
+            if let Some(cb) = prog.as_deref_mut() {
+                cb(ProgressEvent::Prefill { done_tokens: *done, total_tokens: total_prefill_tokens });
+            }
+            Ok(())
         };
-        forward_batch_with_vision(ctx, &token_ids, ctx.state.pos, None, Some(inject))
-    };
-
-    for &tid in &input_ids {
-        if tid == image_token_id {
-            flush_text(&mut text_batch, &mut ctx)?;
-            let mut vi = 0;
-            while vi < n_vision_per_image {
-                let bs = MAX_VISION_BATCH.min(n_vision_per_image - vi);
-                let s = (vision_offset + vi) * hidden;
-                let e = s + bs * hidden;
-                flush_vision(&mut ctx, &vision_embeddings[s..e])?;
-                vi += bs;
+        let flush_vision = |ctx: &mut ForwardContext<'_>, emb: &[f32],
+                            done: &mut usize, prog: &mut Option<&mut dyn FnMut(ProgressEvent)>| -> crate::Result<()> {
+            let n = emb.len() / hidden;
+            debug_assert_eq!(emb.len(), n * hidden);
+            let token_ids: Vec<u32> = vec![image_token_id; n];
+            let inject = VisionInject {
+                image_token_id,
+                vision_embeddings: emb,
+                n_vision_per_image: 1,
+            };
+            forward_batch_with_vision(ctx, &token_ids, ctx.state.pos, None, Some(inject), None)?;
+            *done += n;
+            if let Some(cb) = prog.as_deref_mut() {
+                cb(ProgressEvent::Prefill { done_tokens: *done, total_tokens: total_prefill_tokens });
             }
-            vision_offset += n_vision_per_image;
-        } else {
-            text_batch.push(tid);
-            if text_batch.len() >= MAX_TEXT_BATCH {
-                flush_text(&mut text_batch, &mut ctx)?;
+            Ok(())
+        };
+
+        let mut prog = on_progress;
+        for &tid in &input_ids {
+            if tid == image_token_id {
+                flush_text(&mut text_batch, &mut ctx, &mut done_prefill_tokens, &mut prog)?;
+                let mut vi = 0;
+                while vi < n_vision_per_image {
+                    let bs = MAX_VISION_BATCH.min(n_vision_per_image - vi);
+                    let s = (vision_offset + vi) * hidden;
+                    let e = s + bs * hidden;
+                    flush_vision(&mut ctx, &vision_embeddings[s..e], &mut done_prefill_tokens, &mut prog)?;
+                    vi += bs;
+                }
+                vision_offset += n_vision_per_image;
+            } else {
+                text_batch.push(tid);
+                if text_batch.len() >= MAX_TEXT_BATCH {
+                    flush_text(&mut text_batch, &mut ctx, &mut done_prefill_tokens, &mut prog)?;
+                }
             }
         }
-    }
-    flush_text(&mut text_batch, &mut ctx)?;
+        flush_text(&mut text_batch, &mut ctx, &mut done_prefill_tokens, &mut prog)?;
 
-    // 4. decode 循环 (与 session_reply 一致)
-    let mut rng = LcgRng::new(0xC0FFEE);
-    let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
-    let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
+        // 4. decode 循环 + 增量回调
+        let mut rng = LcgRng::new(0xC0FFEE);
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
+        let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
+        let mut pending_bytes: Vec<u8> = Vec::new();
+        let mut broke = false;
 
-    for _step in 0..max_tokens {
-        let next_id = sample_top_k_top_p_into(
-            &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
-        );
-        if next_id as u32 == cfg.eos_token_id {
-            break;
+        for _step in 0..max_tokens {
+            let next_id = sample_top_k_top_p_into(
+                &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
+            );
+            if next_id as u32 == cfg.eos_token_id {
+                break;
+            }
+            generated_ids.push(next_id as u32);
+            forward_single_token(&mut ctx, next_id as u32)?;
+
+            if let Some(cb) = on_delta.as_deref_mut() {
+                decode_token_bytes(tokenizer, next_id as u32, &mut pending_bytes);
+                let delta = drain_complete_utf8(&mut pending_bytes);
+                if !delta.is_empty() && !cb(&delta) {
+                    broke = true;
+                    break;
+                }
+            }
         }
-        generated_ids.push(next_id as u32);
-        forward_single_token(&mut ctx, next_id as u32)?;
-    }
+        if !broke {
+            if let Some(cb) = on_delta.as_deref_mut() {
+                if !pending_bytes.is_empty() {
+                    let tail = String::from_utf8_lossy(&pending_bytes);
+                    if !tail.is_empty() { cb(&tail); }
+                }
+            }
+        }
+        Ok(generated_ids)
+    })();
 
-    // 5. state/buffers 移回 session
-    session.state = std::mem::take(&mut ctx.state);
-    session.h_buf = std::mem::take(&mut ctx.h_buf);
-    session.workspace = std::mem::take(&mut ctx.workspace);
-    session.logits_buf = std::mem::take(&mut ctx.logits_buf);
-    session.cos_buf = std::mem::take(&mut ctx.cos_buf);
-    session.sin_buf = std::mem::take(&mut ctx.sin_buf);
+    // 5. state/buffers 移回 session (无论成功失败都执行, 避免 KV cache 丢失)
+    restore_ctx_state(session, &mut ctx);
+
+    let generated_ids = inner_result?;
     session.history_tokens.extend(&input_ids);
     session.history_tokens.extend(&generated_ids);
 
-    // 6. 消费 pending_images
+    // 6. 消费 pending_images (engine.rs 已 drain, 这里 clear 兜底)
     session.pending_images.clear();
 
     crate::session_persist::dump_tokens_if_enabled(&input_ids, &generated_ids)?;
@@ -478,9 +809,13 @@ pub fn session_reply_with_vision(
 ///
 /// 与普通 session_reply 的区别:
 /// - 每次都从 0 开始 prefill 完整 messages (tool_call 需要 multi-step 完整重渲染)
+///   TODO(perf): 多轮 tool_call 下每轮都从 pos=0 重 prefill 整段历史 → 跨轮 O(N²)。
+///               后续可考虑增量 prefill + KV cache 复用 (需解决 tool_call 模板
+///               增量拼接的复杂性, 当前为正确性优先而完整重渲染)。
 /// - 不走增量 prefill (messages 历史复杂, 增量拼接易出错)
 /// - 渲染 system prompt 时注入 tools 定义
 /// - decode 后解析 <tool_call> 标签, 返回结构化 ToolCall 结果
+#[allow(dead_code)]
 fn session_reply_with_tools(
     cfg: &Config,
     weights: &LoadedWeights,
@@ -594,6 +929,8 @@ fn session_reply_with_tools(
 /// 本函数会:
 /// 1. 把 ToolResponse 追加到 session.messages
 /// 2. 从 0 开始完整 prefill + decode (与 session_reply_with_tools 一致)
+///    TODO(perf): 与 session_reply_with_tools 相同的跨轮 O(N²) 重 prefill 问题;
+///                每次 tool response 都重跑整段历史。后续可与 tools 路径一并优化。
 pub fn session_reply_with_tool_response(
     cfg: &Config,
     weights: &LoadedWeights,

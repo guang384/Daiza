@@ -43,6 +43,36 @@ fn ms_per(total_ms: u128, n: usize) -> u128 {
     if n == 0 { 0 } else { total_ms / n as u128 }
 }
 
+/// DSpark 流式事件: 用于前端实现"乐观显示 draft + verify 后修正"的 UX
+///
+/// - Draft: drafter 预测的文本 (前端灰色乐观显示)
+/// - Accept: draft 全部通过 verify (前端保留灰色文本, 可选转黑)
+/// - Reject: draft 部分被拒, text 为通过 verify 的 accepted 部分
+///           (前端删除上一个 Draft 的全部文本, 用 text 替换, 黑色)
+/// - Delta: 正常增量 (bonus token / fallback greedy, 黑色)
+pub enum DsparkEvent {
+    /// drafter 预测的文本 (乐观显示)
+    Draft(String),
+    /// draft 全部通过 verify
+    Accept,
+    /// draft 部分被拒, text = accepted 部分 (前端删除 draft, 用 text 替换)
+    Reject(String),
+    /// 正常增量 (bonus / fallback greedy)
+    Delta(String),
+}
+
+/// 推理进度事件: 用于前端显示 prefill / vision 处理进度条
+///
+/// - Vision: 图像处理阶段 (preprocess / encode / project), 进度按 image_idx / total
+/// - Prefill: 文本+图像 token prefill 阶段, 进度按 done_tokens / total_tokens
+pub enum ProgressEvent {
+    /// 图像处理进度: (image_idx 0-based, total_images, stage_name, elapsed_ms)
+    Vision { image_idx: usize, total: usize, stage: &'static str, ms: u128 },
+    /// Prefill 进度: (已处理 token 数, 总 token 数)
+    /// n_total 包含 text tokens + vision tokens (每张图展开为 n_vision_per_image 个 token)
+    Prefill { done_tokens: usize, total_tokens: usize },
+}
+
 /// 多模态视觉上下文 (mmproj 加载后填充)
 pub struct VisionContext {
     pub cfg: VisionConfig,
@@ -194,6 +224,14 @@ impl Engine {
             daiza_engine::model::workspace::init_thread_pool(n_threads);
             eprintln!("[engine] thread pool ({n_threads} workers) initialized");
         }
+        // ★ 重置 DSpark spec_ctx cache: 新 session 的 dspark_tap_history 为空,
+        //   spec_ctx 的 target_tap_len / cached_ctx_len / cached_kv_len 也需重置,
+        //   否则跨 session 复用旧 cache 会导致 drafter context 不一致
+        if let Some(spec) = self.spec_ctx.as_mut() {
+            spec.target_tap_len = 0;
+            spec.drafter.cached_ctx_len = 0;
+            spec.drafter.cached_kv_len = 0;
+        }
         let sys = system_prompt.map(String::from);
         self.session = Some(Session::new(&self.config, think_enabled, sys));
         Ok(())
@@ -243,6 +281,29 @@ impl Engine {
         ))?;
         crate::session::session_reply_stream(
             cfg, weights, &self.tokenizer, session, user_msg, max_tokens, params, on_delta,
+        )
+    }
+
+    /// tool_response 回传后的流式生成
+    ///
+    /// 前端执行工具后, 把结果通过本函数送回模型, 模型继续生成下一轮回复。
+    /// 构造 tool_response 格式的增量 prompt, 复用 session_reply_stream 的核心逻辑。
+    pub fn session_reply_tool_response_stream(
+        &mut self,
+        tool_content: &str,
+        max_tokens: usize,
+        params: SamplingParams,
+        on_delta: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String> {
+        let session = self.session.as_mut().ok_or(crate::BonsaiError::Unsupported(
+            "no active session; call session_begin() first".into()
+        ))?;
+        let cfg = &self.config;
+        let weights = self.weights.as_ref().ok_or(crate::BonsaiError::Unsupported(
+            "weights not loaded".into()
+        ))?;
+        crate::session::session_reply_tool_response_stream(
+            cfg, weights, &self.tokenizer, session, tool_content, max_tokens, params, on_delta,
         )
     }
 
@@ -336,6 +397,101 @@ impl Engine {
             &self.config, weights, &self.tokenizer, session,
             user_msg, max_tokens, params,
             &vision_embeddings, n_vision_per_image, image_token_id,
+        )
+    }
+
+    /// 流式多模态对话: 与 session_reply_with_vision 行为一致, 但
+    /// 1. 每生成一个 token 通过 `on_delta` 回调增量文本 (供 GUI / Web 流式渲染)
+    /// 2. vision 三阶段 (preprocess / encode / project) 和 prefill 阶段
+    ///    通过 `on_progress` 回调上报进度 (供前端显示进度条)
+    ///
+    /// 回调返回 false 可中断生成 (仅 on_delta 生效; on_progress 返回值忽略)
+    pub fn session_reply_with_vision_stream(
+        &mut self,
+        user_msg: &str,
+        max_tokens: usize,
+        params: SamplingParams,
+        on_delta: &mut dyn FnMut(&str) -> bool,
+        on_progress: &mut dyn FnMut(ProgressEvent),
+    ) -> Result<String> {
+        // 无 pending_images: 退化为普通 session_reply_stream
+        // 文本路径 prefill 通常 < 200ms, 进度条无意义, 不上报
+        let has_images = self.session.as_ref()
+            .map(|s| !s.pending_images.is_empty())
+            .unwrap_or(false);
+        if !has_images {
+            return self.session_reply_stream(user_msg, max_tokens, params, on_delta);
+        }
+
+        if self.vision.is_none() {
+            return Err(crate::BonsaiError::Unsupported(
+                "mmproj not loaded; call load_mmproj() first".into()
+            ));
+        }
+        if self.weights.is_none() {
+            return Err(crate::BonsaiError::Unsupported(
+                "weights not loaded".into()
+            ));
+        }
+
+        // 1. 对每张图做 preprocess → encode → project, 拼接 vision_embeddings + 上报进度
+        let image_token_id = self.image_token_id()?;
+        let images: Vec<_> = {
+            let session = self.session.as_mut().ok_or(crate::BonsaiError::Unsupported(
+                "no active session; call session_begin() first".into()
+            ))?;
+            session.pending_images.drain(..).collect()
+        };
+        let n_images = images.len();
+        let n_vision_per_image;
+        let vision_embeddings: Vec<f32> = {
+            let vision = self.vision.as_mut().unwrap();
+            n_vision_per_image = vision.cfg.n_patches_merged();
+            let proj_dim = vision.cfg.projection_dim;
+            let hidden = self.config.hidden;
+            if proj_dim != hidden {
+                return Err(crate::BonsaiError::Model(format!(
+                    "mmproj projection_dim ({proj_dim}) != text model hidden ({hidden}), vision embeddings 无法直接注入"
+                )));
+            }
+            let mut all_emb = Vec::with_capacity(n_images * n_vision_per_image * hidden);
+            for (img_idx, img_path) in images.iter().enumerate() {
+                let t0 = std::time::Instant::now();
+                let patches = preprocess_image(img_path, &vision.cfg)?;
+                let t_pre = t0.elapsed();
+                on_progress(ProgressEvent::Vision { image_idx: img_idx, total: n_images, stage: "preprocess", ms: t_pre.as_millis() });
+
+                let t1 = std::time::Instant::now();
+                encode_image(&vision.weights, &vision.cfg, &mut vision.vit_ctx, &patches)?;
+                let t_enc = t1.elapsed();
+                on_progress(ProgressEvent::Vision { image_idx: img_idx, total: n_images, stage: "encode", ms: t_enc.as_millis() });
+
+                let t2 = std::time::Instant::now();
+                project_vision(&vision.vit_ctx.hidden, &vision.weights, &vision.cfg, &mut vision.proj_ctx)?;
+                let t_proj = t2.elapsed();
+                on_progress(ProgressEvent::Vision { image_idx: img_idx, total: n_images, stage: "project", ms: t_proj.as_millis() });
+
+                let proj_out = &vision.proj_ctx.projected;
+                all_emb.extend_from_slice(proj_out);
+                eprintln!("[vision] image {}: pre={:.1}ms enc={:.1}ms proj={:.1}ms total={:.1}ms ({} patches → {} merged)",
+                    img_path.display(),
+                    t_pre.as_secs_f64() * 1000.0,
+                    t_enc.as_secs_f64() * 1000.0,
+                    t_proj.as_secs_f64() * 1000.0,
+                    (t_pre + t_enc + t_proj).as_secs_f64() * 1000.0,
+                    vision.cfg.n_patches, n_vision_per_image);
+            }
+            all_emb
+        };
+
+        // 2. 调用 session_reply_with_vision_stream (session.rs 中实现)
+        let weights = self.weights.as_ref().unwrap();
+        let session = self.session.as_mut().unwrap();
+        crate::session::session_reply_with_vision_stream(
+            &self.config, weights, &self.tokenizer, session,
+            user_msg, max_tokens, params,
+            &vision_embeddings, n_vision_per_image, image_token_id,
+            on_delta, on_progress,
         )
     }
 
@@ -503,7 +659,7 @@ impl Engine {
                 vision_embeddings: emb,
                 n_vision_per_image: 1,
             };
-            forward_batch_with_vision(ctx, &token_ids, ctx.state.pos, None, Some(inject))
+            forward_batch_with_vision(ctx, &token_ids, ctx.state.pos, None, Some(inject), None)
         };
 
         for &tid in &input_ids {
@@ -730,6 +886,28 @@ impl Engine {
         params: SamplingParams,
         system_prompt: Option<&str>,
         confidence_threshold: f32,
+        fallback_enabled: bool,
+    ) -> Result<String> {
+        // 无回调包装: 忽略所有流式事件, 最后一次性 decode (CLI 用)
+        let mut noop = |_e: DsparkEvent| -> bool { true };
+        self.generate_with_dspark_stream(
+            prompt, max_tokens, params, system_prompt, confidence_threshold, fallback_enabled, &mut noop,
+        )
+    }
+
+    /// DSpark 流式版本: 通过 on_event 回调发出 Draft/Accept/Reject/Delta 事件
+    ///
+    /// 前端可实现"乐观显示": drafter 预测的文本先灰色显示, verify 通过保留,
+    /// verify 拒绝则用 accepted 部分替换。回调返回 false 可中断生成。
+    pub fn generate_with_dspark_stream(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        params: SamplingParams,
+        system_prompt: Option<&str>,
+        confidence_threshold: f32,
+        fallback_enabled: bool,
+        on_event: &mut dyn FnMut(DsparkEvent) -> bool,
     ) -> Result<String> {
         if self.spec_ctx.is_none() {
             return Err(crate::BonsaiError::Unsupported(
@@ -739,14 +917,15 @@ impl Engine {
 
         // 1. 构造输入
         // ★ DAIZA_DSPARK_RAW=1: 用 raw prompt (不走 chat template), 对齐 llama.cpp test-dspark-real-eval
-        let chat_text = if std::env::var("DAIZA_DSPARK_RAW").is_ok() {
+        // ★ 若 prompt 已包含 <|im_start|> (Web 端 handle_chat_dspark 构造的完整 chat 格式,
+        //   含/不含 <think>\n 由 session.think_enabled 控制), 直接使用, 不再 build_chat_input
+        //   包装 (否则会无条件追加 <think>\n, 导致 thinking 开关失效)
+        let chat_text = if std::env::var("DAIZA_DSPARK_RAW").is_ok() || prompt.contains("<|im_start|>") {
             prompt.to_string()
         } else {
             build_chat_input(prompt, system_prompt)
         };
-        eprintln!("[debug] input text: {chat_text:?}");
         let input_ids = self.tokenizer.encode(&chat_text);
-        eprintln!("[debug] input_ids count: {}", input_ids.len());
         if input_ids.is_empty() {
             return Err(crate::BonsaiError::Tokenizer("encode returned empty".into()));
         }
@@ -761,31 +940,84 @@ impl Engine {
         }
 
         // 3. 构造前向上下文 + 启用 hidden tap
+        // ★ 增量模式: 若 self.session 存在, 从 session 取 state/buffers/tap_history,
+        //   增量 prefill (只编码新增 token, 复用 KV cache + SSM state + drafter context)
+        //   跨轮 KV cache 复用: 第二轮 prefill 从 M tokens (新增) 而非 N tokens (全历史)
+        // ★ 全量模式: 无 session (CLI 单次生成), 创建新 ctx, 全量 prefill (原行为)
         let cfg = &self.config;
         let weights = self.weights.as_ref().unwrap();
-        let mut ctx = make_context(weights, cfg);
-        // 启用 hidden tap: 从 spec_ctx 读 target_layers
-        {
-            let spec = self.spec_ctx.as_ref().unwrap();
-            ctx.hidden_tap_layers = spec.cfg().target_layers.clone();
-            eprintln!("[dspark] target tap layers: {:?}", ctx.hidden_tap_layers);
-        }
+        let n_tap_layers;
+        let start_pos;
+        // session_take: 从 engine 取出的 session (增量模式), 函数末尾放回
+        let mut session_take: Option<crate::session::Session> = None;
+        let mut ctx = if self.session.is_some() {
+            // ★ 增量模式: 从 session 取状态
+            let mut session = self.session.take().unwrap();
+            start_pos = session.state.pos;
+            n_tap_layers = if session.dspark_tap_layers.is_empty() {
+                let spec = self.spec_ctx.as_ref().unwrap();
+                let layers = spec.cfg().target_layers.clone();
+                session.dspark_tap_layers = layers.clone();
+                layers.len()
+            } else {
+                session.dspark_tap_layers.len()
+            };
+            let hidden_tap_layers = session.dspark_tap_layers.clone();
+            eprintln!("[dspark] incremental mode: start_pos={start_pos}, tap_layers={n_tap_layers}");
+            // ★ 不重置 spec_ctx cache (跨轮复用 target_tap_len / cached_ctx_len / cached_kv_len)
+            session_take = Some(session);
+            ForwardContext {
+                cfg, weights,
+                state: std::mem::take(&mut session_take.as_mut().unwrap().state),
+                h_buf: std::mem::take(&mut session_take.as_mut().unwrap().h_buf),
+                workspace: std::mem::take(&mut session_take.as_mut().unwrap().workspace),
+                logits_buf: std::mem::take(&mut session_take.as_mut().unwrap().logits_buf),
+                cos_buf: std::mem::take(&mut session_take.as_mut().unwrap().cos_buf),
+                sin_buf: std::mem::take(&mut session_take.as_mut().unwrap().sin_buf),
+                hidden_tap_buf: Vec::new(),
+                hidden_tap_layers,
+                hidden_tap_batch_buf: Vec::new(),
+            }
+        } else {
+            // ★ 全量模式: 创建新 ctx (CLI 单次生成)
+            start_pos = 0;
+            let mut ctx = make_context(weights, cfg);
+            {
+                let spec = self.spec_ctx.as_mut().unwrap();
+                ctx.hidden_tap_layers = spec.cfg().target_layers.clone();
+                n_tap_layers = ctx.hidden_tap_layers.len();
+                eprintln!("[dspark] full mode: tap_layers={n_tap_layers}");
+                // 重置 spec_ctx cache (全量 prefill, 新 target_tap_history)
+                spec.target_tap_len = 0;
+                spec.drafter.cached_ctx_len = 0;
+                spec.drafter.cached_kv_len = 0;
+            }
+            ctx
+        };
 
         // 4. prefill (对齐 llama.cpp speculative-simple.cpp L210-216:
         //    forward N-1 tokens, 最后一个 token 作为 anchor/id_last, 不 forward)
-        //    Daiza 之前是 forward N tokens + sample generated anchor + forward anchor,
-        //    与 llama.cpp 语义不一致, 导致 context 多 1 行 + start_pos 偏移 1, 接受率降。
+        //    ★ 增量模式: start_pos = session.state.pos (从 KV cache 末尾继续)
+        //    ★ 全量模式: start_pos = 0 (从头 prefill)
         let n_input = input_ids.len();
         let prefill_start = std::time::Instant::now();
+        // ★ 累积所有 prefill batch 的 hidden tap (而非只保留最后一个 batch)
+        let mut prefill_tap_acc: Vec<f32> = Vec::new();
         if n_input >= 2 {
-            // prefill 前 N-1 tokens (去掉最后一个作为 anchor)
             let prefill_ids = &input_ids[..n_input - 1];
-            forward_batch(&mut ctx, prefill_ids, 0, None)?;
+            const MAX_BATCH: usize = 64;
+            let np = prefill_ids.len();
+            let mut off = 0usize;
+            while off < np {
+                let end = (off + MAX_BATCH).min(np);
+                forward_batch(&mut ctx, &prefill_ids[off..end], start_pos + off, None)?;
+                prefill_tap_acc.extend_from_slice(&ctx.hidden_tap_batch_buf);
+                off = end;
+            }
         }
-        // n_input == 1: 无 prefill, anchor = input_ids[0], 稍后 forward
         let prefill_ms = prefill_start.elapsed().as_millis();
         let n_prefill = if n_input >= 2 { n_input - 1 } else { 0 };
-        eprintln!("\r[prefill] {n_prefill}/{n_input} done in {prefill_ms}ms");
+        eprintln!("\r[prefill] {n_prefill}/{n_input} done in {prefill_ms}ms (start_pos={start_pos})");
 
         // 5. DSpark decode 循环
         let mut rng = LcgRng::new(0xC0FFEE);
@@ -794,20 +1026,20 @@ impl Engine {
 
         // 累积 target tap history: 每个已 forward token 一行 [n_embd_cap]
         // draft 时传整个 history 作为 drafter context (对齐 llama.cpp ctx_feat 累积语义)
-        let n_tap_layers = ctx.hidden_tap_layers.len();
         let hidden = cfg.hidden;
         let n_embd_cap = n_tap_layers * hidden;
-        // ★ 预分配: 避免 extend_from_slice 触发 Vec realloc (200 token × 100KB = 20MB 累积,
-        //   每次 realloc 复制已有 buffer, log2(N)≈18 次 realloc 累积 ~2x final size copy)
-        //   上界 = (prefill_tokens + anchor + max_tokens) * n_embd_cap
-        let est_rows = n_input.saturating_add(max_tokens);
-        let mut target_tap_history: Vec<f32> = Vec::with_capacity(est_rows * n_embd_cap);
+        // ★ 增量模式: 从 session 取已累积的 target_tap_history (跨轮复用)
+        // ★ 全量模式: 新建空 target_tap_history
+        let mut target_tap_history: Vec<f32> = if let Some(session) = session_take.as_mut() {
+            std::mem::take(&mut session.dspark_tap_history)
+        } else {
+            let est_rows = n_input.saturating_add(max_tokens);
+            Vec::with_capacity(est_rows * n_embd_cap)
+        };
 
-        // prefill 阶段: forward_batch 已捕获 hidden_tap_batch_buf [n_batch, n_tap, hidden]
-        // 累积到 history (行优先 token-major, 与 set_target_tap 期望一致)
-        if n_input >= 2 {
-            target_tap_history.extend_from_slice(&ctx.hidden_tap_batch_buf);
-        }
+        // prefill 阶段: 已逐批累积到 prefill_tap_acc (行优先 token-major)
+        // 直接追加到 target_tap_history (增量模式下 history 已含历史行)
+        target_tap_history.extend_from_slice(&prefill_tap_acc);
 
         // anchor = 最后一个 prefill token (对齐 llama.cpp: id_last = inp.back())
         // 不 sample, 不加入 generated_ids (anchor 不是生成的 token)
@@ -817,9 +1049,48 @@ impl Engine {
         // 累积 anchor 的 hidden tap
         target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
 
+        // ★ think 关闭时, build_increment / handle_chat_dspark 已在 prompt 末尾预填空 think 块
+        //   <think></think>\n, 模型不再生成 <think>...</think> 内容, 直接输出正式回答。
+        //   因此 think_suppress 恒为 false, 不再需要 suppress_buf 过滤逻辑。
+        //   (保留 think_suppress 变量仅为 emit_delta! / Accept/Reject 条件分支兼容)
+        let _think_enabled = session_take.as_ref().map(|s| s.think_enabled).unwrap_or(false);
+        let mut think_suppress = false;
+        let mut suppress_buf: String = String::new();
+
         let decode_start = std::time::Instant::now();
         let stream_output = !matches!(std::env::var("DAIZA_STREAM").as_deref(),
             Ok("0") | Ok("false") | Ok("no"));
+        // 增量解码缓冲 (跨 token 不完整 UTF-8 字节暂存, 与 session_reply_stream 一致)
+        let mut pending_bytes: Vec<u8> = Vec::new();
+        let mut broke = false;
+        // 增量回调 helper: decode token → drain UTF-8 → emit Delta, 返回 false 则中断
+        // ★ think_suppress 模式下: 累积文本到 suppress_buf, 检测 </think>, 过滤 think 内容
+        macro_rules! emit_delta {
+            ($tid:expr) => {{
+                use crate::session::{decode_token_bytes, drain_complete_utf8};
+                decode_token_bytes(&self.tokenizer, $tid as u32, &mut pending_bytes);
+                let delta = drain_complete_utf8(&mut pending_bytes);
+                if !delta.is_empty() {
+                    if think_suppress {
+                        suppress_buf.push_str(&delta);
+                        if let Some(idx) = suppress_buf.find("</think>") {
+                            let after = suppress_buf[idx + 8..].to_string();
+                            suppress_buf.clear();
+                            think_suppress = false;
+                            if !after.is_empty() && !on_event(DsparkEvent::Delta(after)) {
+                                broke = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        if !on_event(DsparkEvent::Delta(delta)) {
+                            broke = true;
+                            break;
+                        }
+                    }
+                }
+            }};
+        }
 
         let block_size = self.spec_ctx.as_ref().unwrap().cfg().block_size;
         let mut total_draft_calls = 0usize;
@@ -841,10 +1112,7 @@ impl Engine {
         // 判定依据: probe 窗口内 dspark ms/token 是否 > target 单 forward 实测耗时
         // (同进程同热状态对比, 免疫系统波动)。sequential verify 下 forwards/token 恒 = 1.0,
         // 故 DSpark 比原生慢 ⟺ draft overhead > 0 (恒成立)。
-        let fallback_enabled = !matches!(
-            std::env::var("DAIZA_DSPARK_FALLBACK").as_deref(),
-            Ok("0") | Ok("false") | Ok("no")
-        );
+        // fallback_enabled 由调用方传入 (Web API 开关 / CLI 环境变量)
         const PROBE_CYCLES: usize = 6;
         let mut probe_done = !fallback_enabled;
         let mut probe_cycles = 0usize;
@@ -890,6 +1158,28 @@ impl Engine {
             let n_draft_to_verify = self.spec_ctx.as_ref().unwrap()
                 .confident_prefix_length(confidence_threshold);
             total_draft_truncated += block_size - n_draft_to_verify;
+
+            // === 乐观显示: emit Draft 事件 (前端灰色显示预测文本) ===
+            // ★ think_suppress 时不发送 Draft 事件: 避免 drafter 预测的 think 内容
+            //   通过 Draft 事件发给前端显示。accept 的 token 后续通过 Delta 事件发送 (带过滤)
+            if n_draft_to_verify > 0 && !think_suppress {
+                let mut draft_buf: Vec<u8> = Vec::new();
+                for &dt in &draft_tokens[..n_draft_to_verify] {
+                    if dt == self.config.eos_token_id {
+                        break;
+                    }
+                    use crate::session::decode_token_bytes;
+                    decode_token_bytes(&self.tokenizer, dt, &mut draft_buf);
+                }
+                // lossy decode: draft 可能含不完整 UTF-8 (跨 token 字符), verify 后会修正
+                let draft_text = String::from_utf8_lossy(&draft_buf).into_owned();
+                if !draft_text.is_empty() {
+                    if !on_event(DsparkEvent::Draft(draft_text)) {
+                        broke = true;
+                        break;
+                    }
+                }
+            }
 
             // --- Phase 2: Sequential Verify with early stop ---
             // 逐 token forward + Leviathan check, reject 时立即停止。
@@ -953,13 +1243,47 @@ impl Engine {
 
                 // Accept: forward draft[i] (更新 KV/SSM, 产生 draft[i+1] 的 logits)
                 n_accepted += 1;
-                generated_ids.push(dt);
                 if dt == self.config.eos_token_id {
                     eprintln!("[dspark] EOS accepted at draft pos {i}");
-                    return Ok(self.tokenizer.decode(&generated_ids));
+                    // ★ EOS 不 push 到 generated_ids (与 session.rs decode 循环一致:
+                    //   EOS 终止生成且不加入输出文本, 否则 decode 会产生字面 "<|im_end|>" 文本)
+                    // ★ think_suppress 模式: 前端无 Draft 灰色文本, 不需发 Accept/Reject 事件
+                    //   EOS 之前的 accept token 已在循环中通过 emit_delta! 发送 (带 think 过滤)
+                    // ★ think 开启模式: 必须发 Accept/Reject 事件清除前端 Draft 灰色文本
+                    //   否则前端 Draft 乐观显示的文本永远不会被 commit (无后续 Delta/Reject)
+                    //   注: EOS token 不 decode 到文本, accepted_text 只含 EOS 之前的 token
+                    if !think_suppress && n_draft_to_verify > 0 {
+                        if n_accepted == n_draft_to_verify {
+                            if !on_event(DsparkEvent::Accept) {
+                                broke = true;
+                                break;
+                            }
+                        } else {
+                            let mut acc_buf: Vec<u8> = Vec::new();
+                            // 只 decode EOS 之前的 token (n_accepted-1, 排除 EOS 自身)
+                            for &at in &draft_tokens[..n_accepted - 1] {
+                                use crate::session::decode_token_bytes;
+                                decode_token_bytes(&self.tokenizer, at, &mut acc_buf);
+                            }
+                            let accepted_text = String::from_utf8_lossy(&acc_buf).into_owned();
+                            if !on_event(DsparkEvent::Reject(accepted_text)) {
+                                broke = true;
+                                break;
+                            }
+                        }
+                    }
+                    broke = true;
+                    break;
                 }
+                generated_ids.push(dt);
                 forward_single_token(&mut ctx, dt)?;
                 n_target_forwards += 1;
+                // ★ think_suppress 模式: accept 的 token 通过 emit_delta! 发送 (带 think 过滤)
+                //   不发 Accept/Reject 事件 (前端无 Draft 灰色文本需要修正)
+                // ★ think 开启模式: 不 emit_delta, 通过 Accept/Reject 事件修正前端 Draft 灰色文本
+                if think_suppress {
+                    emit_delta!(dt);
+                }
                 target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
 
                 if stream_output {
@@ -972,6 +1296,39 @@ impl Engine {
             // 注: sequential verify 只 forward 接受的 token,
             // ctx.state.pos = pos_before + n_accepted (forward_single_token 自然推进)
             // KV cache 也只含接受的 token, 无需 truncate
+
+            // === 乐观显示修正: 根据 verify 结果发 Accept / Reject 事件 ===
+            // - 全部 accept (n_accepted == n_draft_to_verify): emit Accept (前端灰色保留为最终文本)
+            // - 部分/全部 reject: emit Reject(accepted_text)
+            //   前端删除上一个 Draft 的全部文本, 用 accepted_text 替换 (黑色)
+            //   accepted_text = decode(draft_tokens[..n_accepted]) (lossy, 与 Draft 的 UTF-8 drain 一致)
+            // ★ think_suppress 模式: 不发 Accept/Reject 事件 (accept 的 token 已通过 emit_delta! 发送,
+            //   经过 suppress_buf 过滤 think 内容; 前端无 Draft 灰色文本需要修正)
+            if !think_suppress && n_draft_to_verify > 0 && !broke {
+                if n_accepted == n_draft_to_verify {
+                    if !on_event(DsparkEvent::Accept) {
+                        broke = true;
+                        break;
+                    }
+                } else {
+                    // decode accepted 部分
+                    let mut acc_buf: Vec<u8> = Vec::new();
+                    for &dt in &draft_tokens[..n_accepted] {
+                        use crate::session::decode_token_bytes;
+                        decode_token_bytes(&self.tokenizer, dt, &mut acc_buf);
+                    }
+                    let accepted_text = String::from_utf8_lossy(&acc_buf).into_owned();
+                    if !on_event(DsparkEvent::Reject(accepted_text)) {
+                        broke = true;
+                        break;
+                    }
+                }
+            }
+
+            // 增量回调中断: 跳过 Phase 3 + 退出 decode 循环
+            if broke {
+                break;
+            }
 
             // --- Phase 3: Bonus forward ---
             // reject: bonus = sample_bonus(target_logits_i, draft_logits_i) (已采样)
@@ -989,11 +1346,12 @@ impl Engine {
             let bt = bt_raw as u32;
             if bt == self.config.eos_token_id {
                 eprintln!("[dspark] EOS from bonus");
-                return Ok(self.tokenizer.decode(&generated_ids));
+                break;
             }
             generated_ids.push(bt);
             anchor_token = bt;
             forward_single_token(&mut ctx, bt)?;
+            emit_delta!(bt);
             n_target_forwards += 1;
             target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
             total_bonus += 1;
@@ -1055,6 +1413,7 @@ impl Engine {
                 }
                 generated_ids.push(next_id as u32);
                 forward_single_token(&mut ctx, next_id as u32)?;
+                emit_delta!(next_id);
                 if stream_output {
                     if let Some(s) = self.tokenizer.vocab.tokens.get(next_id as usize) {
                         eprint!("\r[dspark→native] -> {s}    ");
@@ -1064,6 +1423,13 @@ impl Engine {
         }
         if stream_output {
             eprintln!();
+        }
+        // 收尾: 未提前中断时, 把残留的不完整字节以 lossy 形式上报 (与 session_reply_stream 一致)
+        if !broke && !pending_bytes.is_empty() {
+            let tail = String::from_utf8_lossy(&pending_bytes);
+            if !tail.is_empty() {
+                let _ = on_event(DsparkEvent::Delta(tail.into_owned()));
+            }
         }
         let decode_ms = decode_start.elapsed().as_millis();
         let n_gen = generated_ids.len();
@@ -1099,6 +1465,20 @@ impl Engine {
             eprintln!("  per-token cost:  ~{}ms target + ~{}ms draft overhead",
                 ms_per(t_verify + t_bonus, n_target_forwards),
                 ms_per(t_draft, n_gen));
+        }
+
+        // ★ 增量模式: 状态移回 session (KV cache + SSM state + target_tap_history)
+        //   确保下一轮 DSpark 对话复用 KV cache, 避免全量 reprefill
+        if let Some(mut session) = session_take {
+            session.state = std::mem::take(&mut ctx.state);
+            session.h_buf = std::mem::take(&mut ctx.h_buf);
+            session.workspace = std::mem::take(&mut ctx.workspace);
+            session.logits_buf = std::mem::take(&mut ctx.logits_buf);
+            session.cos_buf = std::mem::take(&mut ctx.cos_buf);
+            session.sin_buf = std::mem::take(&mut ctx.sin_buf);
+            session.dspark_tap_layers = std::mem::take(&mut ctx.hidden_tap_layers);
+            session.dspark_tap_history = target_tap_history;
+            self.session = Some(session);
         }
 
         crate::session_persist::dump_tokens_if_enabled(&input_ids, &generated_ids)?;
@@ -1220,7 +1600,7 @@ fn build_chat_input(user_prompt: &str, system_prompt: Option<&str>) -> String {
     s.push_str("<|im_end|>\n");
     s.push_str("<|im_start|>assistant\n");
     // 思考模式:chat_template 的 else 分支(默认 enable_thinking=true)
-    // 输出 `<think>\n` 作为思考模式开始标记(从 GGUF 原始字节确认:3c 74 68 69 6e 6b 3e)
+    // <think> 作为 special token 被 tokenizer 识别, \n 作为普通 token
     s.push_str("<think>\n");
     s
 }

@@ -317,13 +317,15 @@ pub fn forward_batch(
     start_pos: usize,
     per_pos_logits: Option<&mut [f32]>,
 ) -> crate::Result<()> {
-    forward_batch_with_vision(ctx, token_ids, start_pos, per_pos_logits, None)
+    forward_batch_with_vision(ctx, token_ids, start_pos, per_pos_logits, None, None)
 }
 
 /// 多模态版 forward_batch: 支持 vision embeddings 注入
 ///
 /// `vision_inject`: 若 Some, token_ids 中匹配 image_token_id 的位置
 ///   被替换为 vision_embeddings 中接下来的 n_vision_per_image 个 hidden-dim 向量
+/// `on_block`: 若 Some, 每完成一个 block 调用一次 (blk_idx, block_count),
+///   用于 prefill 进度条上报. 返回 false 可中断 (当前实现忽略返回值, 仅做上报)
 #[allow(unsafe_code)]
 pub fn forward_batch_with_vision(
     ctx: &mut ForwardContext<'_>,
@@ -331,6 +333,7 @@ pub fn forward_batch_with_vision(
     start_pos: usize,
     per_pos_logits: Option<&mut [f32]>,
     vision_inject: Option<VisionInject<'_>>,
+    mut on_block: Option<&mut dyn FnMut(usize, usize)>,
 ) -> crate::Result<()> {
     let cfg = ctx.cfg;
     let hidden = cfg.hidden;
@@ -931,6 +934,10 @@ pub fn forward_batch_with_vision(
 
         if let Some(ts) = block_ts {
             eprint!("\r[block {blk_idx:>2}] {}ms", ts.elapsed().as_millis());
+        }
+        // prefill 进度上报: 每完成一个 block 触发一次回调
+        if let Some(cb) = on_block.as_deref_mut() {
+            cb(blk_idx + 1, cfg.block_count);
         }
     }
 

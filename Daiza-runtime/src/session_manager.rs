@@ -155,6 +155,43 @@ impl SessionManager {
             || self.inactive.iter().any(|(sid, _)| sid == id)
     }
 
+    /// 重命名 session
+    ///
+    /// - active: 仅改 active_id (session 本身不在此结构中, 无需搬动)
+    /// - inactive: 改队列中的 id 并 rename SSD 文件 (避免遗留旧文件)
+    ///
+    /// 若 `new_id` 已存在 (或 old_id 不存在), 返回错误。
+    /// 调用方需保证 new_id 合法 (非空、长度限制等)。
+    pub fn rename(&mut self, old_id: &str, new_id: &str) -> Result<()> {
+        if old_id == new_id {
+            return Ok(());
+        }
+        if self.exists(new_id) {
+            return Err(crate::BonsaiError::Io(format!(
+                "session id '{new_id}' already exists"
+            )));
+        }
+        // active 重命名: 只改 active_id 字符串
+        if self.active_id.as_deref() == Some(old_id) {
+            self.active_id = Some(new_id.to_string());
+            return Ok(());
+        }
+        // inactive 重命名: 改 (id, path) 并 rename SSD 文件
+        let pos = self.inactive.iter().position(|(sid, _)| sid == old_id);
+        let Some(pos) = pos else {
+            return Err(crate::BonsaiError::Io(format!(
+                "session '{old_id}' not found"
+            )));
+        };
+        let new_path = self.session_path(new_id);
+        let (_, old_path) = self.inactive[pos].clone();
+        std::fs::rename(&old_path, &new_path)
+            .map_err(|e| crate::BonsaiError::Io(format!("rename ssd file: {e}")))?;
+        self.inactive[pos].0 = new_id.to_string();
+        self.inactive[pos].1 = new_path;
+        Ok(())
+    }
+
     /// 生成 session 文件路径
     fn session_path(&self, id: &str) -> PathBuf {
         // 替换文件名中不合法的字符
