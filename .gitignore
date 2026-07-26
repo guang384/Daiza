@@ -23,6 +23,10 @@ sota-baseline/current_tokens.txt
 sota-baseline/golden_tokens.txt
 sota-baseline/daiza-cli-baseline.exe
 
+# self-test 临时目录 (daiza-cli --selftest 生成, 测试结束自动清理,
+# 但若测试中断会残留; 永远不应入库)
+selftest_tmp/
+
 # ===== 编辑器与系统文件 =====
 .vscode/
 .idea/

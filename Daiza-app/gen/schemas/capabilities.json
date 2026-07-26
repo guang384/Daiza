@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"daiza-app 默认权限: 允许主窗口调用自定义 commands + 事件","local":true,"windows":["main"],"permissions":["core:default"]}}

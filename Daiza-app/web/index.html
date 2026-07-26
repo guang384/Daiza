@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Daiza Starting</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #f5f6fa; color: #1e2330;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 26px;
+    overflow: hidden;
+  }
+  .logo {
+    font-size: 52px; font-weight: 800; letter-spacing: 4px;
+    background: linear-gradient(90deg, #6d4bff, #0bbf9f, #e53e6f, #6d4bff);
+    background-size: 300% 100%;
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: sheen 3s linear infinite;
+  }
+  @keyframes sheen { to { background-position: 300% 0; } }
+  .spinner {
+    width: 46px; height: 46px; border-radius: 50%;
+    border: 3px solid rgba(15,23,42,.1);
+    border-top-color: #0bbf9f;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #step { font-size: 14px; color: #6b7280; }
+  .err { color: #e53e6f; font-size: 13px; max-width: 480px;
+         text-align: center; line-height: 1.7; white-space: pre-wrap; }
+  .path-row {
+    display: flex; flex-direction: column; gap: 10px;
+    width: 560px; max-width: 90vw;
+  }
+  .path-row label { font-size: 13px; color: #6b7280; }
+  .path-input-wrap { display: flex; gap: 8px; }
+  .path-input-wrap input {
+    flex: 1; padding: 9px 12px; font-size: 13px;
+    background: #ffffff; color: #1e2330; border: 1px solid rgba(15,23,42,.15);
+    border-radius: 6px; font-family: "Consolas", monospace;
+    outline: none;
+  }
+  .path-input-wrap input:focus { border-color: #0bbf9f; }
+  .path-input-wrap input:read-only { cursor: pointer; color: #4b5563; }
+  .browse-btn {
+    padding: 9px 18px; font-size: 13px; font-weight: 600;
+    background: #ffffff; color: #1e2330; border: 1px solid rgba(15,23,42,.15);
+    border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  .browse-btn:hover { border-color: #6d4bff; background: rgba(109,75,255,.08); }
+  .start-btn {
+    padding: 9px 18px; font-size: 13px; font-weight: 600;
+    background: linear-gradient(90deg, #6d4bff, #0bbf9f);
+    color: #ffffff; border: none; border-radius: 6px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .start-btn:hover { filter: brightness(1.1); }
+  .start-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .hint { font-size: 11px; color: #6b7280; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <div class="logo">DAIZA</div>
+  <div class="spinner" id="spinner"></div>
+  <div id="step">Configure model weight paths</div>
+  <div class="err" id="err"></div>
+  <div class="path-row" id="path-row">
+    <label for="model-path">Main weights GGUF (required)</label>
+    <div class="path-input-wrap">
+      <input id="model-path" type="text" placeholder="Click Browse to select a .gguf file" spellcheck="false" readonly>
+      <button class="browse-btn" id="browse-model">Browse</button>
+    </div>
+    <label style="margin-top:4px">DSpark drafter GGUF (optional, enables speculative decoding)</label>
+    <div class="path-input-wrap">
+      <input id="dspark-path" type="text" placeholder="Click Browse to select a .gguf file" spellcheck="false" readonly>
+      <button class="browse-btn" id="browse-dspark">Browse</button>
+    </div>
+    <label style="margin-top:4px">mmproj GGUF (optional, enables multimodal vision)</label>
+    <div class="path-input-wrap">
+      <input id="mmproj-path" type="text" placeholder="Click Browse to select a .gguf file" spellcheck="false" readonly>
+      <button class="browse-btn" id="browse-mmproj">Browse</button>
+    </div>
+    <div style="display:flex; gap:8px; margin-top:6px;">
+      <button class="start-btn" id="start-btn" style="flex:1;">Start</button>
+    </div>
+    <div class="hint">Paths are saved locally and auto-filled on next launch. Set DAIZA_MODEL env var to skip this page.</div>
+  </div>
+<script>
+const stepEl = document.getElementById('step');
+const errEl = document.getElementById('err');
+const pathInput = document.getElementById('model-path');
+const dsparkInput = document.getElementById('dspark-path');
+const mmprojInput = document.getElementById('mmproj-path');
+const startBtn = document.getElementById('start-btn');
+const spinnerEl = document.getElementById('spinner');
+
+// Restore last paths from localStorage
+pathInput.value = localStorage.getItem('daiza_model_path') || '';
+dsparkInput.value = localStorage.getItem('daiza_dspark_path') || '';
+mmprojInput.value = localStorage.getItem('daiza_mmproj_path') || '';
+if (pathInput.value) {
+  stepEl.textContent = 'Click Start or re-select paths';
+} else {
+  stepEl.textContent = 'Please select the main weights GGUF file';
+}
+// Don't spin spinner until user clicks Start
+spinnerEl.style.display = 'none';
+
+// Listen for backend errors (port in use, run_server failure, etc. — happens async after start_backend returns Ok)
+window.__TAURI__.event.listen('backend_error', (event) => {
+  errEl.textContent = 'Backend service failed to start:\n' + (event.payload && event.payload.error || event.payload);
+  spinnerEl.style.display = 'none';
+  startBtn.disabled = false;
+  stepEl.textContent = 'Start failed';
+});
+
+// File picker: invoke Rust pick_file command to open native file dialog
+async function browseFile(title, inputEl) {
+  try {
+    const path = await window.__TAURI__.core.invoke('pick_file', { title });
+    if (path) {
+      inputEl.value = path;
+      errEl.textContent = '';
+      if (inputEl === pathInput) {
+        stepEl.textContent = 'Click Start or re-select paths';
+      }
+    }
+  } catch (e) {
+    errEl.textContent = 'File picker failed: ' + e;
+  }
+}
+
+document.getElementById('browse-model').addEventListener('click', () => {
+  browseFile('Select main weights GGUF', pathInput);
+});
+document.getElementById('browse-dspark').addEventListener('click', () => {
+  browseFile('Select DSpark drafter GGUF', dsparkInput);
+});
+document.getElementById('browse-mmproj').addEventListener('click', () => {
+  browseFile('Select mmproj GGUF', mmprojInput);
+});
+
+// Click on readonly input also triggers browse
+pathInput.addEventListener('click', () => browseFile('Select main weights GGUF', pathInput));
+dsparkInput.addEventListener('click', () => browseFile('Select DSpark drafter GGUF', dsparkInput));
+mmprojInput.addEventListener('click', () => browseFile('Select mmproj GGUF', mmprojInput));
+
+async function boot(modelPath, dsparkPath, mmprojPath) {
+  // Validate path is non-empty
+  if (!modelPath || !modelPath.trim()) {
+    errEl.textContent = 'Please select the model weights path';
+    return;
+  }
+  modelPath = modelPath.trim();
+  dsparkPath = (dsparkPath || '').trim();
+  mmprojPath = (mmprojPath || '').trim();
+
+  // Show starting status
+  startBtn.disabled = true;
+  spinnerEl.style.display = 'block';
+  stepEl.textContent = 'Starting inference engine…';
+  errEl.textContent = '';
+
+  // Diagnostics: check Tauri IPC availability
+  if (!window.__TAURI__ || !window.__TAURI__.core || !window.__TAURI__.core.invoke) {
+    errEl.textContent = 'Tauri IPC unavailable: window.__TAURI__ not injected\n' +
+      'typeof __TAURI__ = ' + typeof window.__TAURI__;
+    spinnerEl.style.display = 'none';
+    startBtn.disabled = false;
+    stepEl.textContent = 'IPC unavailable';
+    return;
+  }
+
+  try {
+    stepEl.textContent = 'Calling start_backend…';
+    const args = { modelPath };
+    if (dsparkPath) args.dsparkPath = dsparkPath;
+    if (mmprojPath) args.mmprojPath = mmprojPath;
+    await window.__TAURI__.core.invoke('start_backend', args);
+  } catch (e) {
+    errEl.textContent = 'Backend failed to start:\n' + e;
+    spinnerEl.style.display = 'none';
+    startBtn.disabled = false;
+    stepEl.textContent = 'Start failed, please check paths';
+    return;
+  }
+  // start_backend confirmed backend is ready; main window will be navigated to chat page by Rust side
+  // This line is a fallback (in case Rust-side eval fails)
+  stepEl.textContent = 'Loading chat UI…';
+  window.location.replace('http://127.0.0.1:8787/');
+}
+
+startBtn.addEventListener('click', () => {
+  const p = pathInput.value;
+  if (p && p.trim()) {
+    const dp = dsparkInput.value;
+    const mp = mmprojInput.value;
+    // Save to localStorage (only save when user explicitly clicks Start, avoids polluting with mistypes)
+    localStorage.setItem('daiza_model_path', p.trim());
+    localStorage.setItem('daiza_dspark_path', dp.trim());
+    localStorage.setItem('daiza_mmproj_path', mp.trim());
+    boot(p, dp, mp);
+  } else {
+    errEl.textContent = 'Please select the model weights path';
+  }
+});
+</script>
+</body>
+</html>

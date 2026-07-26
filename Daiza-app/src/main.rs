@@ -1,7 +1,8 @@
-//! daiza-app: Tauri 桌面客户端 (内嵌 WebView2 渲染 daiza-web 聊天页)
+//! daiza-app: Tauri 桌面客户端 (内嵌 daiza-web HTTP/SSE 服务, 单 exe 便携版)
 //!
 //! 架构:
-//!   后台线程跑 daiza-web HTTP/SSE 服务 (127.0.0.1:8787),
+//!   start_backend 同步加载 Engine (mmap, <1s), 然后 spawn 后台线程跑 run_server
+//!   (load_drafter + load_mmproj + accept 循环, 阻塞该线程)。
 //!   Tauri 窗口先显示启动页, 等服务就绪后自动切换到聊天页。
 //!   聊天请求走 Tauri command (Rust 侧 ureq 流式转发 SSE → emit 到前端),
 //!   避开 WebView2 fetch 对 127.0.0.1 的 mixed-content 拦截。
@@ -9,57 +10,143 @@
 //! 构建 (需要 feature app):
 //! ```text
 //! cargo tauri dev -- --features app          # 开发模式
-//! cargo tauri build -- --features app        # 发布 (dist/daiza-app.exe + NSIS 安装包)
+//! cargo tauri build -- --features app        # 发布 (单 exe 便携版)
 //! ```
 
-use std::io::Read;
-use std::sync::Mutex;
+// 在 release 模式下隐藏 Windows 控制台窗口 (debug 模式保留控制台方便看日志)
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use base64::Engine as _;
+use std::io::BufRead;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tauri::{Emitter, Manager};
 
-const BOOT_HTML: &str = include_str!("../web/boot.html");
+use daiza_engine::math::SamplingParams;
+use daiza_runtime::engine::Engine;
+use daiza_web::{run_server_with_listener, ServerConfig};
 
 struct Backend {
-    child: Mutex<Option<std::process::Child>>,
+    /// 后台 HTTP server 是否已启动 (防止重复 start_backend)
+    running: AtomicBool,
+    /// chat 中断标志: abort_chat 设置后, chat_send 循环下次迭代时退出
+    abort: AtomicBool,
 }
 
 #[derive(Clone, serde::Serialize)]
 struct ChatEvent {
     kind: String,
-    text: String,
+    /// 原始 JSON data (前端按 kind 解析: delta/draft→text, reject→accepted, done→stats, error→error)
+    data: String,
 }
 
-/// 转发一次聊天请求: ureq POST → 逐字节读 SSE → 解析事件 → emit 到前端
+#[derive(Clone, serde::Serialize)]
+struct BackendError {
+    error: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct BootProgress {
+    stage: String,
+    message: String,
+}
+
+fn boot_progress(app: &tauri::AppHandle, stage: &str, message: &str) {
+    let _ = app.emit("boot_progress", BootProgress {
+        stage: stage.into(),
+        message: message.into(),
+    });
+}
+
+/// 转发一次聊天请求: ureq POST → BufReader 读 SSE → 解析事件 → emit 到前端
+///
+/// `images`: 图片路径数组 (前端已通过 /api/upload 上传, 这里只传路径给后端)
 #[tauri::command]
-fn chat_send(app: tauri::AppHandle, message: String) -> Result<(), String> {
-    let body = format!("{{\"message\":\"{}\"}}", json_escape(&message));
+fn chat_send(app: tauri::AppHandle, message: String, images: Option<Vec<String>>) -> Result<(), String> {
+    let state = app.state::<Backend>();
+    state.abort.store(false, Ordering::SeqCst);
+    // 构造请求体: {"message":"...","images":["p1","p2",...]}
+    // images 为空时省略 images 字段 (后端 json_extract_string_array 返回空 Vec)
+    let body = if let Some(imgs) = images.as_ref().filter(|v| !v.is_empty()) {
+        let arr: Vec<String> = imgs.iter().map(|p| format!("\"{}\"", json_escape(p))).collect();
+        format!("{{\"message\":\"{}\",\"images\":[{}]}}", json_escape(&message), arr.join(","))
+    } else {
+        format!("{{\"message\":\"{}\"}}", json_escape(&message))
+    };
     let resp = ureq::post("http://127.0.0.1:8787/api/chat")
         .header("Content-Type", "application/json")
         .send(body.as_bytes())
         .map_err(|e| format!("backend request failed: {e}"))?;
-    let mut reader = resp.into_body().into_reader();
-    let mut buf: Vec<u8> = Vec::with_capacity(4096);
-    let mut byte = [0u8; 1];
+    let reader = resp.into_body().into_reader();
+    let mut buf_reader = std::io::BufReader::new(reader);
+    let mut event_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut line: Vec<u8> = Vec::with_capacity(512);
     loop {
-        match reader.read(&mut byte) {
-            Ok(0) => break,
-            Ok(_) => {
-                buf.push(byte[0]);
-                if buf.ends_with(b"\n\n") {
-                    handle_sse_block(&app, &buf);
-                    buf.clear();
-                }
-                if buf.len() > 1 << 20 {
-                    return Err("SSE frame too large".into());
-                }
+        if state.abort.load(Ordering::SeqCst) {
+            let _ = app.emit("chat", ChatEvent { kind: "aborted".into(), data: String::new() });
+            return Ok(());
+        }
+        line.clear();
+        let n = buf_reader.read_until(b'\n', &mut line)
+            .map_err(|e| format!("stream read failed: {e}"))?;
+        if n == 0 {
+            if !event_buf.is_empty() {
+                handle_sse_block(&app, &event_buf);
             }
-            Err(e) => return Err(format!("stream read failed: {e}")),
+            break;
+        }
+        // 空行 = SSE 事件边界
+        if line == b"\n" || line == b"\r\n" {
+            if !event_buf.is_empty() {
+                handle_sse_block(&app, &event_buf);
+                event_buf.clear();
+            }
+        } else {
+            event_buf.extend_from_slice(&line);
+        }
+        if event_buf.len() > 1 << 22 {
+            return Err("SSE frame too large".into());
         }
     }
-    if !buf.is_empty() {
-        handle_sse_block(&app, &buf);
-    }
+    Ok(())
+}
+
+/// 弹出原生文件选择框 (过滤 .gguf 文件)
+///
+/// `title`: 对话框标题 (如 "选择主权重 GGUF" / "选择 DSpark drafter GGUF")
+/// 返回选中文件的完整路径, 用户取消则返回 None
+///
+/// 用 spawn_blocking 在独立线程运行同步 FileDialog (避免阻塞 Tauri async runtime,
+/// Win32 模态对话框自带消息泵, 不依赖主线程)
+#[tauri::command]
+async fn pick_file(title: String) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(&title)
+            .add_filter("GGUF model files (*.gguf)", &["gguf"]);
+        // 默认目录: exe 所在目录 (便携版用户通常把 gguf 放在 exe 旁边)
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                dialog = dialog.set_directory(dir);
+            }
+        }
+        dialog.pick_file().map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 中断当前 chat_send (设置本地 abort flag + 通知后端中断推理)
+///
+/// 两步中断:
+///   1. 本地 flag: chat_send SSE 读取循环下次迭代退出
+///   2. POST /api/abort: 后端 handle_chat 回调下次检查时返回 false, 推理循环退出
+#[tauri::command]
+fn abort_chat(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<Backend>();
+    state.abort.store(true, Ordering::SeqCst);
+    // 通知后端立即中断推理 (后端 handle_abort 立即返回, 无阻塞风险)
+    let _ = ureq::post("http://127.0.0.1:8787/api/abort").send(b"");
     Ok(())
 }
 
@@ -78,85 +165,8 @@ fn handle_sse_block(app: &tauri::AppHandle, block: &[u8]) {
     if data.is_empty() {
         return;
     }
-    let payload = if kind == "delta" {
-        // {"text":"..."} → 提取 text (后端已 JSON 转义, 这里反转义)
-        json_extract_field(&data, "text").unwrap_or_default()
-    } else if kind == "done" {
-        json_extract_field(&data, "stats").unwrap_or_default()
-    } else {
-        json_extract_field(&data, "error").unwrap_or_else(|| "unknown error".into())
-    };
-    let _ = app.emit("chat", ChatEvent { kind, text: payload });
-}
-
-/// 极简 JSON 字符串字段提取 ({"key":"value"}, 支持 \" \\ \n \t \r \uXXXX 转义)
-fn json_extract_field(json: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let idx = json.find(&pat)? + pat.len();
-    let rest = &json[idx..];
-    let colon = rest.find(':')?;
-    let after = rest[colon + 1..].trim_start();
-    if !after.starts_with('"') {
-        return None;
-    }
-    let bytes = after.as_bytes();
-    let mut out = String::new();
-    let mut i = 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => return Some(out),
-            b'\\' => {
-                i += 1;
-                if i >= bytes.len() {
-                    return None;
-                }
-                match bytes[i] {
-                    b'n' => out.push('\n'),
-                    b't' => out.push('\t'),
-                    b'r' => out.push('\r'),
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'u' => {
-                        if i + 4 >= bytes.len() {
-                            return None;
-                        }
-                        let hex = std::str::from_utf8(&bytes[i + 1..i + 5]).ok()?;
-                        let mut cp = u32::from_str_radix(hex, 16).ok()?;
-                        i += 4;
-                        if (0xD800..0xDC00).contains(&cp)
-                            && i + 6 < bytes.len()
-                            && bytes[i + 1] == b'\\'
-                            && bytes[i + 2] == b'u'
-                        {
-                            let hex2 = std::str::from_utf8(&bytes[i + 3..i + 7]).ok()?;
-                            let lo = u32::from_str_radix(hex2, 16).ok()?;
-                            if (0xDC00..0xE000).contains(&lo) {
-                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                i += 6;
-                            }
-                        }
-                        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-                    }
-                    _ => return None,
-                }
-            }
-            _ => {
-                let len = utf8_len(bytes[i]);
-                if i + len > bytes.len() {
-                    return None;
-                }
-                out.push_str(std::str::from_utf8(&bytes[i..i + len]).ok()?);
-                i += len - 1;
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn utf8_len(b: u8) -> usize {
-    if b < 0x80 { 1 } else if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 }
+    // 直接传原始 JSON data, 前端按 kind 解析 (delta/draft→text, reject→accepted, done→stats, error→error)
+    let _ = app.emit("chat", ChatEvent { kind, data });
 }
 
 fn json_escape(s: &str) -> String {
@@ -175,67 +185,187 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// 启动后台 daiza-web 进程 (带 15s 超时, 失败返回 Err)
+/// 启动内嵌 HTTP server (单 exe 便携版)
+///
+/// 模型路径解析顺序: 前端传入 modelPath > DAIZA_MODEL 环境变量
+/// DSpark/mmproj 路径: 前端传入 (可选)
+///
+/// 流程:
+///   1. 同步 Engine::load (mmap + metadata, <1s), 失败立即返回 Err
+///   2. spawn 后台线程: load_drafter + load_mmproj + run_server (阻塞)
+///   3. 立即返回 Ok, 前端轮询 /api/status 直到 ready
 #[tauri::command]
-fn start_backend(app: tauri::AppHandle) -> Result<(), String> {
+fn start_backend(
+    app: tauri::AppHandle,
+    model_path: Option<String>,
+    dspark_path: Option<String>,
+    mmproj_path: Option<String>,
+) -> Result<(), String> {
     {
         let state = app.state::<Backend>();
-        if state.child.lock().unwrap().is_some() {
+        if state.running.load(Ordering::SeqCst) {
             return Ok(());
         }
     }
-    let exe = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .parent()
-        .ok_or("no exe dir")?
-        .join("daiza-web.exe");
-    if !exe.exists() {
-        return Err(format!("daiza-web.exe not found at {}", exe.display()));
-    }
-    // 模型路径解析顺序: --model 参数 > DAIZA_MODEL 环境变量 > 默认相对路径
-    let args: Vec<String> = std::env::args().collect();
-    let model = args
-        .windows(2)
-        .find(|w| w[0] == "--model")
-        .map(|w| w[1].clone())
-        .or_else(|| std::env::var("DAIZA_MODEL").ok())
-        .unwrap_or_else(|| "../../Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf".to_string());
-    let child = std::process::Command::new(exe)
-        .args(["--model", &model, "--no-open"])
-        .current_dir("..")
-        .spawn()
-        .map_err(|e| format!("spawn daiza-web failed: {e}"))?;
-    let state = app.state::<Backend>();
-    *state.child.lock().unwrap() = Some(child);
-    Ok(())
-}
 
-/// 窗口退出时杀掉后台 daiza-web
-fn kill_backend(app: &tauri::AppHandle) {
-    let state = app.state::<Backend>();
-    let child = state.child.lock().unwrap().take();
-    if let Some(mut c) = child {
-        let _ = c.kill();
+    let model = model_path
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .or_else(|| std::env::var("DAIZA_MODEL").ok())
+        .ok_or_else(|| "model path not provided".to_string())?;
+
+    // 与 daiza-cli 一致的热降频默认配置 (用户已设置的环境变量优先)
+    if std::env::var("DAIZA_WAIT_MODE").is_err() {
+        std::env::set_var("DAIZA_WAIT_MODE", "yield");
     }
+    if std::env::var("DAIZA_ACTIVE_WORKERS").is_err() {
+        std::env::set_var("DAIZA_ACTIVE_WORKERS", "9");
+    }
+
+    eprintln!("[daiza-app] Loading model: {model}");
+    boot_progress(&app, "loading_metadata", "Parsing model metadata…");
+    // 同步加载 Engine (mmap + metadata 解析, <1s)
+    let mut engine = Engine::load(std::path::Path::new(&model))
+        .map_err(|e| format!("engine load failed: {e}"))?;
+    let model_name = std::path::Path::new(&model)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "model".to_string());
+    eprintln!("[daiza-app] Engine metadata loaded. Loading weights (~13GB)…");
+    boot_progress(&app, "loading_weights", "Loading model weights (~13GB)…");
+    // 同步加载权重 + 初始化线程池 (在 bind listener 之前完成, 避免首次 chat 卡顿)
+    engine.load_weights()
+        .map_err(|e| format!("load_weights failed: {e}"))?;
+    let n_threads = daiza_engine::model::workspace::thread_count();
+    daiza_engine::model::workspace::init_thread_pool(n_threads);
+    eprintln!("[daiza-app] Weights loaded ({n_threads} workers). Engine ready.");
+
+    // 同步加载 DSpark drafter (在 bind listener 之前完成, 避免 run_server 启动延迟)
+    let dspark_available = if let Some(dp) = dspark_path.as_ref().filter(|s| !s.trim().is_empty()) {
+        boot_progress(&app, "loading_dspark", "Loading DSpark drafter…");
+        match engine.load_drafter(std::path::Path::new(dp.trim())) {
+            Ok(()) => { eprintln!("[daiza-app] DSpark drafter loaded."); true }
+            Err(e) => { eprintln!("[daiza-app] DSpark drafter load failed: {e}"); false }
+        }
+    } else {
+        false
+    };
+
+    // 同步加载多模态视觉编码器
+    let vision_available = if let Some(mp) = mmproj_path.as_ref().filter(|s| !s.trim().is_empty()) {
+        boot_progress(&app, "loading_mmproj", "Loading vision encoder…");
+        match engine.load_mmproj(std::path::Path::new(mp.trim())) {
+            Ok(()) => { eprintln!("[daiza-app] mmproj (vision encoder) loaded."); true }
+            Err(e) => { eprintln!("[daiza-app] mmproj load failed: {e}"); false }
+        }
+    } else {
+        false
+    };
+
+    boot_progress(&app, "starting_server", "Starting HTTP server…");
+
+    // 预检 8787 端口: 被占用时立即返回明确错误, 避免前端轮询 30s 超时
+    // listener 不 drop, 直接传给后台线程 run_server_with_listener, 无竞态
+    let port = 8787;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
+        format!(
+            "Port {port} is in use or cannot be bound ({e}).\nPlease use Task Manager to end the process occupying port {port} and retry."
+        )
+    })?;
+
+    let params = SamplingParams { temperature: 0.7, top_k: 20, top_p: 0.95 };
+
+    app.state::<Backend>().running.store(true, Ordering::SeqCst);
+
+    // 后台线程: 立即 run_server_with_listener 开始 accept (加载已在主线程完成)
+    // ready_rx: 后台线程进入 accept 循环前发送 (), 主线程等待此信号才返回 Ok
+    // err_rx: 后台线程出错时发送错误信息, 主线程立即返回 Err
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        let cfg = ServerConfig {
+            engine,
+            model_name,
+            params,
+            max_tokens: 4096,
+            port: 8787,
+            no_open: true, // Tauri 内嵌不自动打开浏览器
+            dspark_available,
+            vision_available,
+        };
+
+        eprintln!("[daiza-web] Chat GUI ready at http://127.0.0.1:8787/");
+        if let Err(e) = run_server_with_listener(cfg, listener, Some(ready_tx)) {
+            eprintln!("[daiza-app] server error: {e}");
+            let _ = err_tx.send(e.to_string());
+            let _ = app_handle.emit("backend_error", BackendError { error: e.to_string() });
+        }
+    });
+
+    // 等待后台线程确认进入 accept 循环 (ready_rx) 或出错 (err_rx)
+    // 这是唯一可靠的就绪检测: TCP connect 成功只代表 listener 已 bind,
+    // 不代表后端在 accept (backlog 会自动完成三次握手)
+    loop {
+        match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(()) => {
+                eprintln!("[daiza-app] Backend accept loop ready.");
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err("Backend service startup timed out (10s), please check logs".to_string());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // 后台线程已退出, 检查是否留下了错误信息
+                return Err(match err_rx.try_recv() {
+                    Ok(err) => format!("Backend service failed to start: {err}"),
+                    Err(_) => "Backend thread exited unexpectedly".to_string(),
+                });
+            }
+        }
+    }
+
+    // 额外验证: 用 ureq 实际请求 /api/status, 确认后端能处理 HTTP 请求
+    // (ready signal 只确认进入 accept 循环, 不确认 handle_conn 正常工作)
+    match ureq::get("http://127.0.0.1:8787/api/status").call() {
+        Ok(resp) => {
+            let body = resp.into_body().read_to_string()
+                .map_err(|e| format!("Failed to read response: {e}"))?;
+            eprintln!("[daiza-app] Backend verification OK: {body}");
+        }
+        Err(e) => {
+            return Err(format!(
+                "Backend verification failed: cannot request /api/status ({e}).\nBackend may be running but unable to handle requests."
+            ));
+        }
+    }
+
+    // 主窗口直接导航到聊天页 http://127.0.0.1:8787/
+    // (放弃 iframe 方案: WebView2 对 iframe 加载 127.0.0.1 有限制)
+    // (放弃新窗口方案: 用户体验差, 会出现两个窗口)
+    // 主窗口导航后 window.__TAURI__ 消失, 聊天页自动走浏览器模式 (直接 HTTP fetch + SSE)
+    if let Some(main_window) = app.get_webview_window("main") {
+        match main_window.eval("window.location.replace('http://127.0.0.1:8787/')") {
+            Ok(_) => eprintln!("[daiza-app] Main window navigating to chat UI."),
+            Err(e) => return Err(format!("Failed to navigate to chat UI: {e}")),
+        }
+    }
+
+    Ok(())
 }
 
 fn main() {
     tauri::Builder::default()
-        .manage(Backend { child: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![chat_send, start_backend])
-        .setup(|app| {
-            let window = app.get_webview_window("main").unwrap();
-            // 启动页: base64 内联, 服务就绪后前端 JS 调 start_backend + location 切换
-            let b64 = base64::engine::general_purpose::STANDARD.encode(BOOT_HTML);
-            window.navigate(format!("data:text/html;base64,{b64}").parse().unwrap()).unwrap();
-            let w = window.clone();
-            window.on_window_event(move |ev| {
-                if let tauri::WindowEvent::Destroyed = ev {
-                    kill_backend(&w.app_handle());
-                }
-            });
-            Ok(())
+        .manage(Backend {
+            running: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
         })
+        .invoke_handler(tauri::generate_handler![
+            chat_send,
+            abort_chat,
+            start_backend,
+            pick_file,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running daiza-app");
 }

@@ -32,44 +32,217 @@
   #step { font-size: 14px; color: #9a9ab0; }
   .err { color: #ff5c8a; font-size: 13px; max-width: 480px;
          text-align: center; line-height: 1.7; white-space: pre-wrap; }
+  .path-row {
+    display: flex; flex-direction: column; gap: 10px;
+    width: 560px; max-width: 90vw;
+  }
+  .path-row label { font-size: 13px; color: #9a9ab0; }
+  .path-input-wrap { display: flex; gap: 8px; }
+  .path-input-wrap input {
+    flex: 1; padding: 9px 12px; font-size: 13px;
+    background: #15152a; color: #e8e8f2; border: 1px solid #2a2a4a;
+    border-radius: 6px; font-family: "Consolas", monospace;
+    outline: none;
+  }
+  .path-input-wrap input:focus { border-color: #00e0c6; }
+  .path-input-wrap input:read-only { cursor: pointer; color: #b0b0c8; }
+  .browse-btn {
+    padding: 9px 18px; font-size: 13px; font-weight: 600;
+    background: #15152a; color: #e8e8f2; border: 1px solid #2a2a4a;
+    border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  .browse-btn:hover { border-color: #7c5cff; background: #1f1f38; }
+  .start-btn {
+    padding: 9px 18px; font-size: 13px; font-weight: 600;
+    background: linear-gradient(90deg, #7c5cff, #00e0c6);
+    color: #07070f; border: none; border-radius: 6px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .start-btn:hover { filter: brightness(1.1); }
+  .start-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .hint { font-size: 11px; color: #6a6a82; line-height: 1.5; }
 </style>
 </head>
 <body>
   <div class="logo">DAIZA</div>
   <div class="spinner" id="spinner"></div>
-  <div id="step">正在启动推理引擎…</div>
+  <div id="step">配置模型权重路径</div>
   <div class="err" id="err"></div>
+  <div class="path-row" id="path-row">
+    <label for="model-path">主权重 GGUF (必需)</label>
+    <div class="path-input-wrap">
+      <input id="model-path" type="text" placeholder="点击右侧浏览按钮选择 .gguf 文件" spellcheck="false" readonly>
+      <button class="browse-btn" id="browse-model">浏览</button>
+    </div>
+    <label style="margin-top:4px">DSpark drafter GGUF (可选, 启用投机解码)</label>
+    <div class="path-input-wrap">
+      <input id="dspark-path" type="text" placeholder="点击右侧浏览按钮选择 .gguf 文件" spellcheck="false" readonly>
+      <button class="browse-btn" id="browse-dspark">浏览</button>
+    </div>
+    <label style="margin-top:4px">mmproj GGUF (可选, 启用多模态视觉)</label>
+    <div class="path-input-wrap">
+      <input id="mmproj-path" type="text" placeholder="点击右侧浏览按钮选择 .gguf 文件" spellcheck="false" readonly>
+      <button class="browse-btn" id="browse-mmproj">浏览</button>
+    </div>
+    <div style="display:flex; gap:8px; margin-top:6px;">
+      <button class="start-btn" id="start-btn" style="flex:1;">启动</button>
+    </div>
+    <div class="hint">路径保存到本地, 下次启动自动填充。也可设置环境变量 DAIZA_MODEL 跳过此页。</div>
+  </div>
 <script>
 const stepEl = document.getElementById('step');
 const errEl = document.getElementById('err');
+const pathInput = document.getElementById('model-path');
+const dsparkInput = document.getElementById('dspark-path');
+const mmprojInput = document.getElementById('mmproj-path');
+const startBtn = document.getElementById('start-btn');
+const spinnerEl = document.getElementById('spinner');
 
-async function boot() {
+// 从 localStorage 恢复上次路径
+pathInput.value = localStorage.getItem('daiza_model_path') || '';
+dsparkInput.value = localStorage.getItem('daiza_dspark_path') || '';
+mmprojInput.value = localStorage.getItem('daiza_mmproj_path') || '';
+if (pathInput.value) {
+  stepEl.textContent = '点击启动或重新选择路径';
+} else {
+  stepEl.textContent = '请选择主权重 GGUF 文件';
+}
+// 等待用户点启动前不转 spinner
+spinnerEl.style.display = 'none';
+
+// 监听后端错误 (如端口占用、run_server 失败等, start_backend 返回 Ok 后异步发生)
+window.__TAURI__.event.listen('backend_error', (event) => {
+  errEl.textContent = '后端服务启动失败:\n' + (event.payload && event.payload.error || event.payload);
+  spinnerEl.style.display = 'none';
+  startBtn.disabled = false;
+  stepEl.textContent = '启动失败';
+});
+
+// 监听启动进度 (loading_metadata/loading_weights/loading_dspark/loading_mmproj/starting_server)
+window.__TAURI__.event.listen('boot_progress', (event) => {
+  const p = event.payload;
+  if (p && p.message) {
+    stepEl.textContent = p.message;
+  }
+});
+
+// 文件选择: 调用 Rust 侧 pick_file 命令弹出原生文件对话框
+async function browseFile(title, inputEl) {
   try {
-    stepEl.textContent = '正在启动推理引擎…';
-    await window.__TAURI__.core.invoke('start_backend');
+    const path = await window.__TAURI__.core.invoke('pick_file', { title });
+    if (path) {
+      inputEl.value = path;
+      errEl.textContent = '';
+      if (inputEl === pathInput) {
+        stepEl.textContent = '点击启动或重新选择路径';
+      }
+    }
   } catch (e) {
-    errEl.textContent = '后端启动失败:\n' + e;
-    document.getElementById('spinner').style.display = 'none';
-    stepEl.textContent = '';
+    errEl.textContent = '文件选择失败: ' + e;
+  }
+}
+
+document.getElementById('browse-model').addEventListener('click', () => {
+  browseFile('选择主权重 GGUF 文件', pathInput);
+});
+document.getElementById('browse-dspark').addEventListener('click', () => {
+  browseFile('选择 DSpark drafter GGUF 文件', dsparkInput);
+});
+document.getElementById('browse-mmproj').addEventListener('click', () => {
+  browseFile('选择 mmproj GGUF 文件', mmprojInput);
+});
+
+// 点击只读 input 也触发浏览
+pathInput.addEventListener('click', () => browseFile('选择主权重 GGUF 文件', pathInput));
+dsparkInput.addEventListener('click', () => browseFile('选择 DSpark drafter GGUF 文件', dsparkInput));
+mmprojInput.addEventListener('click', () => browseFile('选择 mmproj GGUF 文件', mmprojInput));
+
+async function boot(modelPath, dsparkPath, mmprojPath) {
+  // 校验路径非空
+  if (!modelPath || !modelPath.trim()) {
+    errEl.textContent = '请选择模型权重路径';
     return;
   }
-  // 轮询 HTTP 服务就绪
+  modelPath = modelPath.trim();
+  dsparkPath = (dsparkPath || '').trim();
+  mmprojPath = (mmprojPath || '').trim();
+
+  // 显示启动状态
+  startBtn.disabled = true;
+  spinnerEl.style.display = 'block';
+  stepEl.textContent = '正在启动推理引擎…';
+  errEl.textContent = '';
+
+  // 诊断: 检查 Tauri IPC 是否可用
+  if (!window.__TAURI__ || !window.__TAURI__.core || !window.__TAURI__.core.invoke) {
+    errEl.textContent = 'Tauri IPC 不可用: window.__TAURI__ 未注入\n' +
+      'typeof __TAURI__ = ' + typeof window.__TAURI__;
+    spinnerEl.style.display = 'none';
+    startBtn.disabled = false;
+    stepEl.textContent = 'IPC 不可用';
+    return;
+  }
+
+  try {
+    stepEl.textContent = '调用 start_backend…';
+    const args = { modelPath };
+    if (dsparkPath) args.dsparkPath = dsparkPath;
+    if (mmprojPath) args.mmprojPath = mmprojPath;
+    await window.__TAURI__.core.invoke('start_backend', args);
+    stepEl.textContent = 'start_backend 返回, 轮询服务…';
+  } catch (e) {
+    errEl.textContent = '后端启动失败:\n' + e;
+    spinnerEl.style.display = 'none';
+    startBtn.disabled = false;
+    stepEl.textContent = '启动失败, 请检查路径';
+    return;
+  }
+  // 轮询 HTTP 服务就绪 (server 启动即 ready, 权重在首次 chat 时懒加载)
   for (let i = 0; i < 60; i++) {
     try {
       const r = await fetch('http://127.0.0.1:8787/api/status');
       if (r.ok) {
-        stepEl.textContent = '进入聊天…';
-        window.location.replace('http://127.0.0.1:8787/');
-        return;
+        const j = await r.json();
+        if (j.ready) {
+          stepEl.textContent = '加载聊天界面…';
+          // 拉取聊天页 HTML 并替换当前 document (Tauri WebView2 阻止外部跳转/iframe)
+          try {
+            const html = await (await fetch('http://127.0.0.1:8787/')).text();
+            document.open();
+            document.write(html);
+            document.close();
+            return;
+          } catch (e) {
+            errEl.textContent = '聊天界面加载失败: ' + e;
+            spinnerEl.style.display = 'none';
+            startBtn.disabled = false;
+            return;
+          }
+        }
       }
     } catch (e) { /* 还没起来 */ }
     await new Promise(r => setTimeout(r, 500));
   }
-  errEl.textContent = '后端服务 30s 内未就绪, 请检查 daiza-web.exe 是否能独立运行。';
-  document.getElementById('spinner').style.display = 'none';
-  stepEl.textContent = '';
+  errEl.textContent = '后端服务 30s 内未就绪, 请检查模型路径或端口 8787 是否被占用。';
+  spinnerEl.style.display = 'none';
+  startBtn.disabled = false;
+  stepEl.textContent = '启动超时';
 }
-boot();
+
+startBtn.addEventListener('click', () => {
+  const p = pathInput.value;
+  if (p && p.trim()) {
+    const dp = dsparkInput.value;
+    const mp = mmprojInput.value;
+    // 保存到 localStorage (用户主动点启动才保存, 避免误输入污染)
+    localStorage.setItem('daiza_model_path', p.trim());
+    localStorage.setItem('daiza_dspark_path', dp.trim());
+    localStorage.setItem('daiza_mmproj_path', mp.trim());
+    boot(p, dp, mp);
+  } else {
+    errEl.textContent = '请选择模型权重路径';
+  }
+});
 </script>
 </body>
 </html>
