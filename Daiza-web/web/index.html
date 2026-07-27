@@ -1289,35 +1289,44 @@ function isBlockStart(line) {
 }
 
 function renderInline(text, container) {
-  const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
-  let last = 0, m;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) container.appendChild(document.createTextNode(text.slice(last, m.index)));
-    const tok = m[0];
-    if (tok.startsWith('`')) {
-      const code = document.createElement('code');
-      code.className = 'inline-code';
-      code.textContent = tok.slice(1, -1);
-      container.appendChild(code);
-    } else if (tok.startsWith('**')) {
-      const strong = document.createElement('strong');
-      renderInline(tok.slice(2, -2), strong);
-      container.appendChild(strong);
-    } else if (tok.startsWith('*')) {
-      const em = document.createElement('em');
-      renderInline(tok.slice(1, -1), em);
-      container.appendChild(em);
-    } else {
-      const label = tok.slice(1, tok.indexOf(']('));
-      const url = tok.slice(tok.indexOf('](') + 2, -1);
-      const a = document.createElement('a');
-      a.href = url; a.target = '_blank'; a.rel = 'noopener';
-      a.textContent = label;
-      container.appendChild(a);
+  // ★ 按 \n 切分, 段内 inline 渲染, 段间用 <br> 连接
+  //   模型输出常用单换行分段 (非标准 markdown 空行分段), 必须保留换行语义
+  const segments = text.split('\n');
+  for (let s = 0; s < segments.length; s++) {
+    if (s > 0) container.appendChild(document.createElement('br'));
+    const seg = segments[s];
+    const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
+    let last = 0, m;
+    while ((m = re.exec(seg)) !== null) {
+      if (m.index > last) container.appendChild(document.createTextNode(seg.slice(last, m.index)));
+      const tok = m[0];
+      if (tok.startsWith('`')) {
+        const code = document.createElement('code');
+        code.className = 'inline-code';
+        code.textContent = tok.slice(1, -1);
+        container.appendChild(code);
+      } else if (tok.startsWith('**')) {
+        const strong = document.createElement('strong');
+        renderInline(tok.slice(2, -2), strong);
+        container.appendChild(strong);
+      } else if (tok.startsWith('*')) {
+        const em = document.createElement('em');
+        renderInline(tok.slice(1, -1), em);
+        container.appendChild(em);
+      } else {
+        const label = tok.slice(1, tok.indexOf(']('));
+        const url = tok.slice(tok.indexOf('](') + 2, -1);
+        const a = document.createElement('a');
+        a.href = url; a.target = '_blank'; a.rel = 'noopener';
+        a.textContent = label;
+        container.appendChild(a);
+      }
+      last = m.index + tok.length;
     }
-    last = m.index + tok.length;
+    if (last < seg.length) {
+      container.appendChild(document.createTextNode(seg.slice(last)));
+    }
   }
-  if (last < text.length) container.appendChild(document.createTextNode(text.slice(last)));
 }
 
 function renderMarkdown(text, container) {
@@ -1808,6 +1817,9 @@ function escapeHtml(s) {
 // ★ think-block 默认折叠 (流式结束后收起), 点击可展开
 function renderFinalText(full, bubble) {
   bubble.textContent = '';
+  // ★ 覆盖 .bubble 的 white-space: pre-wrap, 让 markdown 渲染的块级元素 (p/h1/pre) 正确布局
+  //   pre-wrap 会保留原始换行符, 与 markdown 自身的换行处理叠加, 导致排版混乱
+  bubble.style.whiteSpace = 'normal';
   const parts = parseThinking(full);
   for (const p of parts) {
     if (p.type === 'think') {
@@ -1821,6 +1833,7 @@ function renderFinalText(full, bubble) {
       bubble.appendChild(block);
     } else if (p.text) {
       const span = document.createElement('span');
+      span.style.display = 'block';
       renderMarkdown(p.text, span);
       bubble.appendChild(span);
     }
