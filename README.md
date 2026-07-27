@@ -1,152 +1,154 @@
+**Languages:** [中文](README.zh.md) | [English](README.md)
+
 # Daiza: A Pure-CPU Rust Inference Engine for 1-bit Bonsai 27B
 
-> **Daiza**(台座) cradles **Bonsai**(盆栽) — a from-scratch Rust engine running the [1-bit Bonsai 27B](https://huggingface.co/prism-ml/Bonsai-27B-gguf) model.
+> **Daiza** (台座, "pedestal") cradles **Bonsai** (盆栽, "bonsai") — a from-scratch Rust engine running the [1-bit Bonsai 27B](https://huggingface.co/prism-ml/Bonsai-27B-gguf) model.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-2-green.svg)](#)
 
-一个学习项目:从零实现 GGUF 解析、Q1_0 反量化、混合注意力(SSM + Full Attention)、GPT-2 BPE 分词,最终在纯 CPU 上完成 Bonsai 27B 的完整推理。
+A learning project: from-scratch implementation of GGUF parsing, Q1_0 dequantization, hybrid attention (SSM + Full Attention), and GPT-2 BPE tokenization, completing full inference of Bonsai 27B on pure CPU.
 
 ---
 
-## ✨ 特性
+## ✨ Features
 
-- **最小依赖**:仅依赖 `memmap2`(GGUF 权重按需 page-in)+ `image`(PNG/JPEG 解码),其余全部(GGUF 解析、FP16/BF16、BPE、GEMV、SSM、RoPE、AVX2 内核)从零实现
-- **纯 CPU**:AVX2 + FMA 手写向量化内核(`target-cpu=native`)
-- **Q1_0 反量化**:1.125 bits/weight 二值化格式,每 128 权重共享一个 FP16 scale
-- **混合注意力架构**:64 层 = 48 SSM 块 + 16 全注意力块(节拍 `(i+1) % 4 == 0`)
-- **M-RoPE**:多模态 RoPE,文本推理时仅旋转时间维(22/64 维)
-- **Gated DeltaNet**:SSM 层使用 Gated Delta Rule 循环更新
-- **Qwen3.6 chat 模板**:支持 `<|im_start|>` 格式与 `mind` 思考模式标记
-- **DSpark 推测解码**:6 层 block-parallel drafter + Markov head + Leviathan rejection sampling,~5.5 tok/s
-- **多线程并行**:持久线程池 (park/unpark 零分配),14 线程 GEMM 并行
-- **Qwen3-VL 多模态**:CLIP ViT (27 层) + qwen3vl_merger 投影器,支持图像输入,text-only decode 零退化
+- **Minimal dependencies**: only `memmap2` (on-demand page-in of GGUF weights) + `image` (PNG/JPEG decoding). Everything else (GGUF parsing, FP16/BF16, BPE, GEMV, SSM, RoPE, AVX2 kernels) is implemented from scratch.
+- **Pure CPU**: hand-written AVX2 + FMA vectorized kernels (`target-cpu=native`).
+- **Q1_0 dequantization**: 1.125 bits/weight binarized format, one FP16 scale shared per 128 weights.
+- **Hybrid attention architecture**: 64 layers = 48 SSM blocks + 16 full-attention blocks (beat `(i+1) % 4 == 0`).
+- **M-RoPE**: multimodal RoPE; for text inference, only the time dimension (22/64 dims) is rotated.
+- **Gated DeltaNet**: SSM layers use Gated Delta Rule recurrent updates.
+- **Qwen3.6 chat template**: supports `<|im_start|>` format and `mind` thinking-mode marker.
+- **DSpark speculative decoding**: 6-layer block-parallel drafter + Markov head + Leviathan rejection sampling, ~5.5 tok/s.
+- **Multi-threaded parallelism**: persistent thread pool (park/unpark zero-alloc), 14-thread GEMM parallelism.
+- **Qwen3-VL multimodal**: CLIP ViT (27 layers) + qwen3vl_merger projector, supports image input, zero-degradation text-only decode.
 
-## 🖼️ 界面预览
+## 🖼️ UI Preview
 
-![Daiza 主界面](docs/screenshots/ScreenShot_2026-07-27_231037_345.png)
+<img src="docs/screenshots/ScreenShot_2026-07-27_231037_345.png" width="720" alt="Daiza main UI" />
 
-![对话演示](docs/screenshots/ScreenShot_2026-07-27_231235_359.png)
+<img src="docs/screenshots/ScreenShot_2026-07-27_231235_359.png" width="720" alt="Chat demo" />
 
-### 流式对话演示
+### Streaming chat demo
 
-![流式对话](docs/screenshots/chating.gif)
+![Streaming chat](docs/screenshots/chating.gif)
 
-### 🎵 AI 生成歌曲演示
+### 🎵 Bonus: From lyrics to song
 
-上面 GIF 中模型即兴生成的歌词,通过 AI 音乐工具谱曲演唱成歌:
+During the GIF demo above, the model improvised a set of lyrics. We casually fed those lyrics into an AI music tool, which composed and sang the following song:
 
 <audio controls src="docs/echoes_of_us.mp3">
-  你的浏览器不支持 audio 元素,可直接下载 <a href="docs/echoes_of_us.mp3">echoes_of_us.mp3</a>
+  Your browser does not support the audio element. You can download <a href="docs/echoes_of_us.mp3">echoes_of_us.mp3</a> directly.
 </audio>
 
-## 📦 目录结构
+## 📦 Directory Structure
 
 ```
 Daiza/
-├── .cargo/config.toml       # target-cpu=native + rsproxy 镜像
-├── Cargo.toml               # workspace 根 (lto="fat")
+├── .cargo/config.toml       # target-cpu=native + rsproxy mirror
+├── Cargo.toml               # workspace root (lto="fat")
 ├── README.md
-├── Bonsai-27B-gguf/         # 模型权重(外部,不入库)
-└── sota-baseline/           # benchmark 脚本(bench/compare/create-baseline)
+├── Bonsai-27B-gguf/         # model weights (external, not in repo)
+└── sota-baseline/           # benchmark scripts (bench/compare/create-baseline)
 ```
 
-### Crate 依赖层级
+### Crate dependency layers
 
 ```
                     ┌─────────────────┐
-                    │  Daiza-engine   │  Layer 0  推理核心 (lib, 零内部依赖)
+                    │  Daiza-engine   │  Layer 0  Inference core (lib, zero internal deps)
                     │  gguf/tensor/   │
                     │  math/model/    │
                     │  cache          │
                     └────────┬────────┘
-                             │ Cargo 依赖
+                             │ Cargo dependency
                     ┌────────▼────────┐
-                    │  Daiza-runtime  │  Layer 1  编排层 (lib, 依赖 engine)
+                    │  Daiza-runtime  │  Layer 1  Orchestration (lib, depends on engine)
                     │  engine/session │
                     │  tokenizer/     │
                     │  tool_call      │
                     └────────┬────────┘
-                             │ Cargo 依赖
+                             │ Cargo dependency
                    ┌─────────┴─────────┐
                    │                   │
             ┌──────▼──────┐     ┌──────▼──────┐
-            │  Daiza-cli  │     │  Daiza-web  │  Layer 2  推理二进制入口
+            │  Daiza-cli  │     │  Daiza-web  │  Layer 2  Inference binary entry points
             │  (CLI bin)  │     │  (HTTP bin) │
             └─────────────┘     └──────▲──────┘
-                                       │ 运行时 spawn daiza-web.exe 子进程
+                                       │ Runtime spawns daiza-web.exe subprocess
                                 ┌──────┴──────┐
-                                │  Daiza-app  │  Layer 3  Tauri 桌面壳
-                                │  (Tauri bin)│  (仅依赖 tauri/ureq/serde/base64,
-                                └─────────────┘   不依赖 engine/runtime)
+                                │  Daiza-app  │  Layer 3  Tauri desktop shell
+                                │  (Tauri bin)│  (only depends on tauri/ureq/serde/base64,
+                                └─────────────┘   not on engine/runtime)
 ```
 
-- **Daiza-engine** (Layer 0):推理核心,零内部依赖。GGUF 解析、Q1_0 反量化、AVX2 GEMM 内核、SSM/Attention/MLP 前向、线程池。
-- **Daiza-runtime** (Layer 1):编排层,依赖 engine。Engine 顶层封装、会话管理、GPT-2 BPE 分词器、工具调用、SSD 持久化。
-- **Daiza-cli / Daiza-web** (Layer 2):推理二进制入口,Cargo 依赖 engine+runtime。
-  - cli:命令行交互
-  - web:HTTP+SSE 聊天服务,可独立运行(`daiza-web --model xxx.gguf` 浏览器访问 127.0.0.1:8787)
-- **Daiza-app** (Layer 3):Tauri 桌面壳,**不依赖 engine/runtime**,仅依赖 tauri/ureq/serde/base64。运行时 spawn `daiza-web.exe` 子进程提供推理服务,自身负责窗口管理 + SSE 转发(绕过 WebView2 对 127.0.0.1 的 mixed-content 拦截)
+- **Daiza-engine** (Layer 0): Inference core, zero internal dependencies. GGUF parsing, Q1_0 dequantization, AVX2 GEMM kernels, SSM/Attention/MLP forward, thread pool.
+- **Daiza-runtime** (Layer 1): Orchestration layer, depends on engine. Top-level Engine wrapper, session management, GPT-2 BPE tokenizer, tool calling, SSD persistence.
+- **Daiza-cli / Daiza-web** (Layer 2): Inference binary entry points, Cargo depends on engine+runtime.
+  - cli: command-line interaction
+  - web: HTTP+SSE chat service, can run standalone (`daiza-web --model xxx.gguf`, browse to 127.0.0.1:8787)
+- **Daiza-app** (Layer 3): Tauri desktop shell, **does not depend on engine/runtime**, only on tauri/ureq/serde/base64. At runtime it spawns `daiza-web.exe` as a subprocess to provide inference, while itself handling window management + SSE forwarding (bypassing WebView2's mixed-content blocking of 127.0.0.1).
 
-> `lto = "fat"` + `codegen-units = 1` 合并所有 crate IR 为单一编译单元,保证跨 crate 内联等效于同 crate(热路径 runtime → engine 的 forward/matvec/AVX2 kernel 调用可被内联)。
+> `lto = "fat"` + `codegen-units = 1` merges all crate IR into a single compilation unit, ensuring cross-crate inlining is equivalent to same-crate inlining (hot-path runtime → engine forward/matvec/AVX2 kernel calls can be inlined).
 
-### Daiza-engine 模块组织
+### Daiza-engine module layout
 
 ```
 Daiza-engine/src/
-├── lib.rs            # 模块入口 + BonsaiError
-├── gguf/             # GGUF v3 二进制格式解析(parser/metadata/tensor_info)
-├── tensor/           # 张量类型 + Q1_0/Q4_1/Q8_0/Iq1M/F32/F16/BF16 反量化 + AVX2 GEMM 内核
-├── math/             # RMSNorm/LayerNorm/RoPE/Softmax/GELU/SIMD 超越函数/采样
-├── model/            # Bonsai 27B 架构
+├── lib.rs            # module entry + BonsaiError
+├── gguf/             # GGUF v3 binary format parsing (parser/metadata/tensor_info)
+├── tensor/           # tensor types + Q1_0/Q4_1/Q8_0/Iq1M/F32/F16/BF16 dequant + AVX2 GEMM kernels
+├── math/             # RMSNorm/LayerNorm/RoPE/Softmax/GELU/SIMD transcendental functions/sampling
+├── model/            # Bonsai 27B architecture
 │   ├── config.rs / weights.rs / block.rs / attention.rs / ssm.rs / mlp.rs
-│   ├── forward.rs    # 单 token 前向 + prefill batch + vision embedding 注入
-│   ├── workspace.rs  # 持久线程池(park/unpark 零分配)+ Workspace 复用
-│   ├── dspark/       # DSpark 推测解码(drafter/markov/speculative/weights/config)
-│   └── vision/       # Qwen3-VL 多模态(config/weights/preprocess/rope/encoder/projector)
-└── cache/            # KV cache(16 层)+ SSM state(48 层)
+│   ├── forward.rs    # single-token forward + prefill batch + vision embedding injection
+│   ├── workspace.rs  # persistent thread pool (park/unpark zero-alloc) + Workspace reuse
+│   ├── dspark/       # DSpark speculative decoding (drafter/markov/speculative/weights/config)
+│   └── vision/       # Qwen3-VL multimodal (config/weights/preprocess/rope/encoder/projector)
+└── cache/            # KV cache (16 layers) + SSM state (48 layers)
 ```
 
-### Daiza-runtime 模块组织
+### Daiza-runtime module layout
 
 ```
 Daiza-runtime/src/
 ├── lib.rs            # re-export engine::Engine + daiza_engine::{BonsaiError, Result}
-├── engine.rs         # 顶层 Engine:加载→前向→采样→解码 + DSpark + Vision 调度
-├── session.rs        # 多轮会话状态
-├── session_persist.rs# 会话 SSD 持久化 (.dzss)
-├── session_manager.rs# 多会话管理
-├── tool_call.rs      # 工具调用解析
-└── tokenizer/        # GPT-2 BPE + Qwen35 预分词
+├── engine.rs         # top-level Engine: load → forward → sample → decode + DSpark + Vision dispatch
+├── session.rs        # multi-turn session state
+├── session_persist.rs# session SSD persistence (.dzss)
+├── session_manager.rs# multi-session management
+├── tool_call.rs      # tool-call parsing
+└── tokenizer/        # GPT-2 BPE + Qwen35 pre-tokenizer
 ```
 
-## 📥 模型权重下载
+## 📥 Model Weight Download
 
-> 权重文件较大(~6.3 GB 共三件),不入库,需手动下载。
+> Weights are large (~6.3 GB total, three files), not included in the repo, and must be downloaded manually.
 
-### 前置条件
+### Prerequisites
 
-安装 [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli):
+Install the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli):
 
 ```bash
 pip install -U "huggingface_hub[cli]"
 ```
 
-### 下载权重(三件套)
+### Download weights (three-piece set)
 
-本引擎目标模型为 `prism-ml/Bonsai-27B-gguf`,需下载以下三个文件:
+The target model for this engine is `prism-ml/Bonsai-27B-gguf`. The following three files are required:
 
-| 文件 | 大小 | 用途 | 状态 |
-|------|------|------|------|
-| `Bonsai-27B-Q1_0.gguf` | 3.9 GB | **主权重**(1.125 bits/weight,语言模型) | ✅ 已支持 |
-| `Bonsai-27B-dspark-Q4_1.gguf` | 1.8 GB | DSpark 投机解码 drafter | ✅ 已支持 |
-| `Bonsai-27B-mmproj-Q8_0.gguf` | 0.63 GB | 视觉塔(多模态输入) | ✅ 已支持 |
+| File | Size | Purpose | Status |
+|------|------|---------|--------|
+| `Bonsai-27B-Q1_0.gguf` | 3.9 GB | **Main weights** (1.125 bits/weight, language model) | ✅ Supported |
+| `Bonsai-27B-dspark-Q4_1.gguf` | 1.8 GB | DSpark speculative-decoding drafter | ✅ Supported |
+| `Bonsai-27B-mmproj-Q8_0.gguf` | 0.63 GB | Vision tower (multimodal input) | ✅ Supported |
 
-**一键下载全部**:
+**One-click download of all files**:
 
 ```powershell
-# 在仓库根目录执行
+# Run from the repo root
 hf download prism-ml/Bonsai-27B-gguf `
     Bonsai-27B-Q1_0.gguf `
     Bonsai-27B-dspark-Q4_1.gguf `
@@ -154,22 +156,22 @@ hf download prism-ml/Bonsai-27B-gguf `
     --local-dir ./Bonsai-27B-gguf
 ```
 
-或单独下载主权重:
+Or download only the main weights:
 
 ```powershell
 hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-Q1_0.gguf --local-dir ./Bonsai-27B-gguf
 ```
 
-### 可选:白皮书
+### Optional: whitepaper
 
 ```powershell
 hf download PrismML-Eng/Bonsai-demo bonsai-27b-whitepaper.pdf --local-dir ./Bonsai-27B-gguf
 ```
 
-### 镜像源(Hugging Face 不稳定时)
+### Mirror source (when Hugging Face is unstable)
 
 ```powershell
-# 国内镜像
+# China mirror
 $env:HF_ENDPOINT="https://hf-mirror.com"
 hf download prism-ml/Bonsai-27B-gguf `
     Bonsai-27B-Q1_0.gguf `
@@ -178,61 +180,61 @@ hf download prism-ml/Bonsai-27B-gguf `
     --local-dir ./Bonsai-27B-gguf
 ```
 
-### 验证下载
+### Verify the download
 
 ```powershell
-# 检查文件大小
+# Check file sizes
 Get-ChildItem .\Bonsai-27B-gguf\*.gguf | Select-Object Name, @{N='Size(GB)';E={[math]::Round($_.Length/1GB,2)}}
 
-# 使用引擎 inspect 模式验证 GGUF 完整性
+# Verify GGUF integrity via engine inspect mode
 .\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
 ```
 
-预期输出包含 `tensor_count : 851`、`block_count : 64`、`Q1_0 tensors: 498`。
+Expected output includes `tensor_count : 851`, `block_count : 64`, `Q1_0 tensors: 498`.
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### 环境要求
+### Requirements
 
-- Rust 2021 edition(推荐 1.75+)
-- 约 13 GB 可用内存(权重加载)
-- x86_64 CPU(AVX2/AVX-512 加速)
+- Rust 2021 edition (1.75+ recommended)
+- ~13 GB available memory (for weight loading)
+- x86_64 CPU (AVX2/AVX-512 acceleration)
 
-### 构建与运行
+### Build & Run
 
 ```powershell
-# Release 构建(推荐,workspace 根目录执行,启用 fat LTO + 跨 crate 内联)
+# Release build (recommended, run from workspace root, enables fat LTO + cross-crate inlining)
 cargo build --release --bin daiza-cli
 
-# 运行推理 (chat 模式,默认 64 token)
-.\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --prompt "你好" --max-tokens 64
+# Run inference (chat mode, default 64 tokens)
+.\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --prompt "Hello" --max-tokens 64
 
-# Raw 模式(跳过 chat 模板,用于调试)
+# Raw mode (skips chat template, for debugging)
 .\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --prompt "The capital of China is" --max-tokens 8 --raw
 
-# 启用 DSpark 投测解码(需先下载 drafter 权重)
+# Enable DSpark speculative decoding (requires drafter weights)
 .\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
-    --prompt "请用中文写一首关于春天的诗,8句" --max-tokens 200 `
+    --prompt "Write a poem about spring, 8 lines" --max-tokens 200 `
     --dspark ".\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf"
 
-# Greedy 模式(temperature=0, 用于正确性验证)
+# Greedy mode (temperature=0, for correctness verification)
 .\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
-    --prompt "你好" --max-tokens 100 `
+    --prompt "Hello" --max-tokens 100 `
     --dspark ".\Bonsai-27B-gguf\Bonsai-27B-dspark-Q4_1.gguf" --greedy
 
-# 多模态:加载 mmproj 视觉塔并对图像问答 (--image 可多次指定)
+# Multimodal: load mmproj vision tower and answer questions about an image (--image may be repeated)
 .\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" `
-    --prompt "描述这张图" --max-tokens 128 `
+    --prompt "Describe this image" --max-tokens 128 `
     --mmproj ".\Bonsai-27B-gguf\Bonsai-27B-mmproj-Q8_0.gguf" --image my_image.jpg
 
-# 检查模型元信息
+# Inspect model metadata
 .\target\release\daiza-cli.exe --model ".\Bonsai-27B-gguf\Bonsai-27B-Q1_0.gguf" --inspect
 
-# 查看帮助
+# Show help
 .\target\release\daiza-cli.exe --help
 ```
 
-### 使用示例
+### Usage examples
 
 ```rust
 use daiza_runtime::Engine;
@@ -247,7 +249,7 @@ let params = SamplingParams {
     frequency_penalty: 0.4,
 };
 let output = engine.generate_with_params(
-    "你好",
+    "Hello",
     256,
     params,
     Some("You are a helpful assistant."),
@@ -255,7 +257,7 @@ let output = engine.generate_with_params(
 println!("{output}");
 ```
 
-多模态推理示例:
+Multimodal inference example:
 
 ```rust
 use std::path::PathBuf;
@@ -266,7 +268,7 @@ let mut engine = Engine::load("../Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf")?;
 engine.load_mmproj(std::path::Path::new("../Bonsai-27B-gguf/Bonsai-27B-mmproj-Q8_0.gguf"))?;
 
 let output = engine.generate_with_image(
-    "描述这张图",
+    "Describe this image",
     &[PathBuf::from("my_image.jpg")],
     128,
     SamplingParams::default(),
@@ -275,18 +277,18 @@ let output = engine.generate_with_image(
 println!("{output}");
 ```
 
-DSpark 投机解码示例:
+DSpark speculative decoding example:
 
 ```rust
 use daiza_runtime::Engine;
 use daiza_engine::math::SamplingParams;
 
 let mut engine = Engine::load("../Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf")?;
-// 加载 DSpark drafter (6 层 block-parallel drafter + Markov head)
+// Load the DSpark drafter (6-layer block-parallel drafter + Markov head)
 engine.load_drafter(std::path::Path::new("../Bonsai-27B-gguf/Bonsai-27B-dspark-Q4_1.gguf"))?;
 
 let output = engine.generate_with_params(
-    "请用中文写一首关于春天的诗,8句",
+    "Write a poem about spring, 8 lines",
     200,
     SamplingParams::default(),
     Some("You are a helpful assistant."),
@@ -294,49 +296,49 @@ let output = engine.generate_with_params(
 println!("{output}");
 ```
 
-## 📐 架构关键点
+## 📐 Architecture Key Points
 
-### Q1_0 量化格式
+### Q1_0 quantization format
 
-每 128 权重 = 1 个 FP16 scale + 16 字节符号位 = 18 字节(1.125 bits/weight)。
-反量化公式(白皮书 §4.2):
+Every 128 weights = 1 FP16 scale + 16 bytes of sign bits = 18 bytes (1.125 bits/weight).
+Dequantization formula (whitepaper §4.2):
 
 ```
 w_i = sg * b_i,  b_i ∈ {-1, +1}
 ```
 
-其中 `sg` 是 FP16 组内 scale,`b_i` 由单个 bit 决定:`bit=0 → -scale`,`bit=1 → +scale`。
-点积核使用 branchless FMA:`acc += scale * (2 * sum_pos_bits - 128)`。
+where `sg` is the FP16 group scale and `b_i` is determined by a single bit: `bit=0 → -scale`, `bit=1 → +scale`.
+The dot-product kernel uses branchless FMA: `acc += scale * (2 * sum_pos_bits - 128)`.
 
-### 混合注意力
+### Hybrid attention
 
-| 层类型 | 数量 | 索引 |
-|--------|------|------|
-| SSM(Gated DeltaNet) | 48 | `i % 4 != 3` |
+| Layer type | Count | Indices |
+|------------|-------|---------|
+| SSM (Gated DeltaNet) | 48 | `i % 4 != 3` |
 | Full Attention | 16 | `3, 7, 11, ..., 63` |
 
-- **Full Attention**:24 query head × 4 KV head(GQA group=6),head_dim=256,使用 M-RoPE
-- **SSM**:48 value head × 128 state size,Gated Delta Rule 循环更新,前置 Conv1d(kernel=4)
+- **Full Attention**: 24 query heads × 4 KV heads (GQA group=6), head_dim=256, uses M-RoPE.
+- **SSM**: 48 value heads × 128 state size, Gated Delta Rule recurrent update, preceded by Conv1d (kernel=4).
 
-### SSM 层前向流程
+### SSM layer forward flow
 
 ```
-x → Q/K/V 投影 → Conv1d(因果)→ SiLU → SSM 循环 → 门控 RMSNorm → 输出
+x → Q/K/V projection → Conv1d (causal) → SiLU → SSM recurrence → gated RMSNorm → output
 ```
 
-Gated Delta Rule(autoregressive decode):
-- `g = A * softplus(alpha + dt_bias)`,A = ssm_a(已存为 -exp(A_log))
+Gated Delta Rule (autoregressive decode):
+- `g = A * softplus(alpha + dt_bias)`, where A = ssm_a (stored as -exp(A_log))
 - `decay = exp(g)` → `s *= decay` → `kv = S^T @ k` → `d = (v - kv) * beta` → `S += k ⊗ d` → `y = S^T @ q`
 
 ### Qwen3.5 Gated Attention
 
-**关键**:`attn_q` 输出 12288 维按 head 交错排列:
+**Key point**: `attn_q` outputs 12288 dims arranged interleaved by head:
 ```
 [Q_head0(256) | gate_head0(256) | Q_head1(256) | gate_head1(256) | ...]
 ```
-**不是** `[全部 Q(6144) | 全部 gate(6144)]`。此交错格式是 Bonsai 的核心实现细节。
+**Not** `[all Q(6144) | all gate(6144)]`. This interleaved layout is a core implementation detail of Bonsai.
 
-### Chat 模板
+### Chat template
 
 ```text
 <|im_start|>system
@@ -347,104 +349,103 @@ Gated Delta Rule(autoregressive decode):
 mind
 ```
 
-模型进入思考模式,输出 `mind ... </mind>` 包裹的思考内容,然后给出最终回复。EOS token(`<|im_end|>`, id=248046)终止生成。
+The model enters thinking mode, outputs `mind ... </mind>` wrapped thinking content, then gives the final reply. The EOS token (`<|im_end|>`, id=248046) terminates generation.
 
-### Qwen3-VL 多模态管线
+### Qwen3-VL multimodal pipeline
 
-参考 [llama.cpp qwen3vl.cpp](https://github.com/PrismML-Eng/llama.cpp) 实现,加载时一次性把 Q8_0/F16 反量化为 F32 (~1.6GB),运行时纯 F32 路径。
+Implemented with reference to [llama.cpp qwen3vl.cpp](https://github.com/PrismML-Eng/llama.cpp). At load time, Q8_0/F16 are dequantized to F32 once (~1.6 GB); at runtime it is a pure F32 path.
 
 ```
-image → resize(768×768,Lanczos3) → normalize → patchify(16×16, 2304 patches × 768 dim)
+image → resize(768×768, Lanczos3) → normalize → patchify(16×16, 2304 patches × 768 dim)
        ↓
-门控 patch embedding: Conv2D(W) + Conv2D(W.1) + bias → [2304, 1152]
+gated patch embedding: Conv2D(W) + Conv2D(W.1) + bias → [2304, 1152]
        ↓
 + learned position_embd [1152, 2304]
        ↓
-27 层 ViT block:
+27 ViT blocks:
   LN1(bias) → QKV proj (fused 3456) → M-RoPE(Q,K) → bidirectional attn → out_proj → +residual
   → LN2(bias) → ffn_up(1152→4304) → GELU → ffn_down(4304→1152) → +residual
        ↓
 post_ln → [2304, 1152]
        ↓
-qwen3vl_merger 投影器:
-  spatial_merge(2×2 块合并, 2304→576 patches, reshape 到 [4608, 576])
+qwen3vl_merger projector:
+  spatial_merge (2×2 block merge, 2304→576 patches, reshape to [4608, 576])
   → Linear(4608→4608) → GELU → Linear(4608→5120)
        ↓
-[576, 5120] vision embeddings (与 text model hidden_dim=5120 一致)
+[576, 5120] vision embeddings (matches text model hidden_dim=5120)
 ```
 
-**关键细节**:
-- M-RoPE sections `[head_dim/4]×4 = [18,18,18,18]`,位置 IDs 为 4D `(t=0, h=py, w=px, extra=0)`,只应用在 Q/K
-- 门控 patch embedding:两个相同形状 `[16,16,3,1152]` 的 Conv2D 权重相加
-- attention bidirectional(无 causal mask),所有 patch 互相可见
-- LayerNorm 带 bias(ViT 风格,非 RMSNorm),GELU 用 tanh 近似
-- **vision 注入只在 prefill 阶段**,text-only decode 走 `forward_single_token` 零退化
+**Key details**:
+- M-RoPE sections `[head_dim/4]×4 = [18,18,18,18]`, position IDs are 4D `(t=0, h=py, w=px, extra=0)`, applied only to Q/K.
+- Gated patch embedding: two Conv2D weights of the same shape `[16,16,3,1152]` are added together.
+- Attention is bidirectional (no causal mask); all patches are mutually visible.
+- LayerNorm has bias (ViT style, not RMSNorm); GELU uses tanh approximation.
+- **Vision injection happens only at the prefill stage**; text-only decode goes through `forward_single_token` with zero degradation.
 
-**性能** (768×768 测试图,Intel Core Ultra 5 225H):
+**Performance** (768×768 test image, Intel Core Ultra 5 225H):
 
-| 阶段 | 时间 | 说明 |
-|------|------|------|
+| Stage | Time | Notes |
+|-------|------|-------|
 | preprocess | ~9ms | resize + patchify |
-| ViT encode (27 层) | ~8.2s | AVX2 batched matmul + 8-row dot product kernel + AVX2 attention (hoist q_i) |
+| ViT encode (27 layers) | ~8.2s | AVX2 batched matmul + 8-row dot-product kernel + AVX2 attention (hoist q_i) |
 | projector | ~0.19s | batched matmul + AVX2 |
-| prefill (602 expanded tokens) | ~103s | ~165ms/tok,vision 分批 batched 注入 (MAX_VISION_BATCH=64) |
-| decode (48 tokens) | ~8.3s | 173ms/tok,与 text-only 一致 |
+| prefill (602 expanded tokens) | ~103s | ~165ms/tok, vision batched injection (MAX_VISION_BATCH=64) |
+| decode (48 tokens) | ~8.3s | 173ms/tok, identical to text-only |
 
-ViT encode 从标量 173s 优化到 8.2s(**22× 加速**):线程池并行 → 2D tiled batched matmul → AVX2 8-row dot product kernel → AVX2 attention kernel → projector batched.
+ViT encode optimized from scalar 173s to 8.2s (**22× speedup**): thread-pool parallelism → 2D tiled batched matmul → AVX2 8-row dot-product kernel → AVX2 attention kernel → projector batched.
 
-Vision prefill 从逐 token 注入 (132s) 改为分批 batched 注入 (MAX_VISION_BATCH=64, 100s),text-only decode 零退化。
+Vision prefill changed from per-token injection (132s) to batched injection (MAX_VISION_BATCH=64, 100s), with zero text-only decode degradation.
 
-## ⚙️ 生成参数(白皮书建议)
+## ⚙️ Generation Parameters (whitepaper recommendations)
 
-| 参数 | 建议值 |
-|------|--------|
+| Parameter | Recommended value |
+|-----------|-------------------|
 | temperature | 0.7 |
 | top_k | 20 |
 | top_p | 0.95 |
 
-这些设置用于 Bonsai 27B 所有 benchmark 结果(thinking mode)。
+These settings are used for all Bonsai 27B benchmark results (thinking mode).
 
-## 📊 性能参考(纯 CPU,单 token decode)
+## 📊 Performance Reference (pure CPU, single-token decode)
 
-测试硬件:Intel Core Ultra 5 225H (Meteor Lake, 14 核, AVX2 + FMA, LPDDR5X-7467)
-测试条件:CPU turbo 频率,greedy/默认采样,短 prompt (≤30 tokens) + 48-64 tokens 生成
+Test hardware: Intel Core Ultra 5 225H (Meteor Lake, 14 cores, AVX2 + FMA, LPDDR5X-7467).
+Test conditions: CPU turbo frequency, greedy/default sampling, short prompt (≤30 tokens) + 48-64 tokens generated.
 
-| 模式 | 吞吐量 | 接受率 | 说明 |
-|------|--------|--------|------|
-| 纯基础模型 (无 DSpark) | ~6.24 tok/s | — | 64 层前向 ~160ms/tok |
-| DSpark 推测解码 | ~6.18 tok/s | ~100% (短序列) | drafter 53ms/call + target verify,与纯 target 持平 |
-| Vision (text-only,加载 mmproj) | ~6.22 tok/s | — | 加载 mmproj 对 text-only decode 零退化 |
-| Vision (with image) | ~5.78 tok/s | — | decode 173ms/tok,vision 一次性成本 (enc 8.2s + prefill 103s) |
+| Mode | Throughput | Accept rate | Notes |
+|------|------------|-------------|-------|
+| Base model only (no DSpark) | ~6.24 tok/s | — | 64-layer forward ~160ms/tok |
+| DSpark speculative decoding | ~6.18 tok/s | ~100% (short sequences) | drafter 53ms/call + target verify, on par with pure target |
+| Vision (text-only, mmproj loaded) | ~6.22 tok/s | — | Loading mmproj causes zero degradation to text-only decode |
+| Vision (with image) | ~5.78 tok/s | — | decode 173ms/tok, vision one-time cost (enc 8.2s + prefill 103s) |
 
-- decode 阶段:block 总耗时 ~155ms (attn 34ms + ssm 115ms + mlp 92ms) + lm_head 6ms
-- 内存占用:~13 GB (Q1_0 权重) + ~1.3 GB (KV/SSM/激活) + ~1.6 GB (mmproj,可选)
-- DSpark 加速比:在 k=4 架构约束和 LPDDR5X 带宽瓶颈下,理论极限仅 1.10x (100% accept rate),短序列实测与纯 target 持平
+- Decode stage: total block time ~155ms (attn 34ms + ssm 115ms + mlp 92ms) + lm_head 6ms.
+- Memory footprint: ~13 GB (Q1_0 weights) + ~1.3 GB (KV/SSM/activations) + ~1.6 GB (mmproj, optional).
+- DSpark speedup: under the k=4 architecture constraint and LPDDR5X bandwidth bottleneck, the theoretical limit is only 1.10× (100% accept rate); for short sequences the measured result is on par with the pure target.
 
-**说明**:这是学习项目。当前性能已接近 LPDDR5X 单通道带宽极限 (~22 GB/s 实测 vs 60 GB/s 理论),
-MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](https://github.com/PrismML-Eng/llama.cpp)。
+**Note**: This is a learning project. Current performance is already close to the LPDDR5X single-channel bandwidth limit (~22 GB/s measured vs 60 GB/s theoretical); the MLP layer, which accounts for 58% of time, is already saturated. For commercial deployment please use the [llama.cpp PrismML fork](https://github.com/PrismML-Eng/llama.cpp).
 
-## 🗺️ 路线图
+## 🗺️ Roadmap
 
-- [x] Q1_0 主权重文本推理
-- [x] 混合注意力(SSM + Full Attention)
-- [x] Chat 模板与思考模式
-- [x] 多线程并行(持久线程池 + AVX2 手写内核)
-- [x] DSpark 投机解码(`Bonsai-27B-dspark-Q4_1.gguf`)
-- [x] 多模态视觉输入(`Bonsai-27B-mmproj-Q8_0.gguf`)
-- [x] ViT encoder AVX2 向量化 + 线程池并行(173s/图 → 7.9s/图,22× 加速)
-- [x] Vision prefill batched(逐 token 注入 → 分批 64 个,132s → 100s,text-only 零退化)
+- [x] Q1_0 main-weight text inference
+- [x] Hybrid attention (SSM + Full Attention)
+- [x] Chat template and thinking mode
+- [x] Multi-threaded parallelism (persistent thread pool + hand-written AVX2 kernels)
+- [x] DSpark speculative decoding (`Bonsai-27B-dspark-Q4_1.gguf`)
+- [x] Multimodal vision input (`Bonsai-27B-mmproj-Q8_0.gguf`)
+- [x] ViT encoder AVX2 vectorization + thread-pool parallelism (173s/image → 7.9s/image, 22× speedup)
+- [x] Vision prefill batched (per-token injection → batches of 64, 132s → 100s, zero text-only degradation)
 
-> 路线图已完成。进一步加速需算法变更(drafter early exit / 减小 block_size / 共享 target tap 投影)或硬件升级(DDR5 双通道 / HBM),超出纯代码优化范围。KV cache 4-bit 量化经调研后判定不值得实施(KV cache 读取占带宽 <0.01%,4-bit 量化收益 <1%,且违反"不得降低模型精度"硬约束)。
+> The roadmap is complete. Further acceleration requires algorithmic changes (drafter early exit / smaller block_size / shared target tap projection) or hardware upgrades (DDR5 dual-channel / HBM), which are beyond the scope of pure code optimization. After investigation, KV cache 4-bit quantization was deemed not worth implementing (KV cache reads account for <0.01% of bandwidth; 4-bit quantization yields <1% and would violate the "must not reduce model accuracy" hard constraint).
 
-## 📚 参考资料
+## 📚 References
 
-- [1-bit Bonsai 27B 白皮书](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/bonsai-27b-whitepaper.pdf)
-- [Bonsai-27B-gguf Hugging Face 仓库](https://huggingface.co/prism-ml/Bonsai-27B-gguf)
-- [GGUF 格式规范](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md)
-- [Qwen3 模型架构](https://github.com/QwenLM/Qwen3)
-- [llama.cpp PrismML fork (qwen3vl 参考)](https://github.com/PrismML-Eng/llama.cpp)
-- [Qwen3-VL 多模态架构](https://github.com/QwenLM/Qwen3-VL)
+- [1-bit Bonsai 27B whitepaper](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/bonsai-27b-whitepaper.pdf)
+- [Bonsai-27B-gguf Hugging Face repo](https://huggingface.co/prism-ml/Bonsai-27B-gguf)
+- [GGUF format specification](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md)
+- [Qwen3 model architecture](https://github.com/QwenLM/Qwen3)
+- [llama.cpp PrismML fork (qwen3vl reference)](https://github.com/PrismML-Eng/llama.cpp)
+- [Qwen3-VL multimodal architecture](https://github.com/QwenLM/Qwen3-VL)
 
-## 📄 许可证
+## 📄 License
 
-Apache-2.0(与上游 Bonsai 27B 模型一致)
+Apache-2.0 (consistent with the upstream Bonsai 27B model).
