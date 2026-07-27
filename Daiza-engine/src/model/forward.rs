@@ -93,6 +93,32 @@ pub struct ForwardContext<'a> {
     /// 布局: [n_batch * n_tap_layers * hidden] flat (行优先: token-major)
     /// 由 engine 在 prefill 后读出, 累积到 target_tap_history
     pub hidden_tap_batch_buf: Vec<f32>,
+
+    // === prefill batch buffer (跨 forward_batch 调用复用, 避免每次 vec! 分配) ===
+    // ★ 优化: 原 forward_batch_with_vision 每次 prefill 重新分配 9 个 buffer (~5MB),
+    //   DSpark 增量模式每轮多次 forward_batch 累计 ~50ms alloc 开销。
+    //   改为 ForwardContext 字段, 按需 resize 复用, 零 alloc (容量足够时)。
+    /// `[n_batch * hidden]` rmsnorm 输出
+    pub batch_normed: Vec<f32>,
+    /// `[n_batch * max(qkv_total, ssm_qkv, ffn_dim)]` Q/K/V 或 SSM qkv 或 MLP gate/up 共用
+    pub batch_qkv: Vec<f32>,
+    /// `[n_batch * max(attn_out, ssm_out)]` attention 或 SSM 输出
+    pub batch_out: Vec<f32>,
+    /// `[n_batch * n_kv_heads * head_dim]` K 投影
+    pub batch_k: Vec<f32>,
+    /// `[n_batch * n_kv_heads * head_dim]` V 投影
+    pub batch_v: Vec<f32>,
+    /// `[n_batch * ffn_dim]` MLP gate/up 临时
+    pub batch_tmp: Vec<f32>,
+    /// `[n_batch * ssm_alpha_dim]` SSM alpha
+    pub batch_ssm_alpha: Vec<f32>,
+    /// `[n_batch * ssm_alpha_dim]` SSM beta
+    pub batch_ssm_beta: Vec<f32>,
+    /// `[n_batch * ssm_gate_dim]` SSM gate
+    pub batch_ssm_gate: Vec<f32>,
+    /// `[n_batch * rope_dim * 2]` 扁平 cos/sin (cos 在前, sin 在后, 每 token 一段)
+    /// 替代原 `Vec<([f32; 128], [f32; 128])>`, 消除每 prefill 的 n_batch × 1KB alloc
+    pub batch_cos_sin: Vec<f32>,
 }
 
 /// 剖析开关:DAIZA_PROFILE env var,OnceLock 缓存避免热路径 env::var 开销
@@ -114,6 +140,51 @@ fn dump_tap_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("DAIZA_DUMP_TAP").is_ok())
+}
+
+/// 批量 rmsnorm 跨 token 并行 (n_batch >= 4 时启用线程池)
+/// ★ 优化: 原 n_batch 串行循环 ~130μs/block × 64 blocks = ~8ms/prefill,
+///   并行后 ~35μs/block × 64 blocks = ~2ms/prefill, 省 ~6ms。
+/// 每个 token 的 src/dst 是 disjoint slice, 用 raw pointer 在线程间共享 (与 SSM scan 并行模式一致)。
+#[allow(unsafe_code)]
+fn batch_rmsnorm_parallel(
+    h_buf: &[f32],
+    normed_batch: &mut [f32],
+    norm_w: &[f32],
+    hidden: usize,
+    eps: f32,
+    n_batch: usize,
+) {
+    if n_batch <= 3 {
+        // n_batch 太小, 线程池调度开销 > 收益, 串行
+        for t in 0..n_batch {
+            let src = &h_buf[t * hidden..(t + 1) * hidden];
+            let dst = &mut normed_batch[t * hidden..(t + 1) * hidden];
+            math::rmsnorm_into(src, dst, norm_w, eps);
+        }
+        return;
+    }
+    let pool = crate::model::workspace::get_thread_pool();
+    if let Some(pool) = pool {
+        // raw pointer as usize (Send + Sync), 闭包内重建 slice, 每 t 访问 disjoint 区域
+        let h_addr = h_buf.as_ptr() as usize;
+        let normed_addr = normed_batch.as_mut_ptr() as usize;
+        let norm_w_addr = norm_w.as_ptr() as usize;
+        pool.scatter_wait(n_batch, move |t| {
+            let h = unsafe { std::slice::from_raw_parts(h_addr as *const f32, (t + 1) * hidden) };
+            let src = &h[t * hidden..(t + 1) * hidden];
+            let normed = unsafe { std::slice::from_raw_parts_mut(normed_addr as *mut f32, (t + 1) * hidden) };
+            let dst = &mut normed[t * hidden..(t + 1) * hidden];
+            let norm_w = unsafe { std::slice::from_raw_parts(norm_w_addr as *const f32, hidden) };
+            math::rmsnorm_into(src, dst, norm_w, eps);
+        });
+    } else {
+        for t in 0..n_batch {
+            let src = &h_buf[t * hidden..(t + 1) * hidden];
+            let dst = &mut normed_batch[t * hidden..(t + 1) * hidden];
+            math::rmsnorm_into(src, dst, norm_w, eps);
+        }
+    }
 }
 
 /// 单 token 前向,logits 写入 `ctx.logits_buf`(无 clone)
@@ -411,33 +482,56 @@ pub fn forward_batch_with_vision(
     let ssm_alpha_dim = ssm_num_v_heads;            // 48
     let ssm_gate_dim = cfg.ssm_inner_size;          // 6144
 
-    let mut normed_batch = vec![0.0f32; n_batch * hidden];
-    let mut qkv_buf = vec![0.0f32; n_batch * qkv_total_dim.max(ssm_qkv_dim).max(ffn_dim)];
-    let mut attn_out_buf = vec![0.0f32; n_batch * attn_out_dim.max(ssm_out_dim)];
-    let mut k_buf = vec![0.0f32; n_batch * n_kv_heads * head_dim];
-    let mut v_buf = vec![0.0f32; n_batch * n_kv_heads * head_dim];
-    let mut tmp_buf = vec![0.0f32; n_batch * ffn_dim]; // MLP gate/up
-    let mut ssm_alpha_buf = vec![0.0f32; n_batch * ssm_alpha_dim];
-    let mut ssm_beta_buf = vec![0.0f32; n_batch * ssm_alpha_dim];
-    let mut ssm_gate_buf = vec![0.0f32; n_batch * ssm_gate_dim];
+    // 2. 复用 ForwardContext 的 batch buffer (按需 resize, 避免每次 prefill 重新分配 ~5MB)
+    //    ★ 优化: 原 vec![0.0; ...] 每次 forward_batch 分配 9 个 buffer,
+    //      DSpark 增量模式每轮多次调用累计 ~50ms alloc 开销。
+    //      改为 ctx.batch_xxx.resize(need, 0.0), 容量足够时零 alloc。
+    //    ★ 取出所有权 (std::mem::take) 作为局部变量, 避免后续代码与 ctx.h_buf 等字段的 borrow 冲突。
+    //      panic=abort 下无需 panic safety; 函数末尾放回, 容量保留供下次 prefill 复用。
+    ctx.batch_normed.resize(n_batch * hidden, 0.0);
+    ctx.batch_qkv.resize(n_batch * qkv_total_dim.max(ssm_qkv_dim).max(ffn_dim), 0.0);
+    ctx.batch_out.resize(n_batch * attn_out_dim.max(ssm_out_dim), 0.0);
+    ctx.batch_k.resize(n_batch * n_kv_heads * head_dim, 0.0);
+    ctx.batch_v.resize(n_batch * n_kv_heads * head_dim, 0.0);
+    ctx.batch_tmp.resize(n_batch * ffn_dim, 0.0);
+    ctx.batch_ssm_alpha.resize(n_batch * ssm_alpha_dim, 0.0);
+    ctx.batch_ssm_beta.resize(n_batch * ssm_alpha_dim, 0.0);
+    ctx.batch_ssm_gate.resize(n_batch * ssm_gate_dim, 0.0);
+    let mut normed_batch = std::mem::take(&mut ctx.batch_normed);
+    let mut qkv_buf = std::mem::take(&mut ctx.batch_qkv);
+    let mut attn_out_buf = std::mem::take(&mut ctx.batch_out);
+    let mut k_buf = std::mem::take(&mut ctx.batch_k);
+    let mut v_buf = std::mem::take(&mut ctx.batch_v);
+    let mut tmp_buf = std::mem::take(&mut ctx.batch_tmp);
+    let mut ssm_alpha_buf = std::mem::take(&mut ctx.batch_ssm_alpha);
+    let mut ssm_beta_buf = std::mem::take(&mut ctx.batch_ssm_beta);
+    let mut ssm_gate_buf = std::mem::take(&mut ctx.batch_ssm_gate);
 
     // 3. 逐 block 前向
     let debug_blocks = debug_blocks_enabled();
     let block_start_ts = std::time::Instant::now();
 
     // 预计算所有 batch token 的 cos/sin(避免与 kv cache 的 borrow 冲突)
-    // ★ 优化: 预分配 buffer 复用, 消除 2×n_batch 次 Vec heap 分配 (n_batch=26 → 52 次 alloc)
+    // ★ 优化: 扁平布局 [n_batch * rope_dim * 2] (cos 在前, sin 在后) + ForwardContext 复用,
+    //   消除原 Vec<([f32;128],[f32;128])> 每次 prefill 的 n_batch × 1KB alloc。
     let t0 = if profile { Some(std::time::Instant::now()) } else { None };
     let rope_dim = cfg.rope_dim;
     debug_assert!(rope_dim <= 128, "rope_dim {rope_dim} > 128, 需扩大 buffer");
-    let mut cos_sin_batch: Vec<([f32; 128], [f32; 128])> = (0..n_batch)
-        .map(|_| ([0.0f32; 128], [0.0f32; 128]))
-        .collect();
+    let cos_sin_stride = rope_dim * 2; // 每 token: cos[rope_dim] + sin[rope_dim]
+    ctx.batch_cos_sin.resize(n_batch * cos_sin_stride, 0.0);
+    let cos_sin_batch = std::mem::take(&mut ctx.batch_cos_sin);
+    let mut cos_sin_batch = cos_sin_batch; // shadow 为 mut
+    // ★ Bonsai-27B 是 Qwen3 纯文本模型 (rope_dim=64, sections=[11,11,10,0]) + 外挂视觉编码器
+    //   文本模型的 M-RoPE 期望所有 token (包括 vision embedding 替换的 image_pad) 用 (t,t,t) 位置编码
+    //   vision embedding 只是替换了 image_pad token 的 embedding, 位置编码仍按序列位置递增
+    //   若为 vision token 单独计算三维 M-RoPE (T,H,W), 会与文本模型期望的位置编码不匹配,
+    //   导致 attention 退化 (重复循环 + 数量级错误)
     for t in 0..n_batch {
-        let (cos_arr, sin_arr) = &mut cos_sin_batch[t];
+        let base = t * cos_sin_stride;
+        let (cos_part, sin_part) = cos_sin_batch[base..base + 2 * rope_dim].split_at_mut(rope_dim);
         math::rope_cos_sin_mrope_text_into(
             start_pos + t, &ctx.state.rope_freqs, &ctx.state.rope_sections,
-            &mut cos_arr[..rope_dim], &mut sin_arr[..rope_dim],
+            cos_part, sin_part,
         );
     }
     if let Some(t) = t0 { p_cos_sin = t.elapsed(); }
@@ -459,13 +553,9 @@ pub fn forward_batch_with_vision(
             // ★ scale 已预烘焙到 Q (见 token 循环内 q_scale_t), 这里不再保留 attn_scale
             let group_size = n_q_heads / n_kv_heads;
 
-            // 3a. Batch rmsnorm
+            // 3a. Batch rmsnorm (跨 token 并行, n_batch >= 4 时启用线程池)
             let ts = if profile { Some(std::time::Instant::now()) } else { None };
-            for t in 0..n_batch {
-                let src = &ctx.h_buf[t * hidden..(t + 1) * hidden];
-                let dst = &mut normed_batch[t * hidden..(t + 1) * hidden];
-                math::rmsnorm_into(src, dst, &w.attn_norm.data, cfg.rms_eps);
-            }
+            batch_rmsnorm_parallel(&ctx.h_buf, &mut normed_batch, &w.attn_norm.data, hidden, cfg.rms_eps, n_batch);
             if let Some(ts) = ts { p_batch_rmsnorm += ts.elapsed(); }
 
             // 3b. Batch Q matvec: qkv_buf[t] = W_q @ normed[t]
@@ -492,9 +582,10 @@ pub fn forward_batch_with_vision(
                 // ★ P1-5: 不再 copy K/V 到 workspace, K norm+RoPE 直接在 k_buf 上 in-place
 
                 // QK-norm + RoPE 融合 (减少循环开销)
-                let (cos_arr, sin_arr) = &cos_sin_batch[t];
-                let cos = &cos_arr[..rope_dim];
-                let sin = &sin_arr[..rope_dim];
+                // ★ 扁平 cos_sin_batch: [t * stride .. t * stride + rope_dim] = cos, 后半 = sin
+                let cs_base = t * cos_sin_stride;
+                let cos = &cos_sin_batch[cs_base..cs_base + rope_dim];
+                let sin = &cos_sin_batch[cs_base + rope_dim..cs_base + 2 * rope_dim];
 
                 for h_i in 0..n_q_heads {
                     let hs = h_i * head_dim;
@@ -606,13 +697,9 @@ pub fn forward_batch_with_vision(
             let ssm_pool = crate::model::workspace::get_thread_pool();
             let ssm_n_threads = crate::model::workspace::thread_count().min(ssm_num_v_heads);
 
-            // 3a. Batch rmsnorm
+            // 3a. Batch rmsnorm (跨 token 并行, n_batch >= 4 时启用线程池)
             let ts = if profile { Some(std::time::Instant::now()) } else { None };
-            for t in 0..n_batch {
-                let src = &ctx.h_buf[t * hidden..(t + 1) * hidden];
-                let dst = &mut normed_batch[t * hidden..(t + 1) * hidden];
-                math::rmsnorm_into(src, dst, &w.attn_norm.data, cfg.rms_eps);
-            }
+            batch_rmsnorm_parallel(&ctx.h_buf, &mut normed_batch, &w.attn_norm.data, hidden, cfg.rms_eps, n_batch);
             if let Some(ts) = ts { p_batch_rmsnorm += ts.elapsed(); }
 
             // 3b. Batch SSM matvecs
@@ -874,13 +961,9 @@ pub fn forward_batch_with_vision(
         // 4. Post-attention norm + MLP (batch)
         let (post_norm, w_gate, w_up, w_down) = block_w.post_norm_and_ffn();
 
-        // 4a. Batch post-attention norm
+        // 4a. Batch post-attention norm (跨 token 并行, n_batch >= 4 时启用线程池)
         let ts = if profile { Some(std::time::Instant::now()) } else { None };
-        for t in 0..n_batch {
-            let src = &ctx.h_buf[t * hidden..(t + 1) * hidden];
-            let dst = &mut normed_batch[t * hidden..(t + 1) * hidden];
-            math::rmsnorm_into(src, dst, &post_norm.data, cfg.rms_eps);
-        }
+        batch_rmsnorm_parallel(&ctx.h_buf, &mut normed_batch, &post_norm.data, hidden, cfg.rms_eps, n_batch);
         if let Some(ts) = ts { p_batch_rmsnorm += ts.elapsed(); }
 
         // 4b. Batch MLP matvecs (gate → qkv_buf, up → tmp_buf, 直接复用无需 take)
@@ -1018,6 +1101,18 @@ pub fn forward_batch_with_vision(
         );
     }
 
+    // ★ 放回 batch buffer 到 ctx (容量保留供下次 prefill 复用, 零 alloc)
+    ctx.batch_normed = normed_batch;
+    ctx.batch_qkv = qkv_buf;
+    ctx.batch_out = attn_out_buf;
+    ctx.batch_k = k_buf;
+    ctx.batch_v = v_buf;
+    ctx.batch_tmp = tmp_buf;
+    ctx.batch_ssm_alpha = ssm_alpha_buf;
+    ctx.batch_ssm_beta = ssm_beta_buf;
+    ctx.batch_ssm_gate = ssm_gate_buf;
+    ctx.batch_cos_sin = cos_sin_batch;
+
     Ok(())
 }
 pub fn make_context<'a>(
@@ -1036,5 +1131,15 @@ pub fn make_context<'a>(
         hidden_tap_buf: Vec::new(),
         hidden_tap_layers: Vec::new(),
         hidden_tap_batch_buf: Vec::new(),
+        batch_normed: Vec::new(),
+        batch_qkv: Vec::new(),
+        batch_out: Vec::new(),
+        batch_k: Vec::new(),
+        batch_v: Vec::new(),
+        batch_tmp: Vec::new(),
+        batch_ssm_alpha: Vec::new(),
+        batch_ssm_beta: Vec::new(),
+        batch_ssm_gate: Vec::new(),
+        batch_cos_sin: Vec::new(),
     }
 }

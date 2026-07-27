@@ -282,6 +282,16 @@ pub fn session_reply(
         hidden_tap_buf: Vec::new(),
         hidden_tap_layers: Vec::new(),
         hidden_tap_batch_buf: Vec::new(),
+        batch_normed: Vec::new(),
+        batch_qkv: Vec::new(),
+        batch_out: Vec::new(),
+        batch_k: Vec::new(),
+        batch_v: Vec::new(),
+        batch_tmp: Vec::new(),
+        batch_ssm_alpha: Vec::new(),
+        batch_ssm_beta: Vec::new(),
+        batch_ssm_gate: Vec::new(),
+        batch_cos_sin: Vec::new(),
     };
 
     // 3-4. prefill + decode 封装到 IIFE
@@ -471,6 +481,16 @@ fn reply_with_increment_stream(
         hidden_tap_buf: Vec::new(),
         hidden_tap_layers: Vec::new(),
         hidden_tap_batch_buf: Vec::new(),
+        batch_normed: Vec::new(),
+        batch_qkv: Vec::new(),
+        batch_out: Vec::new(),
+        batch_k: Vec::new(),
+        batch_v: Vec::new(),
+        batch_tmp: Vec::new(),
+        batch_ssm_alpha: Vec::new(),
+        batch_ssm_beta: Vec::new(),
+        batch_ssm_gate: Vec::new(),
+        batch_cos_sin: Vec::new(),
     };
 
     let n_input = input_ids.len();
@@ -627,9 +647,13 @@ fn session_reply_with_vision_inner(
     } else { 0 };
     let image_token_str = tokenizer.vocab.tokens.get(image_token_id as usize)
         .cloned().unwrap_or_else(|| "<|image_pad|>".to_string());
+    // ★ Qwen3-VL chat template: 每张图必须用 <|vision_start|><|image_pad|><|vision_end|> 包裹
+    //   缺少 vision_start/end 会导致模型无法识别图像边界, 完全看不到图像内容
     let mut image_section = String::new();
     for _ in 0..n_images {
+        image_section.push_str("<|vision_start|>");
         image_section.push_str(&image_token_str);
+        image_section.push_str("<|vision_end|>");
     }
 
     // 构造增量: 首轮带 sys prompt, 后续轮补 <|im_end|>\n
@@ -677,6 +701,16 @@ fn session_reply_with_vision_inner(
         hidden_tap_buf: Vec::new(),
         hidden_tap_layers: Vec::new(),
         hidden_tap_batch_buf: Vec::new(),
+        batch_normed: Vec::new(),
+        batch_qkv: Vec::new(),
+        batch_out: Vec::new(),
+        batch_k: Vec::new(),
+        batch_v: Vec::new(),
+        batch_tmp: Vec::new(),
+        batch_ssm_alpha: Vec::new(),
+        batch_ssm_beta: Vec::new(),
+        batch_ssm_gate: Vec::new(),
+        batch_cos_sin: Vec::new(),
     };
 
     // 3-4. prefill + decode 封装到 IIFE
@@ -692,7 +726,6 @@ fn session_reply_with_vision_inner(
         let total_prefill_tokens = input_ids.len() + n_images * n_vision_per_image.saturating_sub(1);
         let mut done_prefill_tokens = 0usize;
         const MAX_TEXT_BATCH: usize = 32;
-        const MAX_VISION_BATCH: usize = 64;
         let mut text_batch: Vec<u32> = Vec::with_capacity(MAX_TEXT_BATCH);
         let mut vision_offset = 0usize;
 
@@ -718,11 +751,17 @@ fn session_reply_with_vision_inner(
                             done: &mut usize, prog: &mut Option<&mut dyn FnMut(ProgressEvent)>| -> crate::Result<()> {
             let n = emb.len() / hidden;
             debug_assert_eq!(emb.len(), n * hidden);
-            let token_ids: Vec<u32> = vec![image_token_id; n];
+            // ★ 一次性处理: 1 个 image_pad 占位, 展开为 n 个 vision token
+            //   (vs 原分批: n 个 image_pad 各展开 1 个)
+            //   原因: forward_batch_with_vision 的 vision M-RoPE 需要 n_vision_per_image
+            //   来计算 n_per_side_merged = sqrt(n); 分批模式下 n_vision_per_image=1 会导致
+            //   sqrt(1)=1, 所有 patch 的 (h,w) 退化为 (idx,0), 模型无法区分空间位置 →
+            //   图像内容混叠、重复计数 (如 "几个文件夹" 被描述为 "成百上千个")
+            let token_ids: Vec<u32> = vec![image_token_id];
             let inject = VisionInject {
                 image_token_id,
                 vision_embeddings: emb,
-                n_vision_per_image: 1,
+                n_vision_per_image: n,
             };
             forward_batch_with_vision(ctx, &token_ids, ctx.state.pos, None, Some(inject), None)?;
             *done += n;
@@ -736,14 +775,11 @@ fn session_reply_with_vision_inner(
         for &tid in &input_ids {
             if tid == image_token_id {
                 flush_text(&mut text_batch, &mut ctx, &mut done_prefill_tokens, &mut prog)?;
-                let mut vi = 0;
-                while vi < n_vision_per_image {
-                    let bs = MAX_VISION_BATCH.min(n_vision_per_image - vi);
-                    let s = (vision_offset + vi) * hidden;
-                    let e = s + bs * hidden;
-                    flush_vision(&mut ctx, &vision_embeddings[s..e], &mut done_prefill_tokens, &mut prog)?;
-                    vi += bs;
-                }
+                // ★ 一次性 flush 整张图的 vision embedding (不分批)
+                //   576 个 vision token 一次性注入, M-RoPE 能正确计算每个 patch 的 (h,w)
+                let s = vision_offset * hidden;
+                let e = s + n_vision_per_image * hidden;
+                flush_vision(&mut ctx, &vision_embeddings[s..e], &mut done_prefill_tokens, &mut prog)?;
                 vision_offset += n_vision_per_image;
             } else {
                 text_batch.push(tid);
@@ -859,6 +895,16 @@ fn session_reply_with_tools(
         hidden_tap_buf: Vec::new(),
         hidden_tap_layers: Vec::new(),
         hidden_tap_batch_buf: Vec::new(),
+        batch_normed: Vec::new(),
+        batch_qkv: Vec::new(),
+        batch_out: Vec::new(),
+        batch_k: Vec::new(),
+        batch_v: Vec::new(),
+        batch_tmp: Vec::new(),
+        batch_ssm_alpha: Vec::new(),
+        batch_ssm_beta: Vec::new(),
+        batch_ssm_gate: Vec::new(),
+        batch_cos_sin: Vec::new(),
     };
 
     // 4. 完整 prefill (从 pos=0 开始, 分批避免 tmp[64] 越界)
@@ -974,6 +1020,16 @@ pub fn session_reply_with_tool_response(
         hidden_tap_buf: Vec::new(),
         hidden_tap_layers: Vec::new(),
         hidden_tap_batch_buf: Vec::new(),
+        batch_normed: Vec::new(),
+        batch_qkv: Vec::new(),
+        batch_out: Vec::new(),
+        batch_k: Vec::new(),
+        batch_v: Vec::new(),
+        batch_tmp: Vec::new(),
+        batch_ssm_alpha: Vec::new(),
+        batch_ssm_beta: Vec::new(),
+        batch_ssm_gate: Vec::new(),
+        batch_cos_sin: Vec::new(),
     };
 
     let n_input = input_ids.len();

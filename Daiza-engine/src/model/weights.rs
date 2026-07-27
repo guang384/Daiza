@@ -487,13 +487,16 @@ impl Q1_0Matrix {
                 return;
             }
             // ★ P1-4: 用 batched kernel 复用 scale/LUT, tmp buffer 避免堆分配
-            let mut tmp = [0.0f32; 64];
-            debug_assert!(n_batch <= 64);
+            // ★ vision 路径 n_batch 可能 > 64 (如 576 vision tokens), 栈数组不够用
+            //   正常文本 prefill n_batch <= 64, 用栈数组; vision prefill 用 Vec (少见路径)
+            let mut tmp_stack = [0.0f32; 64];
+            let mut tmp_vec: Vec<f32> = if n_batch > 64 { vec![0.0; n_batch] } else { Vec::new() };
+            let tmp: &mut [f32] = if n_batch > 64 { &mut tmp_vec } else { &mut tmp_stack[..n_batch] };
             #[cfg(target_arch = "x86_64")]
             if use_avx2 {
                 for i in 0..n {
                     unsafe {
-                        dot_q1_0_row_batch_avx2(&self.bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                        dot_q1_0_row_batch_avx2(&self.bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                     }
                     for t in 0..n_batch {
                         y[t * n + i] = tmp[t];
@@ -502,7 +505,7 @@ impl Q1_0Matrix {
                 return;
             }
             for i in 0..n {
-                dot_q1_0_row_batch(&self.bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                dot_q1_0_row_batch(&self.bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                 for t in 0..n_batch {
                     y[t * n + i] = tmp[t];
                 }
@@ -539,8 +542,10 @@ impl Q1_0Matrix {
                     }
                     return;
                 }
-                let mut tmp = [0.0f32; 64];
-                debug_assert!(n_batch <= 64);
+                // ★ vision 路径 n_batch 可能 > 64 (如 576), 栈数组不够用
+                let mut tmp_stack = [0.0f32; 64];
+                let mut tmp_vec: Vec<f32> = if n_batch > 64 { vec![0.0; n_batch] } else { Vec::new() };
+                let tmp: &mut [f32] = if n_batch > 64 { &mut tmp_vec } else { &mut tmp_stack[..n_batch] };
                 #[cfg(target_arch = "x86_64")]
                 if use_avx2 {
                     // ★ batch4 分块: 4-token 共享权重读取 (vs 2-token 的 n_batch/2 次)
@@ -578,7 +583,7 @@ impl Q1_0Matrix {
                     return;
                 }
                 for i in start..end {
-                    dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                    dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                     for t in 0..n_batch {
                         unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
                     }
@@ -614,13 +619,15 @@ impl Q1_0Matrix {
                         }
                         return;
                     }
-                    let mut tmp = [0.0f32; 64];
-                    debug_assert!(n_batch <= 64);
+                    // ★ vision 路径 n_batch 可能 > 64 (如 576), 栈数组不够用
+                    let mut tmp_stack = [0.0f32; 64];
+                    let mut tmp_vec: Vec<f32> = if n_batch > 64 { vec![0.0; n_batch] } else { Vec::new() };
+                    let tmp: &mut [f32] = if n_batch > 64 { &mut tmp_vec } else { &mut tmp_stack[..n_batch] };
                     #[cfg(target_arch = "x86_64")]
                     if use_avx2 {
                         for i in start..end {
                             unsafe {
-                                dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                                dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                             }
                             for t in 0..n_batch {
                                 unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
@@ -629,7 +636,7 @@ impl Q1_0Matrix {
                         return;
                     }
                     for i in start..end {
-                        dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                        dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                         for t in 0..n_batch {
                             unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
                         }
@@ -829,13 +836,15 @@ impl Q1_0Matrix {
                 return;
             }
             // ★ P1-4: batched kernel
-            let mut tmp = [0.0f32; 64];
-            debug_assert!(n_batch <= 64);
+            // ★ vision 路径 n_batch 可能 > 64 (如 576), 栈数组不够用
+            let mut tmp_stack = [0.0f32; 64];
+            let mut tmp_vec: Vec<f32> = if n_batch > 64 { vec![0.0; n_batch] } else { Vec::new() };
+            let tmp: &mut [f32] = if n_batch > 64 { &mut tmp_vec } else { &mut tmp_stack[..n_batch] };
             #[cfg(target_arch = "x86_64")]
             if use_avx2 {
                 for i in 0..n {
                     unsafe {
-                        dot_q1_0_row_batch_avx2(&self.bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                        dot_q1_0_row_batch_avx2(&self.bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                     }
                     for t in 0..n_batch {
                         y[t * n + i] += tmp[t];
@@ -844,7 +853,7 @@ impl Q1_0Matrix {
                 return;
             }
             for i in 0..n {
-                dot_q1_0_row_batch(&self.bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                dot_q1_0_row_batch(&self.bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                 for t in 0..n_batch {
                     y[t * n + i] += tmp[t];
                 }
@@ -881,8 +890,10 @@ impl Q1_0Matrix {
                     }
                     return;
                 }
-                let mut tmp = [0.0f32; 64];
-                debug_assert!(n_batch <= 64);
+                // ★ vision 路径 n_batch 可能 > 64 (如 576), 栈数组不够用
+                let mut tmp_stack = [0.0f32; 64];
+                let mut tmp_vec: Vec<f32> = if n_batch > 64 { vec![0.0; n_batch] } else { Vec::new() };
+                let tmp: &mut [f32] = if n_batch > 64 { &mut tmp_vec } else { &mut tmp_stack[..n_batch] };
                 #[cfg(target_arch = "x86_64")]
                 if use_avx2 {
                     // ★ batch4 分块: 4-token 共享权重读取 (vs 2-token 的 n_batch/2 次)
@@ -918,7 +929,7 @@ impl Q1_0Matrix {
                     return;
                 }
                 for i in start..end {
-                    dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                    dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                     for t in 0..n_batch {
                         unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
                     }
@@ -954,13 +965,15 @@ impl Q1_0Matrix {
                         }
                         return;
                     }
-                    let mut tmp = [0.0f32; 64];
-                    debug_assert!(n_batch <= 64);
+                    // ★ vision 路径 n_batch 可能 > 64 (如 576), 栈数组不够用
+                    let mut tmp_stack = [0.0f32; 64];
+                    let mut tmp_vec: Vec<f32> = if n_batch > 64 { vec![0.0; n_batch] } else { Vec::new() };
+                    let tmp: &mut [f32] = if n_batch > 64 { &mut tmp_vec } else { &mut tmp_stack[..n_batch] };
                     #[cfg(target_arch = "x86_64")]
                     if use_avx2 {
                         for i in start..end {
                             unsafe {
-                                dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                                dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                             }
                             for t in 0..n_batch {
                                 unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
@@ -969,7 +982,7 @@ impl Q1_0Matrix {
                         return;
                     }
                     for i in start..end {
-                        dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, &mut tmp[..n_batch], 1);
+                        dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                         for t in 0..n_batch {
                             unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
                         }

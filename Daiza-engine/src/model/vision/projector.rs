@@ -18,7 +18,7 @@
 //! 输出 576 个 vision embeddings, 每个维度 = text model hidden dim (5120)
 //! 这些 embeddings 替换 text model prefill 中的 image_token 位置的 token_embd
 
-use crate::math::gelu_inplace;
+use crate::math::gelu_erf_inplace;
 
 use super::config::VisionConfig;
 use super::weights::VisionWeights;
@@ -116,10 +116,13 @@ pub fn project_vision(
         crate::math::simd_exp::saxpy_avx2(1.0, mm_0_b, y, merged_hidden);
     }
 
-    // ───── 3. GELU (in-place, 无需 tmp buffer) ─────
-    // ★ V-6: gelu_inplace 替代 gelu_into + copy_from_slice (2 pass → 1 pass, 省 10.6MB copy)
+    // ───── 3. GELU (in-place, 精确 erf 版本) ─────
+    // ★ Qwen3-VL PatchMerger 用 nn.GELU(approximate='none') 即精确 erf 版本,
+    //   区别于 ViT MLP 的 tanh 近似。混用会导致 vision embedding 数值偏差,
+    //   进而影响模型对图像内容的判别 (虽量级小, 但 PatchMerger 是 vision→text
+    //   的关键投影层, 数值精度直接影响 text model 对图像 token 的解读)。
     for m in 0..n_merged {
-        gelu_inplace(&mut pctx.mm_0_out[m * merged_hidden..(m + 1) * merged_hidden]);
+        gelu_erf_inplace(&mut pctx.mm_0_out[m * merged_hidden..(m + 1) * merged_hidden]);
     }
 
     // ───── 4. mm.2: Linear(4608 → 5120) + bias, batched matmul ─────

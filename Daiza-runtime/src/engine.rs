@@ -142,6 +142,9 @@ impl Engine {
         let vit_ctx = ViTContext::new(&cfg);
         let proj_ctx = ProjectorContext::new(&cfg);
         eprintln!("[vision] mmproj loaded successfully");
+        // ★ 验证 Qwen3-VL chat template 必需的 vision 边界 token 在 tokenizer vocab 中存在
+        //   缺失会导致 <|vision_start|>/<|vision_end|> 被当普通文本字节编码, 模型无法识别图像
+        self.verify_vision_boundary_tokens()?;
         self.vision = Some(VisionContext { cfg, weights, vit_ctx, proj_ctx });
         Ok(())
     }
@@ -168,6 +171,23 @@ impl Engine {
         Err(crate::BonsaiError::Unsupported(
             "image_token_id not found: GGUF has neither tokenizer.ggml.image_token_id metadata nor <|image_pad|>/<|vision_pad|> special token".into()
         ))
+    }
+
+    /// 验证 Qwen3-VL vision 边界 token (<|vision_start|>/<|vision_end|>) 在 vocab 中存在
+    ///
+    /// ★ 必需: chat template 要求 image_pad 用 <|vision_start|>...<|vision_end|> 包裹,
+    ///   若这些 token 不在 special_tokens 中, BPE 会把它们当普通文本字节编码,
+    ///   产生大量乱码 token, 模型完全无法识别图像边界。
+    pub fn verify_vision_boundary_tokens(&self) -> Result<()> {
+        for name in ["<|vision_start|>", "<|vision_end|>"] {
+            if !self.tokenizer.special_tokens.contains_key(name) {
+                return Err(crate::BonsaiError::Unsupported(format!(
+                    "vision boundary token {name} not found in tokenizer special_tokens; \
+                     Qwen3-VL chat template requires <|vision_start|>/<|vision_end|> to wrap image_pad"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// 一次性加载所有 block 权重到内存(约 13GB)
@@ -600,9 +620,12 @@ impl Engine {
         //    每个 image_token 会被 forward_batch_with_vision 展开为 n_vision_per_image 个 vision embeddings
         let image_token_str = self.tokenizer.vocab.tokens.get(image_token_id as usize)
             .cloned().unwrap_or_else(|| "<|image_pad|>".to_string());
+        // ★ Qwen3-VL chat template: 每张图必须用 <|vision_start|><|image_pad|><|vision_end|> 包裹
         let mut image_section = String::new();
         for _ in 0..image_paths.len() {
+            image_section.push_str("<|vision_start|>");
             image_section.push_str(&image_token_str);
+            image_section.push_str("<|vision_end|>");
         }
         let chat_text = build_chat_input_with_image(&image_section, prompt, system_prompt);
         eprintln!("[debug] input text: {chat_text:?}");
@@ -620,18 +643,17 @@ impl Engine {
         let weights = self.weights.as_ref().unwrap();
         let mut ctx = make_context(weights, cfg);
 
-        // 6. prefill: text tokens 用 forward_batch (batched), vision embeddings 分批注入
+        // 6. prefill: text tokens 用 forward_batch (batched), vision embeddings 一次性注入
         //    ★ 策略:
         //      - text tokens: 收集成 batch (≤32), 用 forward_batch 一次读 13GB 权重
-        //      - image_token: 展开为 n_vision_per_image 个 vision embeddings,
-        //        分批注入 (每批 MAX_VISION_BATCH=64 个), 用 forward_batch_with_vision
-        //      - 每 64 个 vision embeddings 一次 forward_batch, 读 13GB 权重 1 次
-        //        vs 逐个注入 576 次 forward_single_token, 读 13GB 权重 576 次
-        //    ★ n_batch=64 走 batch4 kernel (16 组 × 4 token), tmp[64] 够用
+        //      - image_token: 1 个占位, 展开为 n_vision_per_image 个 vision embeddings,
+        //        一次性注入 (用 forward_batch_with_vision)
+        //    ★ 一次性注入原因: vision M-RoPE 需要 n_vision_per_image 计算
+        //      n_per_side_merged = sqrt(n), 分批模式下 n=1 会导致 sqrt(1)=1,
+        //      所有 patch 的 (h,w) 退化为 (idx,0), 模型无法区分空间位置
         let n_input = input_ids.len();
         let prefill_start = std::time::Instant::now();
         const MAX_TEXT_BATCH: usize = 32;
-        const MAX_VISION_BATCH: usize = 64;
         let mut text_batch: Vec<u32> = Vec::with_capacity(MAX_TEXT_BATCH);
         let mut vision_offset = 0usize; // 以 hidden-dim 为单位的偏移
         let hidden = self.config.hidden;
@@ -648,16 +670,16 @@ impl Engine {
             Ok(())
         };
 
-        // 分批注入 vision embeddings (每批 MAX_VISION_BATCH 个)
+        // 一次性注入整张图的 vision embeddings
         let flush_vision_batch = |ctx: &mut ForwardContext<'_>, emb: &[f32]| -> crate::Result<()> {
             let n = emb.len() / hidden;
             debug_assert_eq!(emb.len(), n * hidden);
-            // 构造 n 个 image_token, 每个替换为 1 个 vision embedding (n_vision_per_image=1)
-            let token_ids: Vec<u32> = vec![image_token_id; n];
+            // 1 个 image_token 占位, 展开为 n 个 vision token
+            let token_ids: Vec<u32> = vec![image_token_id];
             let inject = VisionInject {
                 image_token_id,
                 vision_embeddings: emb,
-                n_vision_per_image: 1,
+                n_vision_per_image: n,
             };
             forward_batch_with_vision(ctx, &token_ids, ctx.state.pos, None, Some(inject), None)
         };
@@ -666,16 +688,11 @@ impl Engine {
             if tid == image_token_id {
                 // 先 flush 累积的 text batch
                 flush_text_batch(&mut text_batch, &mut ctx)?;
-                // 分批注入 n_vision_per_image 个 vision embeddings
-                let mut vi = 0;
-                while vi < n_vision_per_image {
-                    let batch_size = MAX_VISION_BATCH.min(n_vision_per_image - vi);
-                    let emb_start = (vision_offset + vi) * hidden;
-                    let emb_end = emb_start + batch_size * hidden;
-                    let emb = &vision_embeddings[emb_start..emb_end];
-                    flush_vision_batch(&mut ctx, emb)?;
-                    vi += batch_size;
-                }
+                // 一次性注入整张图的 vision embeddings
+                let emb_start = vision_offset * hidden;
+                let emb_end = emb_start + n_vision_per_image * hidden;
+                let emb = &vision_embeddings[emb_start..emb_end];
+                flush_vision_batch(&mut ctx, emb)?;
                 vision_offset += n_vision_per_image;
             } else {
                 text_batch.push(tid);
@@ -977,6 +994,16 @@ impl Engine {
                 hidden_tap_buf: Vec::new(),
                 hidden_tap_layers,
                 hidden_tap_batch_buf: Vec::new(),
+                batch_normed: Vec::new(),
+                batch_qkv: Vec::new(),
+                batch_out: Vec::new(),
+                batch_k: Vec::new(),
+                batch_v: Vec::new(),
+                batch_tmp: Vec::new(),
+                batch_ssm_alpha: Vec::new(),
+                batch_ssm_beta: Vec::new(),
+                batch_ssm_gate: Vec::new(),
+                batch_cos_sin: Vec::new(),
             }
         } else {
             // ★ 全量模式: 创建新 ctx (CLI 单次生成)
@@ -1669,8 +1696,12 @@ fn leviathan_check(
     }
 
     // 采样模式: 标准 Leviathan 随机接受 u < p[dt]/q[dt]
-    let (p_dt, _) = softmax_single(target_logits, dt);
-    let (q_dt, _) = softmax_single(draft_logits, dt);
+    // ★ 优化: AVX2 融合 softmax_pair_single, target+draft 并行遍历
+    //   原 softmax_single 标量两次调用 = 4 次 vocab 遍历 (~16ms/cycle)
+    //   现融合为 2 次 AVX2 遍历 (~4ms/cycle), 省 ~12ms/cycle
+    let (p_dt, q_dt) = daiza_engine::math::simd_exp::softmax_pair_single_avx2(
+        target_logits, draft_logits, dt,
+    );
 
     let r = if q_dt > 1e-12 { p_dt / q_dt } else { 0.0 };
     let u = rng();
@@ -1730,20 +1761,6 @@ fn sample_bonus(
 fn softmax_into(logits: &[f32], out: &mut [f32]) {
     out[..logits.len()].copy_from_slice(logits);
     daiza_engine::math::softmax_inplace(&mut out[..logits.len()]);
-}
-
-/// 只计算 softmax 在 `idx` 位置的概率值, 避免全量分配
-/// 返回 (prob[idx], sum)
-fn softmax_single(logits: &[f32], idx: usize) -> (f32, f32) {
-    let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let mut sum = 0.0f32;
-    let mut idx_exp = 0.0f32;
-    for (i, &l) in logits.iter().enumerate() {
-        let e = (l - max).exp();
-        sum += e;
-        if i == idx { idx_exp = e; }
-    }
-    (idx_exp / sum, sum)
 }
 
 /// DSpark bonus 采样复用 buffer (跨 cycle 复用, 避免每 cycle ~4MB 分配)
