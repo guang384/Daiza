@@ -32,7 +32,7 @@ pub use rmsnorm::{rmsnorm_inplace, rmsnorm_into};
 pub use rope::{apply_rope_partial, rope_cos_sin_mrope_text, rope_cos_sin_mrope_text_into, rope_cos_sin_mrope_vision_into, rope_freqs};
 pub use softmax::softmax_inplace;
 pub use activation::swiglu_inplace;
-pub use sampling::{sample_top_k_top_p_into, LcgRng, SamplingBuffers, SamplingParams};
+pub use sampling::{sample_top_k_top_p_into, apply_repetition_penalty, LcgRng, SamplingBuffers, SamplingParams};
 pub use simd_exp::{
     exp_inplace_simd, mul_inplace_simd, sigmoid_fast, sigmoid_inplace_simd,
     silu_inplace_simd, swiglu_inplace_simd,

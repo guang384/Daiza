@@ -9,7 +9,7 @@
 //! - `session_manager`: 多 session LRU 管理 (active 在 DRAM, inactive 在 SSD)
 //! - `tool_call`: 工具调用 (tools/tool_call/tool_response 模板渲染 + 解析)
 
-use daiza_engine::math::{sample_top_k_top_p_into, LcgRng, SamplingBuffers, SamplingParams};
+use daiza_engine::math::{sample_top_k_top_p_into, apply_repetition_penalty, LcgRng, SamplingBuffers, SamplingParams};
 use daiza_engine::model::forward::{
     forward_batch, forward_single_token, ForwardContext, ModelState,
 };
@@ -78,6 +78,17 @@ impl Session {
         self.history_tokens.clear();
         self.pending_images.clear();
         self.messages.clear();
+        self.dspark_tap_history.clear();
+    }
+
+    /// 仅重置推理状态 (KV/SSM state + dspark tap),
+    /// 保留 history_tokens / messages / tools / system_prompt / think_enabled。
+    ///
+    /// 用于 DSpark ↔ 非 DSpark 切换: KV/SSM state 不兼容必须重置,
+    /// 但 history_tokens 保留, 下一轮 session_reply 检测到 state.pos=0 但
+    /// history_tokens 非空时, 会先 prefill 整个 history_tokens 恢复上下文。
+    pub fn reset_state(&mut self) {
+        self.state.reset();
         self.dspark_tap_history.clear();
     }
 }
@@ -311,10 +322,12 @@ pub fn session_reply(
         let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
 
         for _step in 0..max_tokens {
+            // ★ 重复惩罚: 对最近生成的 token 降低概率, 抑制重复循环
+            apply_repetition_penalty(&mut ctx.logits_buf, &generated_ids, params.repetition_penalty, params.frequency_penalty);
             let next_id = sample_top_k_top_p_into(
                 &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
             );
-            // EOS:停止生成,不 forward EOS(EOS 的 KV 在下一轮 increment 补入)
+            // EOS:停止生成,不 forwardEOS(EOS 的 KV 在下一轮 increment 补入)
             if next_id as u32 == cfg.eos_token_id {
                 break;
             }
@@ -469,6 +482,13 @@ fn reply_with_increment_stream(
     }
 
     let start_pos = session.state.pos;
+    // ★ DSpark 切换后 state.pos=0 但 history_tokens 非空: 需先 prefill 整个历史恢复 KV/SSM
+    let replay_history = start_pos == 0 && !session.history_tokens.is_empty();
+    let history_tokens_clone = if replay_history {
+        session.history_tokens.clone()
+    } else {
+        Vec::new()
+    };
     let mut ctx = ForwardContext {
         cfg,
         weights,
@@ -499,10 +519,15 @@ fn reply_with_increment_stream(
     //   外层 restore_ctx_state 保证 KV cache + pos 回移到 session。
     let inner_result: Result<Vec<u32>> = (|| {
         let prefill_start = std::time::Instant::now();
+        // ★ DSpark 切换恢复: 先 prefill 整个 history_tokens 重建 KV/SSM state
+        if replay_history && !history_tokens_clone.is_empty() {
+            prefill_batched(&mut ctx, &history_tokens_clone, 0)?;
+        }
+        let cur_pos = ctx.state.pos;
         if n_input == 1 {
             forward_single_token(&mut ctx, input_ids[0])?;
         } else if n_input > 1 {
-            prefill_batched(&mut ctx, &input_ids, start_pos)?;
+            prefill_batched(&mut ctx, &input_ids, cur_pos)?;
         }
         let prefill_ms = prefill_start.elapsed().as_millis();
 
@@ -516,6 +541,8 @@ fn reply_with_increment_stream(
         let mut broke = false;
 
         for _step in 0..max_tokens {
+            // ★ 重复惩罚: 对最近生成的 token 降低概率, 抑制重复循环
+            apply_repetition_penalty(&mut ctx.logits_buf, &generated_ids, params.repetition_penalty, params.frequency_penalty);
             let next_id = sample_top_k_top_p_into(
                 &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
             );
@@ -798,6 +825,8 @@ fn session_reply_with_vision_inner(
         let mut broke = false;
 
         for _step in 0..max_tokens {
+            // ★ 重复惩罚
+            apply_repetition_penalty(&mut ctx.logits_buf, &generated_ids, params.repetition_penalty, params.frequency_penalty);
             let next_id = sample_top_k_top_p_into(
                 &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
             );
@@ -921,6 +950,8 @@ fn session_reply_with_tools(
     let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
 
     for _step in 0..max_tokens {
+        // ★ 重复惩罚
+        apply_repetition_penalty(&mut ctx.logits_buf, &generated_ids, params.repetition_penalty, params.frequency_penalty);
         let next_id = sample_top_k_top_p_into(
             &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
         );
@@ -1044,6 +1075,8 @@ pub fn session_reply_with_tool_response(
     let mut sampling_buf = SamplingBuffers::new(ctx.logits_buf.len());
 
     for _step in 0..max_tokens {
+        // ★ 重复惩罚
+        apply_repetition_penalty(&mut ctx.logits_buf, &generated_ids, params.repetition_penalty, params.frequency_penalty);
         let next_id = sample_top_k_top_p_into(
             &ctx.logits_buf, params, &mut || rng.next_f32(), &mut sampling_buf,
         );

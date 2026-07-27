@@ -273,7 +273,7 @@ fn start_backend(
         )
     })?;
 
-    let params = SamplingParams { temperature: 0.7, top_k: 20, top_p: 0.95 };
+    let params = SamplingParams { temperature: 0.7, top_k: 20, top_p: 0.95, repetition_penalty: 1.3, frequency_penalty: 0.4 };
 
     app.state::<Backend>().running.store(true, Ordering::SeqCst);
 

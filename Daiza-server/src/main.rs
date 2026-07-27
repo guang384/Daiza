@@ -285,6 +285,7 @@ fn handle_chat_completions(stream: &mut TcpStream, shared: &Shared, body: &str) 
         temperature: temperature.max(0.0),
         top_k,
         top_p: top_p.clamp(0.0, 1.0),
+        ..Default::default()
     };
 
     // 构造 chat prompt + 提取图片
@@ -475,6 +476,7 @@ fn handle_completions(stream: &mut TcpStream, shared: &Shared, body: &str) {
         temperature: temperature.max(0.0),
         top_k,
         top_p: top_p.clamp(0.0, 1.0),
+        ..Default::default()
     };
 
     let model_id = shared.model_id.clone();

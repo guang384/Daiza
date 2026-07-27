@@ -797,6 +797,8 @@
           <label>temperature<input type="number" id="param-temp" step="0.1" min="0" max="2"></label>
           <label>top_k<input type="number" id="param-topk" step="1" min="0" max="100"></label>
           <label>top_p<input type="number" id="param-topp" step="0.05" min="0" max="1"></label>
+          <label>rep_penalty<input type="number" id="param-reppenalty" step="0.05" min="1" max="2"></label>
+          <label>freq_penalty<input type="number" id="param-freqpenalty" step="0.1" min="0" max="2"></label>
           <label>max_tokens<input type="number" id="param-maxtok" step="256" min="1" max="65536"></label>
           <button id="param-greedy" title="Greedy decoding (temperature=0)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
@@ -1512,10 +1514,7 @@ async function setDsparkMode(mode) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-    // 切换 enabled 后 session 已重置, 清空聊天显示
-    document.getElementById('chat').innerHTML = '';
-    activeSessionId = null;
-    loadSessions();
+    // ★ DSpark 切换只重置 KV/SSM state, 保留 messages 历史, 不清空聊天显示
   } catch (err) {
     // 失败回滚: 重新拉取状态
     try {
@@ -1544,6 +1543,8 @@ const settingsPanel = document.getElementById('settings-panel');
 const paramTemp = document.getElementById('param-temp');
 const paramTopk = document.getElementById('param-topk');
 const paramTopp = document.getElementById('param-topp');
+const paramReppenalty = document.getElementById('param-reppenalty');
+const paramFreqpenalty = document.getElementById('param-freqpenalty');
 const paramMaxtok = document.getElementById('param-maxtok');
 const paramThink = document.getElementById('param-think');
 const paramGreedy = document.getElementById('param-greedy');
@@ -1568,6 +1569,8 @@ async function loadParams() {
     paramTemp.value = j.temperature ?? '';
     paramTopk.value = j.top_k ?? '';
     paramTopp.value = j.top_p ?? '';
+    paramReppenalty.value = j.repetition_penalty ?? '';
+    paramFreqpenalty.value = j.frequency_penalty ?? '';
     paramMaxtok.value = j.max_tokens ?? '';
     paramThink.checked = !!j.think;
     paramSysprompt.value = j.system_prompt ?? '';
@@ -1601,7 +1604,7 @@ async function postParams(body) {
 }
 
 // number inputs: change 事件 (失焦或回车时触发, 避免输入过程中频繁 POST)
-[paramTemp, paramTopk, paramTopp, paramMaxtok].forEach(el => {
+[paramTemp, paramTopk, paramTopp, paramReppenalty, paramFreqpenalty, paramMaxtok].forEach(el => {
   el.addEventListener('change', () => {
     const body = {};
     if (el === paramTemp) {
@@ -1613,6 +1616,12 @@ async function postParams(body) {
     } else if (el === paramTopp) {
       const p = parseFloat(paramTopp.value);
       if (!isNaN(p)) body.top_p = p;
+    } else if (el === paramReppenalty) {
+      const rp = parseFloat(paramReppenalty.value);
+      if (!isNaN(rp)) body.repetition_penalty = rp;
+    } else if (el === paramFreqpenalty) {
+      const fp = parseFloat(paramFreqpenalty.value);
+      if (!isNaN(fp)) body.frequency_penalty = fp;
     } else if (el === paramMaxtok) {
       const m = parseInt(paramMaxtok.value);
       if (!isNaN(m) && m > 0) body.max_tokens = m;
@@ -1813,10 +1822,16 @@ async function send() {
   const sendingAttachments = pendingAttachments.slice();
   pendingAttachments = [];
   renderAttachments();
-  // 首次 chat (无 session) 完成后需刷新会话列表
-  const needSessionRefresh = !activeSessionId;
   busy = true;
   setDsparkButtonsDisabled(true);  // 消息回复期间禁用 DSpark + think 开关
+  // ★ 首次发送 (无 active session): 先调 ensure 立即创建 session 标签,
+  //   让侧边栏在 prefill/推理开始前就显示, 不必等回答完成
+  if (!activeSessionId) {
+    try {
+      await fetch(sessionsUrl('/api/sessions/ensure'), { method: 'POST' });
+      await loadSessions();
+    } catch (_) {}
+  }
   // 重置全局 prefill 进度条 (上次发送可能残留)
   const _ppReset = document.getElementById('prefill-progress');
   if (_ppReset) {
@@ -2167,7 +2182,6 @@ async function send() {
   iconSend.style.display = '';
   iconStop.style.display = 'none';
   abortController = null;
-  if (needSessionRefresh) loadSessions();
   input.focus();
 }
 

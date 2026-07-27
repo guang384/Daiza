@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use daiza_engine::gguf::parser::GgufFile;
-use daiza_engine::math::{sample_top_k_top_p_into, LcgRng, SamplingBuffers, SamplingParams};
+use daiza_engine::math::{sample_top_k_top_p_into, apply_repetition_penalty, LcgRng, SamplingBuffers, SamplingParams};
 use daiza_engine::model::config::Config;
 use daiza_engine::model::dspark::{
     weights::DrafterWeights,
@@ -964,13 +964,19 @@ impl Engine {
         let cfg = &self.config;
         let weights = self.weights.as_ref().unwrap();
         let n_tap_layers;
-        let start_pos;
+        let mut start_pos;
         // session_take: 从 engine 取出的 session (增量模式), 函数末尾放回
         let mut session_take: Option<crate::session::Session> = None;
+        // ★ DSpark 切换后 state.pos=0 但 history_tokens 非空: 需先 prefill 整个历史恢复 KV/SSM
+        let mut replay_history: Vec<u32> = Vec::new();
         let mut ctx = if self.session.is_some() {
             // ★ 增量模式: 从 session 取状态
             let mut session = self.session.take().unwrap();
             start_pos = session.state.pos;
+            // ★ 检测 DSpark 切换恢复: state.pos=0 但 history_tokens 非空
+            if start_pos == 0 && !session.history_tokens.is_empty() {
+                replay_history = session.history_tokens.clone();
+            }
             n_tap_layers = if session.dspark_tap_layers.is_empty() {
                 let spec = self.spec_ctx.as_ref().unwrap();
                 let layers = spec.cfg().target_layers.clone();
@@ -1030,6 +1036,20 @@ impl Engine {
         let prefill_start = std::time::Instant::now();
         // ★ 累积所有 prefill batch 的 hidden tap (而非只保留最后一个 batch)
         let mut prefill_tap_acc: Vec<f32> = Vec::new();
+        // ★ DSpark 切换恢复: 先 prefill 整个 history_tokens 重建 KV/SSM state
+        //   (不累积 hidden tap, drafter context 从增量 token 开始)
+        if !replay_history.is_empty() {
+            const MAX_BATCH: usize = 64;
+            let np = replay_history.len();
+            let mut off = 0usize;
+            while off < np {
+                let end = (off + MAX_BATCH).min(np);
+                forward_batch(&mut ctx, &replay_history[off..end], off, None)?;
+                off = end;
+            }
+            start_pos = ctx.state.pos;
+            eprintln!("[dspark] replayed {} history tokens, start_pos now {}", np, start_pos);
+        }
         if n_input >= 2 {
             let prefill_ids = &input_ids[..n_input - 1];
             const MAX_BATCH: usize = 64;
@@ -1234,7 +1254,7 @@ impl Engine {
             let mut bonus_token: Option<usize> = None;
             for (i, &dt) in draft_tokens[..n_draft_to_verify].iter().enumerate() {
                 // ctx.logits_buf = 预测 draft[i] 的 target 分布 (前一个 forward 的输出)
-                let target_logits_i = &ctx.logits_buf[..cfg.vocab_size];
+                let target_logits_i = &mut ctx.logits_buf[..cfg.vocab_size];
 
                 // ★ greedy 模式跳过 step_logits 复制 (draft_logits 为空)
                 //   leviathan_check greedy 路径只需 target argmax, 不读 draft_logits
@@ -1251,6 +1271,8 @@ impl Engine {
 
                 if !accepted {
                     // Reject: 用 ctx.logits_buf 采样 bonus (预测 draft[i] 的分布)
+                    // ★ 重复惩罚: 对 target_logits_i 应用 (reject 路径)
+                    apply_repetition_penalty(target_logits_i, &generated_ids, params.repetition_penalty, params.frequency_penalty);
                     bonus_token = Some(if params.temperature <= 0.0 {
                         // greedy: 直接 argmax target (省 sample_bonus 的 p/q softmax)
                         sample_top_k_top_p_into(
@@ -1365,6 +1387,8 @@ impl Engine {
                 bt
             } else {
                 // All-accept: 从 ctx.logits_buf 采样 (最后一个 forward 的输出, 预测 pos_before+k)
+                // ★ 重复惩罚: bonus 路径 (all-accept 时 bonus_token 为 None)
+                apply_repetition_penalty(&mut ctx.logits_buf, &generated_ids, params.repetition_penalty, params.frequency_penalty);
                 sample_top_k_top_p_into(
                     &ctx.logits_buf, params,
                     &mut || rng.next_f32(), &mut sampling_buf,
@@ -1505,6 +1529,10 @@ impl Engine {
             session.sin_buf = std::mem::take(&mut ctx.sin_buf);
             session.dspark_tap_layers = std::mem::take(&mut ctx.hidden_tap_layers);
             session.dspark_tap_history = target_tap_history;
+            // ★ 维护 history_tokens (与非 DSpark 模式一致),
+            //   DSpark 切换到非 DSpark 时可从 history_tokens 恢复上下文
+            session.history_tokens.extend(&input_ids);
+            session.history_tokens.extend(&generated_ids);
             self.session = Some(session);
         }
 

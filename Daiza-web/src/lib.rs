@@ -445,6 +445,9 @@ fn handle_conn(mut stream: TcpStream, shared: std::sync::Arc<Shared>) {
         ("POST", "/api/sessions/new") => {
             handle_sessions_new(&mut stream, &shared, &body);
         }
+        ("POST", "/api/sessions/ensure") => {
+            handle_sessions_ensure(&mut stream, &shared);
+        }
         ("POST", "/api/sessions/switch") => {
             handle_sessions_switch(&mut stream, &shared, &body);
         }
@@ -520,15 +523,7 @@ fn handle_chat(stream: &mut TcpStream, shared: &Shared, body: &str) {
         let sys = shared.system_prompt.lock().unwrap().clone();
         match engine.session_begin(think, Some(&sys)) {
             Ok(()) => {
-                let mut mgr = shared.session_mgr.lock().unwrap();
-                let mut n = mgr.list().len() + 1;
-                let mut id = format!("New Chat {n}");
-                while mgr.exists(&id) {
-                    n += 1;
-                    id = format!("New Chat {n}");
-                }
-                mgr.set_active_id(Some(id));
-                drop(mgr);
+                ensure_active_id(shared);
                 shared.ready.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
@@ -536,6 +531,9 @@ fn handle_chat(stream: &mut TcpStream, shared: &Shared, body: &str) {
                 return;
             }
         }
+    } else {
+        // session 已存在但 active_id 可能缺失 (被其他路径重建但未同步), 补一次
+        ensure_active_id(shared);
     }
 
     // think 模式切换检测: 若 Shared.think_enabled 与 session.think_enabled 不一致,
@@ -856,9 +854,10 @@ fn handle_chat_dspark(
     // ★ 增量 prompt: 只编码新增 token (复用 KV cache + SSM state + drafter context)
     //   首轮 (state.pos==0): system + user + assistant 头
     //   后续轮: 补上一轮 EOS + user + assistant 头
-    //   (与非 DSpark 的 build_increment 逻辑一致, 但用 state.pos 判断首轮)
+    //   ★ 用 history_tokens.is_empty() 判断首轮 (而非 state.pos==0),
+    //     因为 DSpark 切换后 state.pos=0 但 history_tokens 可能非空 (需恢复上下文)
     let mut prompt = String::new();
-    if session.state.pos == 0 {
+    if session.history_tokens.is_empty() {
         // 首轮: 带 system prompt (tools 非空时注入 tools 块)
         if !session.tools.is_empty() {
             prompt.push_str("<|im_start|>system\n");
@@ -1036,15 +1035,27 @@ fn handle_dspark_set(stream: &mut TcpStream, shared: &Shared, body: &str) {
     };
     let prev = shared.use_dspark.swap(enabled, std::sync::atomic::Ordering::Relaxed);
 
-    // 模式切换时重置 session (KV/SSM state 与 DSpark 非复用模式不一致)
+    // 模式切换时重置 session state (KV/SSM state 与 DSpark 非复用模式不一致)
+    // ★ 保留 messages 历史: 用户切换 DSpark 不应丢失对话上下文,
+    //   下一轮 prefill 会从 history_tokens 重建 KV/SSM state
     if prev != enabled {
         let mut engine = shared.engine.lock().unwrap();
-        engine.session_end();
-        // ★ 读取用户当前 think 配置, 而非硬编码 true
-        //   (用户关了 think 后切换 DSpark, session 应保持 think=false)
         let think = shared.think_enabled.load(std::sync::atomic::Ordering::Relaxed);
-        let sys = shared.system_prompt.lock().unwrap().clone();
-        let _ = engine.session_begin(think, Some(&sys));
+        if let Some(session) = engine.session.as_mut() {
+            session.reset_state();
+            session.think_enabled = think;
+        } else {
+            // session 不存在: 创建新 session (无历史可保留)
+            let sys = shared.system_prompt.lock().unwrap().clone();
+            let _ = engine.session_begin(think, Some(&sys));
+            ensure_active_id(shared);
+        }
+        // ★ 重置 spec_ctx cache: DSpark 模式切换时 drafter context 不兼容
+        if let Some(spec) = engine.spec_ctx.as_mut() {
+            spec.target_tap_len = 0;
+            spec.drafter.cached_ctx_len = 0;
+            spec.drafter.cached_kv_len = 0;
+        }
     }
     let fallback = shared.dspark_fallback.load(std::sync::atomic::Ordering::Relaxed);
     let body = format!("{{\"available\":true,\"enabled\":{enabled},\"fallback\":{fallback}}}");
@@ -1071,6 +1082,28 @@ fn handle_sessions_list(stream: &mut TcpStream, shared: &Shared) {
     };
     let body = format!("{{\"active\":{active_json},\"sessions\":{sessions}}}");
     http_response(stream, "200 OK", "application/json; charset=utf-8", &body);
+}
+
+/// POST /api/sessions/ensure → 确保已有 active session (懒创建, 无需 body)
+///
+/// 前端 send() 开始时调用: 若无 active session, 立即创建并返回 active_id,
+/// 让侧边栏在 prefill/推理开始前就显示标签。
+/// 若已有 active session, 直接返回当前 active_id (幂等)。
+fn handle_sessions_ensure(stream: &mut TcpStream, shared: &Shared) {
+    let mut engine = shared.engine.lock().unwrap();
+    if let Err(e) = ensure_session(shared, &mut engine) {
+        http_response(stream, "500 Internal Server Error", "application/json; charset=utf-8",
+            &format!("{{\"error\":\"{e}\"}}"));
+        return;
+    }
+    let mgr = shared.session_mgr.lock().unwrap();
+    let active = mgr.active_id().map(String::from);
+    let active_json = match &active {
+        Some(a) => format!("\"{}\"", json_escape(a)),
+        None => "null".to_string(),
+    };
+    http_response(stream, "200 OK", "application/json; charset=utf-8",
+        &format!("{{\"ok\":true,\"active\":{active_json}}}"));
 }
 
 /// POST /api/sessions/new {"id":"..."} → park 当前 active, 创建新 session
@@ -1232,20 +1265,20 @@ fn handle_sessions_rename(stream: &mut TcpStream, shared: &Shared, body: &str) {
     }
 }
 
-/// GET /api/params → {"temperature":0.7,"top_k":20,"top_p":0.95,"max_tokens":4096,"think":true,"system_prompt":"..."}
+/// GET /api/params → {"temperature":0.7,"top_k":20,"top_p":0.95,"repetition_penalty":1.2,"frequency_penalty":0.0,"max_tokens":4096,"think":true,"system_prompt":"..."}
 fn handle_params_get(stream: &mut TcpStream, shared: &Shared) {
     let p = shared.params.lock().unwrap();
     let m = *shared.max_tokens.lock().unwrap();
     let think = shared.think_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let sys = shared.system_prompt.lock().unwrap();
     let body = format!(
-        "{{\"temperature\":{},\"top_k\":{},\"top_p\":{},\"max_tokens\":{},\"think\":{think},\"system_prompt\":\"{}\"}}",
-        p.temperature, p.top_k, p.top_p, m, json_escape(&sys)
+        "{{\"temperature\":{},\"top_k\":{},\"top_p\":{},\"repetition_penalty\":{},\"frequency_penalty\":{},\"max_tokens\":{},\"think\":{think},\"system_prompt\":\"{}\"}}",
+        p.temperature, p.top_k, p.top_p, p.repetition_penalty, p.frequency_penalty, m, json_escape(&sys)
     );
     http_response(stream, "200 OK", "application/json; charset=utf-8", &body);
 }
 
-/// POST /api/params {"temperature":0.7,"top_k":20,"top_p":0.95,"max_tokens":4096,"think":true}
+/// POST /api/params {"temperature":0.7,"top_k":20,"top_p":0.95,"repetition_penalty":1.1,"max_tokens":4096,"think":true}
 /// 所有字段可选, 只更新提供的字段
 fn handle_params_set(stream: &mut TcpStream, shared: &Shared, body: &str) {
     {
@@ -1258,6 +1291,12 @@ fn handle_params_set(stream: &mut TcpStream, shared: &Shared, body: &str) {
         }
         if let Some(v) = json_extract_raw(body, "top_p").and_then(|s| s.parse::<f32>().ok()) {
             p.top_p = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = json_extract_raw(body, "repetition_penalty").and_then(|s| s.parse::<f32>().ok()) {
+            p.repetition_penalty = v.clamp(1.0, 2.0);
+        }
+        if let Some(v) = json_extract_raw(body, "frequency_penalty").and_then(|s| s.parse::<f32>().ok()) {
+            p.frequency_penalty = v.clamp(0.0, 2.0);
         }
     }
     if let Some(v) = json_extract_raw(body, "max_tokens").and_then(|s| s.parse::<usize>().ok()) {
@@ -1279,6 +1318,9 @@ fn handle_params_set(stream: &mut TcpStream, shared: &Shared, body: &str) {
             engine.session_end();
             let think = shared.think_enabled.load(std::sync::atomic::Ordering::Relaxed);
             let _ = engine.session_begin(think, Some(&new_sys));
+            // ★ 同步 active_id: 若重置前未发消息 (active_id=None), 需创建,
+            //   否则 handle_chat 跳过懒创建导致侧边栏无标签
+            ensure_active_id(shared);
         }
     }
     http_response(stream, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
@@ -1390,6 +1432,24 @@ fn tool_call_to_json(tc: &ToolCall) -> String {
     format!("{{\"name\":\"{}\",\"arguments\":{}}}", json_escape(&tc.name), args)
 }
 
+/// 确保 mgr.active_id 存在: 若为 None, 创建 "New Chat N" 作为 active_id
+///
+/// 用于 session_begin 后同步 active_id:
+/// handle_dspark_set / handle_params_set 等会 session_end + session_begin 重建 session,
+/// 若此时 active_id 为 None (用户尚未发消息就切换了配置), 后续 handle_chat 检测到
+/// session 已存在会跳过懒创建, 导致侧边栏无标签。
+fn ensure_active_id(shared: &Shared) {
+    let mut mgr = shared.session_mgr.lock().unwrap();
+    if mgr.active_id().is_some() { return; }
+    let mut n = mgr.list().len() + 1;
+    let mut id = format!("New Chat {n}");
+    while mgr.exists(&id) {
+        n += 1;
+        id = format!("New Chat {n}");
+    }
+    mgr.set_active_id(Some(id));
+}
+
 /// 确保已有 active session (懒创建)
 ///
 /// tools API 在用户尚未发送任何消息时也会被调用 (用户先配置工具再对话),
@@ -1401,15 +1461,7 @@ fn ensure_session(shared: &Shared, engine: &mut Engine) -> Result<(), String> {
     let sys = shared.system_prompt.lock().unwrap().clone();
     engine.session_begin(think, Some(&sys))
         .map_err(|e| format!("session init: {e}"))?;
-    let mut mgr = shared.session_mgr.lock().unwrap();
-    let mut n = mgr.list().len() + 1;
-    let mut id = format!("New Chat {n}");
-    while mgr.exists(&id) {
-        n += 1;
-        id = format!("New Chat {n}");
-    }
-    mgr.set_active_id(Some(id));
-    drop(mgr);
+    ensure_active_id(shared);
     shared.ready.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }

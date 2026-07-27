@@ -23,6 +23,13 @@ pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    /// 重复惩罚因子 (1.0 = 不惩罚, 1.1-1.3 常用)
+    /// 对最近生成的 token 的 logits 除以此因子, 抑制重复
+    pub repetition_penalty: f32,
+    /// 频率惩罚 (0.0 = 不惩罚, 0.1-1.0 常用)
+    /// 对窗口内出现 n 次的 token, logit -= n * freq_penalty (线性累加)
+    /// 与 repetition_penalty 叠加使用, 对高频重复 token 特别有效
+    pub frequency_penalty: f32,
 }
 
 impl Default for SamplingParams {
@@ -31,6 +38,75 @@ impl Default for SamplingParams {
             temperature: 0.7,
             top_k: 20,
             top_p: 0.95,
+            repetition_penalty: 1.3,
+            frequency_penalty: 0.4,
+        }
+    }
+}
+
+/// 重复惩罚: 对 recent_tokens 中出现过的 token 应用惩罚
+///
+/// - `penalty` (repetition_penalty): 对窗口内每个出现过的 token, logits /= penalty
+///   多次出现会多次除以 penalty (exponential 衰减, 已包含 frequency 意味)
+/// - `freq_penalty` (frequency_penalty): 对窗口内出现 n 次的 token, logit -= n * freq_penalty
+///   线性累加, 与 repetition_penalty 叠加, 提供更精细的高频抑制
+///
+/// window=256 覆盖整首诗的重复跨度 (vs 原 64 仅覆盖段落内)
+pub fn apply_repetition_penalty(
+    logits: &mut [f32],
+    recent_tokens: &[u32],
+    penalty: f32,
+    freq_penalty: f32,
+) {
+    let need_rp = penalty > 1.0;
+    let need_fp = freq_penalty > 0.0;
+    if (!need_rp && !need_fp) || recent_tokens.is_empty() {
+        return;
+    }
+    let window = 256usize;
+    let start = recent_tokens.len().saturating_sub(window);
+    let window_slice = &recent_tokens[start..];
+
+    if need_fp {
+        // ★ 需要统计频次: 用线性扫描统计每个 token 在窗口内的出现次数
+        //   window ≤ 256, vocab=248K, 直接 O(N²) 扫描仅 65K 操作 (~0.05ms)
+        //   比 HashMap 分配快得多, 且无需堆分配
+        //   对每个 token: 先应用 repetition_penalty (除以 penalty^count), 再减 count * freq_penalty
+        for i in 0..window_slice.len() {
+            let tok = window_slice[i];
+            // 跳过本 token 之前已处理过的相同 token (避免重复应用)
+            // 简单去重: 若 window_slice[..i] 已包含 tok, 跳过
+            if window_slice[..i].iter().any(|&t| t == tok) {
+                continue;
+            }
+            // 统计 tok 在整个窗口的出现次数
+            let count = window_slice.iter().filter(|&&t| t == tok).count();
+            let idx = tok as usize;
+            if idx < logits.len() {
+                // repetition: 多次出现 = 多次除以 penalty (exponential)
+                if need_rp {
+                    let factor = penalty.powi(count as i32);
+                    if logits[idx] > 0.0 {
+                        logits[idx] /= factor;
+                    } else {
+                        logits[idx] *= factor;
+                    }
+                }
+                // frequency: logit -= count * freq_penalty (线性)
+                logits[idx] -= (count as f32) * freq_penalty;
+            }
+        }
+    } else {
+        // 仅 repetition_penalty: 原 O(N) 路径, 多次出现多次除以 penalty
+        for &tok in window_slice {
+            let idx = tok as usize;
+            if idx < logits.len() {
+                if logits[idx] > 0.0 {
+                    logits[idx] /= penalty;
+                } else {
+                    logits[idx] *= penalty;
+                }
+            }
         }
     }
 }

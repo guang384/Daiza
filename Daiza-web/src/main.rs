@@ -60,9 +60,9 @@ fn main() {
     let no_open = args.iter().any(|a| a == "--no-open");
 
     let params = if greedy {
-        SamplingParams { temperature: 0.0, top_k: 0, top_p: 1.0 }
+        SamplingParams { temperature: 0.0, top_k: 0, top_p: 1.0, ..Default::default() }
     } else {
-        SamplingParams { temperature: 0.7, top_k: 20, top_p: 0.95 }
+        SamplingParams { temperature: 0.7, top_k: 20, top_p: 0.95, ..Default::default() }
     };
 
     // 与 daiza-cli 一致的热降频默认配置 (用户已设置的环境变量优先)

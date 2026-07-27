@@ -657,6 +657,7 @@ fn run_self_test(mut engine: Engine, max_tokens: usize) -> Result<()> {
         temperature: 0.0,
         top_k: 0,
         top_p: 1.0,
+        ..Default::default()
     };
     let sys = "You are a helpful assistant.";
 
@@ -1087,12 +1088,14 @@ fn main() -> Result<()> {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
+            ..Default::default()
         }
     } else {
         SamplingParams {
             temperature: 0.7,
             top_k: 20,
             top_p: 0.95,
+            ..Default::default()
         }
     };
 
