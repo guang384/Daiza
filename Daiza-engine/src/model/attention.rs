@@ -106,12 +106,11 @@ pub fn attention_forward_into(
     }
     // ★ scale 预烘焙到 Q (一次扫描 attn_q, 消除内层 n_cached×group_size 次 *scale)
     //   dot_product 后直接是 score, 省 1 条 vmulps / iter
+    // ★ AVX2 向量化 (原标量 6144 iter × 16 blocks = 98K mul/token)
     let q_scale = 1.0 / (head_dim as f32).sqrt();
     let total_q = n_q_heads * head_dim;
     debug_assert!(ws.attn_q.len() >= total_q);
-    for v in &mut ws.attn_q[..total_q] {
-        *v *= q_scale;
-    }
+    crate::math::simd_exp::scale_inplace_avx2(&mut ws.attn_q[..total_q], q_scale);
     for h_i in 0..n_kv_heads {
         let hs = h_i * head_dim;
         let he = hs + head_dim;

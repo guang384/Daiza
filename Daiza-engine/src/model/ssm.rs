@@ -477,10 +477,9 @@ pub fn ssm_forward_into(
     }
 
     // 5. q 预缩放: q *= 1/sqrt(head_dim)
+    // ★ AVX2 向量化 (原标量 2048 iter × 48 blocks = 98K mul/token)
     let q_scale = 1.0 / (head_dim as f32).sqrt();
-    for qi in ws.ssm_q.iter_mut() {
-        *qi *= q_scale;
-    }
+    crate::math::simd_exp::scale_inplace_avx2(&mut ws.ssm_q[..qkv_dim], q_scale);
 
     // 6. Alpha / Beta / dt / A (per v_head, [48])
     //    ★ P0-B: alpha/beta 已在步骤 2 与 qkv/gate 一起计算, 这里直接读取

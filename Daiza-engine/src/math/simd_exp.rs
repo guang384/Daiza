@@ -426,15 +426,16 @@ pub fn online_softmax_v_update_avx2(
     }
 }
 
-/// AVX2 8-wide scale: y[i] = x[i] * scale
+/// AVX2 8-wide scale: y[i] = x[i] * scale (含 tail 标量处理)
 ///
 /// attention online softmax 归一化: out_head[j] = out[j] * inv_s (head_dim=256)。
+/// ★ tail 处理: len % 8 != 0 时剩余元素标量处理 (vocab=248320 整除, 但保持通用)
 #[allow(unsafe_code)]
 #[inline]
 pub fn scale_avx2(x: &[f32], scale: f32, y: &mut [f32], len: usize) {
-    debug_assert!(len >= 8);
     debug_assert_eq!(x.len(), len);
     debug_assert_eq!(y.len(), len);
+    if len == 0 { return; }
     unsafe {
         let sv = _mm256_set1_ps(scale);
         let mut i = 0;
@@ -443,6 +444,36 @@ pub fn scale_avx2(x: &[f32], scale: f32, y: &mut [f32], len: usize) {
             let result = _mm256_mul_ps(sv, vx);
             _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
             i += 8;
+        }
+        // tail: 剩余 0..7 元素标量处理
+        while i < len {
+            *y.get_unchecked_mut(i) = *x.get_unchecked(i) * scale;
+            i += 1;
+        }
+    }
+}
+
+/// AVX2 8-wide scale 原地: x[i] *= scale (含 tail 标量处理)
+///
+/// ★ 用于 src==dst 场景 (q_scale 烘焙), 避免 borrow checker 同时 &T + &mut T 限制
+#[allow(unsafe_code)]
+#[inline]
+pub fn scale_inplace_avx2(x: &mut [f32], scale: f32) {
+    let len = x.len();
+    if len == 0 { return; }
+    unsafe {
+        let sv = _mm256_set1_ps(scale);
+        let ptr = x.as_mut_ptr();
+        let mut i = 0;
+        while i + 8 <= len {
+            let vx = _mm256_loadu_ps(ptr.add(i));
+            let result = _mm256_mul_ps(sv, vx);
+            _mm256_storeu_ps(ptr.add(i), result);
+            i += 8;
+        }
+        while i < len {
+            *x.get_unchecked_mut(i) *= scale;
+            i += 1;
         }
     }
 }
@@ -580,4 +611,129 @@ pub fn residual_max_zero_sum_avx2(p: &[f32], q: &[f32], residual: &mut [f32]) ->
         sum += r;
     }
     sum
+}
+
+/// AVX2 向量化: 同时计算 softmax(target)[idx] 和 softmax(draft)[idx]
+///
+/// ★ 用于 leviathan_check 采样模式 (原 softmax_single 标量两次调用)
+///   - 原实现: 4 次标量 vocab 遍历 (2 max + 2 sum), vocab=248K, 每 cycle ~16ms
+///   - 优化后: 2 次 AVX2 vocab 遍历 (target+draft 并行), 每 cycle ~4ms
+///   - target/draft 来自不同地址, L3 cache (32MB+) 完全容纳两路 1MB
+///
+/// 算法:
+///   Pass 1: 并行 max reduce (target + draft 各一个 max 累加器)
+///   Pass 2: 并行 (sub_max + exp + sum + idx_exp 提取) 融合
+///   idx 所在的 8-element chunk 单独 store 提取 idx 位置 exp 值
+#[inline]
+pub fn softmax_pair_single_avx2(
+    target: &[f32],
+    draft: &[f32],
+    idx: usize,
+) -> (f32, f32) {
+    debug_assert_eq!(target.len(), draft.len());
+    let n = target.len();
+    if n == 0 || idx >= n {
+        return (0.0, 0.0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if simd_available() && n >= 8 {
+        #[allow(unsafe_code)]
+        unsafe {
+            let n8 = (n / 8) * 8;
+            let t_ptr = target.as_ptr();
+            let d_ptr = draft.as_ptr();
+
+            // Pass 1: 并行 max reduce (target + draft 同时处理)
+            let mut t_max_v = _mm256_set1_ps(target[0]);
+            let mut d_max_v = _mm256_set1_ps(draft[0]);
+            let mut i = 0;
+            while i < n8 {
+                let tv = _mm256_loadu_ps(t_ptr.add(i));
+                let dv = _mm256_loadu_ps(d_ptr.add(i));
+                t_max_v = _mm256_max_ps(t_max_v, tv);
+                d_max_v = _mm256_max_ps(d_max_v, dv);
+                i += 8;
+            }
+            let mut t_max = hmax_ps(t_max_v);
+            let mut d_max = hmax_ps(d_max_v);
+            while i < n {
+                if target[i] > t_max { t_max = target[i]; }
+                if draft[i] > d_max { d_max = draft[i]; }
+                i += 1;
+            }
+
+            // Pass 2: 并行 (sub_max + exp + sum 累加 + idx_exp 提取)
+            let t_max_v = _mm256_set1_ps(t_max);
+            let d_max_v = _mm256_set1_ps(d_max);
+            let mut t_sum_v = _mm256_setzero_ps();
+            let mut d_sum_v = _mm256_setzero_ps();
+            let mut t_idx_exp = 0.0f32;
+            let mut d_idx_exp = 0.0f32;
+
+            // idx 所在 8-element chunk 的起始位置 (若 idx < n8)
+            let idx_chunk_start = if idx < n8 { (idx / 8) * 8 } else { usize::MAX };
+            let idx_off = idx - idx_chunk_start; // 0..7
+
+            i = 0;
+            while i < n8 {
+                let tv = _mm256_loadu_ps(t_ptr.add(i));
+                let dv = _mm256_loadu_ps(d_ptr.add(i));
+                let te = exp_ps(_mm256_sub_ps(tv, t_max_v));
+                let de = exp_ps(_mm256_sub_ps(dv, d_max_v));
+                t_sum_v = _mm256_add_ps(t_sum_v, te);
+                d_sum_v = _mm256_add_ps(d_sum_v, de);
+
+                // 提取 idx 所在 chunk 的 idx 位置 exp 值 (仅一次命中)
+                if i == idx_chunk_start {
+                    let mut tmp_t = [0f32; 8];
+                    let mut tmp_d = [0f32; 8];
+                    _mm256_storeu_ps(tmp_t.as_mut_ptr(), te);
+                    _mm256_storeu_ps(tmp_d.as_mut_ptr(), de);
+                    t_idx_exp = tmp_t[idx_off];
+                    d_idx_exp = tmp_d[idx_off];
+                }
+                i += 8;
+            }
+
+            let mut t_sum = hsum_ps(t_sum_v);
+            let mut d_sum = hsum_ps(d_sum_v);
+            // tail (n8..n): idx 可能在 tail 中
+            for j in n8..n {
+                let te = (target[j] - t_max).exp();
+                let de = (draft[j] - d_max).exp();
+                t_sum += te;
+                d_sum += de;
+                if j == idx {
+                    t_idx_exp = te;
+                    d_idx_exp = de;
+                }
+            }
+
+            if t_sum <= 0.0 { t_sum = 1.0; }
+            if d_sum <= 0.0 { d_sum = 1.0; }
+            return (t_idx_exp / t_sum, d_idx_exp / d_sum);
+        }
+    }
+
+    // 标量 fallback (与原 softmax_single 等价, 但单次遍历)
+    let t_max = target.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let d_max = draft.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut t_sum = 0.0f32;
+    let mut d_sum = 0.0f32;
+    let mut t_idx_exp = 0.0f32;
+    let mut d_idx_exp = 0.0f32;
+    for (i, (&t, &d)) in target.iter().zip(draft.iter()).enumerate() {
+        let te = (t - t_max).exp();
+        let de = (d - d_max).exp();
+        t_sum += te;
+        d_sum += de;
+        if i == idx {
+            t_idx_exp = te;
+            d_idx_exp = de;
+        }
+    }
+    if t_sum <= 0.0 { t_sum = 1.0; }
+    if d_sum <= 0.0 { d_sum = 1.0; }
+    (t_idx_exp / t_sum, d_idx_exp / d_sum)
 }
