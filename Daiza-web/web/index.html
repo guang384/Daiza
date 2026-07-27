@@ -1098,6 +1098,18 @@ async function switchSession(id) {
     if (r.ok) {
       chat.innerHTML = '';
       activeSessionId = id;
+      // 渲染目标 session 的聊天历史
+      const j = await r.json().catch(() => ({}));
+      if (Array.isArray(j.messages)) {
+        for (const m of j.messages) {
+          const role = m.role === 'user' ? 'user' : 'bot';
+          const bubble = addMsg(role, m.content || '');
+          if (role === 'bot' && m.content) {
+            renderFinalText(m.content, bubble);
+          }
+        }
+        scrollBottom();
+      }
       setStatus('ok', 'Switched to ' + id);
       loadSessions();
     } else {
@@ -1135,6 +1147,31 @@ async function newSession() {
   } catch (e) {
     setStatus('err', 'Create failed');
   }
+}
+
+/// 页面加载时恢复 active session 的聊天历史
+async function loadActiveHistory() {
+  try {
+    const r1 = await fetch(sessionsUrl('/api/sessions'));
+    if (!r1.ok) return;
+    const j1 = await r1.json();
+    if (!j1.active) return;
+    activeSessionId = j1.active;
+    const url = sessionsUrl('/api/sessions/history') + '?id=' + encodeURIComponent(j1.active);
+    const r2 = await fetch(url);
+    if (!r2.ok) return;
+    const j2 = await r2.json();
+    if (!Array.isArray(j2.messages) || j2.messages.length === 0) return;
+    chat.innerHTML = '';
+    for (const m of j2.messages) {
+      const role = m.role === 'user' ? 'user' : 'bot';
+      const bubble = addMsg(role, m.content || '');
+      if (role === 'bot' && m.content) {
+        renderFinalText(m.content, bubble);
+      }
+    }
+    scrollBottom();
+  } catch (e) { /* silent */ }
 }
 
 async function deleteSessionById(id) {
@@ -1237,6 +1274,7 @@ async function renameSession(oldId, newId) {
 sessionNewBtn.addEventListener('click', newSession);
 sessionDelBtn.addEventListener('click', deleteSession);
 loadSessions();
+loadActiveHistory();
 
 // Minimal Markdown rendering (zero deps, DOM API construction to avoid XSS)
 // Supports: fenced code / heading / hr / blockquote / ul / ol / table / paragraph

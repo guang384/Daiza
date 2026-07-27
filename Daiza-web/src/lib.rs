@@ -77,6 +77,8 @@ pub fn run_server_with_listener(
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let upload_dir = std::path::PathBuf::from(SESSIONS_DIR).join("uploads");
     std::fs::create_dir_all(&upload_dir)?;
+    let history_dir = std::path::PathBuf::from(SESSIONS_DIR).join("history");
+    std::fs::create_dir_all(&history_dir)?;
 
     let shared = std::sync::Arc::new(Shared {
         engine: Mutex::new(engine),
@@ -93,6 +95,7 @@ pub fn run_server_with_listener(
         think_enabled: std::sync::atomic::AtomicBool::new(true),
         system_prompt: std::sync::Mutex::new(DEFAULT_SYSTEM_PROMPT.to_string()),
         upload_dir,
+        history_dir,
     });
 
     // 通知调用方: 即将进入 accept 循环 (SessionManager/upload_dir 已就绪)
@@ -405,6 +408,8 @@ struct Shared {
     system_prompt: std::sync::Mutex<String>,
     /// 图片上传保存目录 (POST /api/upload 把 base64 图片保存到此目录)
     upload_dir: std::path::PathBuf,
+    /// 聊天历史保存目录 (每个 session 一个 JSON 文件, 切换/重启时恢复前端显示)
+    history_dir: std::path::PathBuf,
 }
 
 fn handle_conn(mut stream: TcpStream, shared: std::sync::Arc<Shared>) {
@@ -456,6 +461,9 @@ fn handle_conn(mut stream: TcpStream, shared: std::sync::Arc<Shared>) {
         }
         ("POST", "/api/sessions/rename") => {
             handle_sessions_rename(&mut stream, &shared, &body);
+        }
+        ("GET", "/api/sessions/history") => {
+            handle_sessions_history(&mut stream, &shared, &path);
         }
         ("GET", "/api/params") => {
             handle_params_get(&mut stream, &shared);
@@ -677,6 +685,8 @@ fn handle_chat(stream: &mut TcpStream, shared: &Shared, body: &str) {
             use daiza_runtime::tool_call::ToolMessage;
             let think_on = engine.session.as_ref().map(|s| s.think_enabled).unwrap_or(false);
             let cleaned = clean_assistant_text(&full, think_on);
+            // 保留一份给 history_append (cleaned 会在下面 push 时被 move)
+            let cleaned_for_history = cleaned.clone();
             if has_tool_call {
                 // 逐个发出 tool_call 事件
                 for tc in &tool_calls {
@@ -704,6 +714,12 @@ fn handle_chat(stream: &mut TcpStream, shared: &Shared, body: &str) {
                 ),
             );
             eprintln!("[bench] chat done: ttft={ttft_ms}ms, decode({n_tokens}t)={decode_ms}ms (~{ms_per_tok}ms/tok), total={total_ms}ms");
+            // ★ 追加 history (user + assistant), 用于切换会话/重启时恢复前端显示
+            let sid = shared.session_mgr.lock().unwrap().active_id().map(String::from);
+            if let Some(sid) = sid {
+                history_append(&shared.history_dir, &sid, "user", &msg);
+                history_append(&shared.history_dir, &sid, "assistant", &cleaned_for_history);
+            }
         }
         Err(e) => {
             sse_write(
@@ -1062,6 +1078,67 @@ fn handle_dspark_set(stream: &mut TcpStream, shared: &Shared, body: &str) {
     http_response(stream, "200 OK", "application/json; charset=utf-8", &body);
 }
 
+/// history 文件安全 id (与 session_manager 的 safe_id 规则一致)
+fn history_safe_id(id: &str) -> String {
+    id.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+}
+
+/// history 文件路径: {history_dir}/{safe_id}.jsonl
+fn history_path(history_dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+    history_dir.join(format!("{}.jsonl", history_safe_id(id)))
+}
+
+/// 追加一条消息到 history 文件 (JSON Lines 格式, 每行一个对象)
+///
+/// 文件格式 (每行):
+/// `{"role":"user","content":"..."}`
+/// `{"role":"assistant","content":"..."}`
+///
+/// append 写入, 无需读取全量, 进程崩溃不损坏已有内容
+fn history_append(history_dir: &std::path::Path, id: &str, role: &str, content: &str) {
+    let path = history_path(history_dir, id);
+    let line = format!("{{\"role\":\"{}\",\"content\":\"{}\"}}\n", json_escape(role), json_escape(content));
+    // create(true) + append(true): 文件不存在则新建, 存在则追加
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 读取 history 文件, 返回 JSON 数组字符串 `[{"role":"...","content":"..."},...]`
+///
+/// 把 JSON Lines 按行组装成 JSON 数组 (每行已是合法 JSON 对象, 直接 join)
+/// 文件不存在时返回 `"[]"`
+fn history_load_json(history_dir: &std::path::Path, id: &str) -> String {
+    let path = history_path(history_dir, id);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines()
+                .filter(|l| !l.is_empty())
+                .collect();
+            if lines.is_empty() {
+                "[]".to_string()
+            } else {
+                format!("[{}]", lines.join(","))
+            }
+        }
+        Err(_) => "[]".to_string(),
+    }
+}
+
+/// 删除 history 文件 (session delete 时同步删除)
+fn history_delete(history_dir: &std::path::Path, id: &str) {
+    let path = history_path(history_dir, id);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 重命名 history 文件 (session rename 时同步)
+fn history_rename(history_dir: &std::path::Path, old_id: &str, new_id: &str) {
+    let old_path = history_path(history_dir, old_id);
+    let new_path = history_path(history_dir, new_id);
+    let _ = std::fs::rename(&old_path, &new_path);
+}
+
 /// GET /api/sessions → {"active": "id"|null, "sessions": [{"id":"...","active":bool}]}
 fn handle_sessions_list(stream: &mut TcpStream, shared: &Shared) {
     let mgr = shared.session_mgr.lock().unwrap();
@@ -1163,7 +1240,10 @@ fn handle_sessions_switch(stream: &mut TcpStream, shared: &Shared, body: &str) {
     let mut engine = shared.engine.lock().unwrap();
     let mut mgr = shared.session_mgr.lock().unwrap();
     if mgr.active_id() == Some(id.as_str()) {
-        http_response(stream, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        // 已是 active: 直接返回当前 history
+        let msgs = history_load_json(&shared.history_dir, &id);
+        let body = format!("{{\"ok\":true,\"messages\":{msgs}}}");
+        http_response(stream, "200 OK", "application/json; charset=utf-8", &body);
         return;
     }
     if !mgr.exists(&id) {
@@ -1180,7 +1260,10 @@ fn handle_sessions_switch(stream: &mut TcpStream, shared: &Shared, body: &str) {
     match mgr.unpark(&id, &engine.config) {
         Ok(session) => {
             engine.session = Some(session);
-            http_response(stream, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+            // 返回目标 session 的聊天历史
+            let msgs = history_load_json(&shared.history_dir, &id);
+            let body = format!("{{\"ok\":true,\"messages\":{msgs}}}");
+            http_response(stream, "200 OK", "application/json; charset=utf-8", &body);
         }
         Err(e) => {
             http_response(stream, "500 Internal Server Error", "application/json; charset=utf-8",
@@ -1210,6 +1293,8 @@ fn handle_sessions_delete(stream: &mut TcpStream, shared: &Shared, body: &str) {
         engine.session_end();
     }
     mgr.delete(&id);
+    // 同步删除 history 文件
+    history_delete(&shared.history_dir, &id);
     http_response(stream, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
 }
 
@@ -1256,6 +1341,8 @@ fn handle_sessions_rename(stream: &mut TcpStream, shared: &Shared, body: &str) {
     }
     match mgr.rename(&id, &new_id) {
         Ok(()) => {
+            // 同步重命名 history 文件
+            history_rename(&shared.history_dir, &id, &new_id);
             http_response(stream, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
         }
         Err(e) => {
@@ -1263,6 +1350,52 @@ fn handle_sessions_rename(stream: &mut TcpStream, shared: &Shared, body: &str) {
                 &format!("{{\"error\":\"{}\"}}", json_escape(&e.to_string())));
         }
     }
+}
+
+/// 简单 URL decode: 把 %XX (UTF-8 字节) 和 + 还原, 支持中文等多字节字符
+fn url_decode(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '+' => bytes.push(b' '),
+            '%' => {
+                let h1 = chars.next();
+                let h2 = chars.next();
+                if let (Some(h1), Some(h2)) = (h1, h2) {
+                    if let Ok(byte) = u8::from_str_radix(&format!("{h1}{h2}"), 16) {
+                        bytes.push(byte);
+                        continue;
+                    }
+                }
+                // 解析失败: 保留原始 %
+                bytes.push(b'%');
+                if let Some(h1) = h1 { bytes.extend(h1.to_string().as_bytes()); }
+                if let Some(h2) = h2 { bytes.extend(h2.to_string().as_bytes()); }
+            }
+            c => bytes.extend(c.to_string().as_bytes()),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// GET /api/sessions/history?id=xxx → {"ok":true,"messages":[{"role":"...","content":"..."},...]}
+///
+/// 用于重启后恢复 active session 的聊天历史到前端
+fn handle_sessions_history(stream: &mut TcpStream, shared: &Shared, path: &str) {
+    // 从 query string 解析 id 参数: ?id=Chat%20123456
+    let id = path.split("?id=").nth(1)
+        .map(|s| s.split('&').next().unwrap_or(""))
+        .map(|s| url_decode(s))
+        .unwrap_or_default();
+    if id.is_empty() {
+        http_response(stream, "400 Bad Request", "application/json; charset=utf-8",
+            "{\"error\":\"missing id parameter\"}");
+        return;
+    }
+    let msgs = history_load_json(&shared.history_dir, &id);
+    let body = format!("{{\"ok\":true,\"messages\":{msgs}}}");
+    http_response(stream, "200 OK", "application/json; charset=utf-8", &body);
 }
 
 /// GET /api/params → {"temperature":0.7,"top_k":20,"top_p":0.95,"repetition_penalty":1.2,"frequency_penalty":0.0,"max_tokens":4096,"think":true,"system_prompt":"..."}
