@@ -13,7 +13,7 @@ use daiza_engine::math::SamplingParams;
 pub const INDEX_HTML: &str = include_str!("../web/index.html");
 pub const SESSIONS_DIR: &str = "daiza_sessions";
 pub const MAX_INACTIVE_SESSIONS: usize = 10;
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "你是一个乐于助人的助手。请用与用户相同的语言回复。";
 
 /// 服务配置: 由调用方构造 (daiza-web binary 或 daiza-app), 传入已加载的 Engine
 pub struct ServerConfig {
@@ -91,6 +91,7 @@ pub fn run_server_with_listener(
         use_dspark: std::sync::atomic::AtomicBool::new(true),
         dspark_fallback: std::sync::atomic::AtomicBool::new(true),
         think_enabled: std::sync::atomic::AtomicBool::new(true),
+        system_prompt: std::sync::Mutex::new(DEFAULT_SYSTEM_PROMPT.to_string()),
         upload_dir,
     });
 
@@ -399,6 +400,9 @@ struct Shared {
     /// 是否启用思考模式 (/api/params 设置, handle_chat 读取)
     /// 切换后需要重置 session (think_enabled 影响 increment 末尾的 <think>\n)
     think_enabled: std::sync::atomic::AtomicBool,
+    /// 系统提示词 (/api/params 设置, session_begin 时读取)
+    /// 修改后需要重置 session 才能生效 (system_prompt 在 session 创建时固化)
+    system_prompt: std::sync::Mutex<String>,
     /// 图片上传保存目录 (POST /api/upload 把 base64 图片保存到此目录)
     upload_dir: std::path::PathBuf,
 }
@@ -513,7 +517,8 @@ fn handle_chat(stream: &mut TcpStream, shared: &Shared, body: &str) {
     // session 懒创建 (首个请求时执行; 权重已在启动时加载, 此处仅创建 Session, <1s)
     if engine.session.is_none() {
         let think = shared.think_enabled.load(std::sync::atomic::Ordering::Relaxed);
-        match engine.session_begin(think, Some(DEFAULT_SYSTEM_PROMPT)) {
+        let sys = shared.system_prompt.lock().unwrap().clone();
+        match engine.session_begin(think, Some(&sys)) {
             Ok(()) => {
                 let mut mgr = shared.session_mgr.lock().unwrap();
                 let mut n = mgr.list().len() + 1;
@@ -1038,7 +1043,8 @@ fn handle_dspark_set(stream: &mut TcpStream, shared: &Shared, body: &str) {
         // ★ 读取用户当前 think 配置, 而非硬编码 true
         //   (用户关了 think 后切换 DSpark, session 应保持 think=false)
         let think = shared.think_enabled.load(std::sync::atomic::Ordering::Relaxed);
-        let _ = engine.session_begin(think, Some(DEFAULT_SYSTEM_PROMPT));
+        let sys = shared.system_prompt.lock().unwrap().clone();
+        let _ = engine.session_begin(think, Some(&sys));
     }
     let fallback = shared.dspark_fallback.load(std::sync::atomic::Ordering::Relaxed);
     let body = format!("{{\"available\":true,\"enabled\":{enabled},\"fallback\":{fallback}}}");
@@ -1095,9 +1101,10 @@ fn handle_sessions_new(stream: &mut TcpStream, shared: &Shared, body: &str) {
             let _ = mgr.park(&cur_id, &session, &engine.config);
         }
     }
+    let sys = shared.system_prompt.lock().unwrap().clone();
     match engine.session_begin(
         shared.think_enabled.load(std::sync::atomic::Ordering::Relaxed),
-        Some(DEFAULT_SYSTEM_PROMPT),
+        Some(&sys),
     ) {
         Ok(()) => {
             mgr.set_active_id(Some(id));
@@ -1225,14 +1232,15 @@ fn handle_sessions_rename(stream: &mut TcpStream, shared: &Shared, body: &str) {
     }
 }
 
-/// GET /api/params → {"temperature":0.7,"top_k":20,"top_p":0.95,"max_tokens":4096}
+/// GET /api/params → {"temperature":0.7,"top_k":20,"top_p":0.95,"max_tokens":4096,"think":true,"system_prompt":"..."}
 fn handle_params_get(stream: &mut TcpStream, shared: &Shared) {
     let p = shared.params.lock().unwrap();
     let m = *shared.max_tokens.lock().unwrap();
     let think = shared.think_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let sys = shared.system_prompt.lock().unwrap();
     let body = format!(
-        "{{\"temperature\":{},\"top_k\":{},\"top_p\":{},\"max_tokens\":{},\"think\":{think}}}",
-        p.temperature, p.top_k, p.top_p, m
+        "{{\"temperature\":{},\"top_k\":{},\"top_p\":{},\"max_tokens\":{},\"think\":{think},\"system_prompt\":\"{}\"}}",
+        p.temperature, p.top_k, p.top_p, m, json_escape(&sys)
     );
     http_response(stream, "200 OK", "application/json; charset=utf-8", &body);
 }
@@ -1259,6 +1267,19 @@ fn handle_params_set(stream: &mut TcpStream, shared: &Shared, body: &str) {
     }
     if let Some(v) = json_extract_raw(body, "think").and_then(|s| s.parse::<bool>().ok()) {
         shared.think_enabled.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    // system_prompt: 修改后重置 session (system_prompt 在 session 创建时固化, 需重建才能生效)
+    if let Some(new_sys) = json_extract_field(body, "system_prompt") {
+        let mut sys_lock = shared.system_prompt.lock().unwrap();
+        if *sys_lock != new_sys {
+            *sys_lock = new_sys.clone();
+            drop(sys_lock);
+            // 重置 session (与 think 切换一致的行为): 用新 system_prompt 重建
+            let mut engine = shared.engine.lock().unwrap();
+            engine.session_end();
+            let think = shared.think_enabled.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = engine.session_begin(think, Some(&new_sys));
+        }
     }
     http_response(stream, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
 }
@@ -1377,7 +1398,8 @@ fn tool_call_to_json(tc: &ToolCall) -> String {
 fn ensure_session(shared: &Shared, engine: &mut Engine) -> Result<(), String> {
     if engine.session.is_some() { return Ok(()); }
     let think = shared.think_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    engine.session_begin(think, Some(DEFAULT_SYSTEM_PROMPT))
+    let sys = shared.system_prompt.lock().unwrap().clone();
+    engine.session_begin(think, Some(&sys))
         .map_err(|e| format!("session init: {e}"))?;
     let mut mgr = shared.session_mgr.lock().unwrap();
     let mut n = mgr.list().len() + 1;

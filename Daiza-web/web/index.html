@@ -198,6 +198,13 @@
     border-radius: 6px; outline: none; transition: border-color .15s;
   }
   #settings-panel input[type="number"]:focus { border-color: var(--accent1); }
+  #settings-panel textarea {
+    width: 100%; min-height: 60px; max-height: 160px; padding: 8px 10px; font: inherit; font-size: 12.5px;
+    color: var(--text); background: rgba(15,23,42,.04); border: 1px solid var(--border);
+    border-radius: 6px; outline: none; transition: border-color .15s; resize: vertical;
+    line-height: 1.4;
+  }
+  #settings-panel textarea:focus { border-color: var(--accent1); }
   #composer-toolbar .switch-row {
     display: inline-flex; align-items: center; justify-content: center;
     width: 30px; height: 30px; padding: 0;
@@ -583,6 +590,22 @@
     box-shadow: 0 4px 16px rgba(0,224,198,.4);
   }
   .bubble.thinking { color: var(--dim); font-style: italic; }
+  /* 三点跳动动画 (替代文字点点, 更现代简洁) */
+  .thinking-dots {
+    display: inline-flex; gap: 4px; margin-left: 6px;
+    vertical-align: middle; height: 1em; align-items: center;
+  }
+  .thinking-dots i {
+    display: block; width: 5px; height: 5px; border-radius: 50%;
+    background: var(--dim);
+    animation: bounce-dot 1.2s ease-in-out infinite;
+  }
+  .thinking-dots i:nth-child(2) { animation-delay: .2s; }
+  .thinking-dots i:nth-child(3) { animation-delay: .4s; }
+  @keyframes bounce-dot {
+    0%, 60%, 100% { transform: translateY(0); opacity: .4; }
+    30% { transform: translateY(-4px); opacity: 1; }
+  }
   .bubble .cursor {
     display: inline-block; width: 8px; height: 1.1em; margin-left: 2px;
     vertical-align: text-bottom; border-radius: 2px;
@@ -779,6 +802,7 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
             <span>Greedy</span>
           </button>
+          <label>system_prompt<textarea id="param-sysprompt" placeholder="System prompt (修改后重置当前会话)" rows="3"></textarea></label>
         </div>
         <div class="footer-row">
           <button id="settings-toggle" title="Settings">
@@ -1523,6 +1547,7 @@ const paramTopp = document.getElementById('param-topp');
 const paramMaxtok = document.getElementById('param-maxtok');
 const paramThink = document.getElementById('param-think');
 const paramGreedy = document.getElementById('param-greedy');
+const paramSysprompt = document.getElementById('param-sysprompt');
 // 缓存进入 greedy 前的参数, 取消 greedy 时恢复
 let greedySaved = null;
 // 防止 loadParams 回填触发 change 事件循环
@@ -1545,6 +1570,7 @@ async function loadParams() {
     paramTopp.value = j.top_p ?? '';
     paramMaxtok.value = j.max_tokens ?? '';
     paramThink.checked = !!j.think;
+    paramSysprompt.value = j.system_prompt ?? '';
     // Greedy 状态: temperature=0 视为 greedy 模式
     const isGreedy = parseFloat(j.temperature) === 0;
     paramGreedy.classList.toggle('active', isGreedy);
@@ -1599,6 +1625,12 @@ async function postParams(body) {
 paramThink.addEventListener('change', () => {
   if (busy) return;  // 消息回复期间不允许切换 think
   postParams({ think: paramThink.checked });
+});
+
+// system_prompt: change 事件 (失焦时触发, 避免输入过程中频繁重置 session)
+paramSysprompt.addEventListener('change', () => {
+  if (busy) return;  // 消息回复期间不允许修改 system_prompt
+  postParams({ system_prompt: paramSysprompt.value });
 });
 
 paramGreedy.addEventListener('click', async () => {
@@ -1815,12 +1847,13 @@ async function send() {
 
   const bubble = addMsg('bot', '');
   bubble.classList.add('thinking');
-  bubble.textContent = 'Thinking';
-  let dots = 0;
-  const thinkTimer = setInterval(() => {
-    dots = (dots + 1) % 4;
-    if (bubble.classList.contains('thinking')) bubble.textContent = 'Thinking' + '.'.repeat(dots);
-  }, 400);
+  // 三点跳动动效 (CSS 动画, 替代原 setInterval 文字点点)
+  const dotsEl = document.createElement('span');
+  dotsEl.className = 'thinking-dots';
+  dotsEl.innerHTML = '<i></i><i></i><i></i>';
+  bubble.appendChild(dotsEl);
+  // thinkTimer 保留为 null (clearInterval(null) 安全, 各清理点无需修改)
+  const thinkTimer = null;
 
   let first = true;
   let textSpan = null;
@@ -1839,14 +1872,13 @@ async function send() {
   // 推理指标 (done 事件携带)
   let ttftMs = null, msPerTok = null, nTok = 0;
   // 进度条: 仅使用全局 #prefill-progress (composer 上方), 不在 bubble 内创建局部进度条
-  // 首次 progress 事件时清理 thinking 状态
+  // ★ prefill/vision 阶段保留 thinking 指示 (状态词 + 跳动点), 让用户知道仍在工作
+  //   thinking 状态由首个 delta/draft 事件清除 (真正开始输出文本时)
   let progressStarted = false;
   const ensureProgressUi = () => {
     if (progressStarted) return;
     progressStarted = true;
-    clearInterval(thinkTimer);
-    bubble.classList.remove('thinking');
-    bubble.textContent = '';
+    // 不清除 thinking 状态, 保留 "Thinking..." + 跳动点显示
   };
   const onEvent = (kind, payload) => {
     if (kind === 'progress') {

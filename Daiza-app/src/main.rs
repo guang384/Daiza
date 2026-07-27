@@ -354,7 +354,47 @@ fn start_backend(
     Ok(())
 }
 
+/// 安装 panic hook: 将 panic 信息 + backtrace 写入 exe 同目录的 panic.log
+///
+/// ★ panic = "abort" 下, panic 直接终止进程 (Tauri 窗口闪退, 无任何输出)。
+///   此 hook 在 abort 前将 panic 详情写入文件, 便于事后定位崩溃根因。
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg = payload.downcast_ref::<&str>().copied()
+            .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<non-string panic payload>");
+        let location = info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let log = format!(
+            "[daiza-app panic]\nTime: epoch={now}s\nMessage: {msg}\nLocation: {location}\nThread: {:?}\n\nBacktrace:\n{bt}\n",
+            std::thread::current().name().unwrap_or("<unnamed>"),
+        );
+        // 写入 exe 同目录下的 panic.log (追加模式, 保留多次崩溃记录)
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("panic.log")))
+            .unwrap_or_else(|| std::path::PathBuf::from("panic.log"));
+        let _ = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(&log_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, log.as_bytes()));
+        // 也写到 stderr (debug 模式下控制台可见)
+        eprintln!("{log}");
+        // 调用之前的 hook (保留默认行为)
+        prev(info);
+    }));
+}
+
 fn main() {
+    install_panic_hook();
     tauri::Builder::default()
         .manage(Backend {
             running: AtomicBool::new(false),
