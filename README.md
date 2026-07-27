@@ -23,6 +23,24 @@
 - **多线程并行**:持久线程池 (park/unpark 零分配),14 线程 GEMM 并行
 - **Qwen3-VL 多模态**:CLIP ViT (27 层) + qwen3vl_merger 投影器,支持图像输入,text-only decode 零退化
 
+## 🖼️ 界面预览
+
+![Daiza 主界面](docs/screenshots/ScreenShot_2026-07-27_231037_345.png)
+
+![对话演示](docs/screenshots/ScreenShot_2026-07-27_231235_359.png)
+
+### 流式对话演示
+
+![流式对话](docs/screenshots/chating.gif)
+
+### 🎵 AI 生成歌曲演示
+
+上面 GIF 中模型即兴生成的歌词,通过 AI 音乐工具谱曲演唱成歌:
+
+<audio controls src="docs/echoes_of_us.mp3">
+  你的浏览器不支持 audio 元素,可直接下载 <a href="docs/echoes_of_us.mp3">echoes_of_us.mp3</a>
+</audio>
+
 ## 📦 目录结构
 
 ```
@@ -225,6 +243,8 @@ let params = SamplingParams {
     temperature: 0.7,
     top_k: 20,
     top_p: 0.95,
+    repetition_penalty: 1.3,
+    frequency_penalty: 0.4,
 };
 let output = engine.generate_with_params(
     "你好",
