@@ -1083,7 +1083,7 @@ pub fn forward_batch_with_vision(
             block_count = cfg.block_count,
         );
         eprintln!(
-            "  emb={emb_ms:.2}ms cos_sin={cos_ms:.2}ms final={final_ms:.2}ms",
+            "  emb={emb_ms:.6}ms cos_sin={cos_ms:.6}ms final={final_ms:.6}ms",
             emb_ms = p_emb.as_secs_f64() * 1000.0,
             cos_ms = p_cos_sin.as_secs_f64() * 1000.0,
             final_ms = p_final.as_secs_f64() * 1000.0,

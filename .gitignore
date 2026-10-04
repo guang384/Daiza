@@ -16,6 +16,7 @@ __pycache__/
 
 # ===== 调试输出与临时文件 =====
 *.log
+.temp/
 Daiza-engine/test_*.txt
 Daiza-engine/inspect_output.txt
 Daiza-engine/gguf_inspect_output.txt

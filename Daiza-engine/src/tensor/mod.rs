@@ -12,6 +12,7 @@
 //! Q1_0 的反量化是这个引擎的核心创新点。
 
 pub mod dtype;
+pub mod gemm;
 pub mod iq1m;
 pub mod quant;
 pub mod tensor;

@@ -461,6 +461,17 @@ impl Q1_0Matrix {
             return;
         }
 
+        // ★ Prefill 块 GEMM 化: 大矩阵 (rows >= 4096) + 大 batch (>= 64) 时走块 GEMM
+        // 收益来源: batch kernel 的 LUT 每 token 每组重复 + 行优先 x 跨 stride 访存灾难
+        // 阈值: 小矩阵 (alpha/beta 48 rows, k/v 1024 rows) 权重驻缓存, batch kernel
+        //   已接近带宽上限, GEMM 的 FMA 优势小于 dispatch 开销 (prep+barrier);
+        //   小 batch 时计算量不足以摊薄 prep 成本
+        #[cfg(target_arch = "x86_64")]
+        if n_batch >= 64 && n >= 4096 && crate::tensor::quant::avx2_q1_0_available() {
+            crate::tensor::gemm::gemm_q1_0_batch(&self.bytes, n, n_cols, x, n_batch, y);
+            return;
+        }
+
         // ★ Q8_PATH: 模拟 llama.cpp 的 F32→Q8_0 量化误差, 使 target tap 与 drafter 训练分布一致
         // Q8_0 是 per-32-element block, n_cols=5120 是 32 的倍数, 可直接对整个 x 量化
         let x_q8 = maybe_quantize_x_q8(x);
