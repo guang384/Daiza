@@ -96,6 +96,64 @@ pub fn get_thread_pool() -> Option<&'static ThreadPool> {
     GLOBAL_POOL.get()
 }
 
+/// 当前活跃 worker 数 (不含 main; pool 未初始化时 0)
+pub fn active_workers() -> usize {
+    GLOBAL_POOL
+        .get()
+        .map(|p| p.shared.n_active_workers.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// 动态设置活跃 worker 数 (运行时切换热降频策略; pool 未初始化时 no-op)。
+/// 用途: prefill 短爆发全核利用 → 结束后恢复 decode 长跑的省核策略。
+pub fn set_active_workers(n: usize) {
+    if let Some(p) = GLOBAL_POOL.get() {
+        p.set_active_workers(n);
+    }
+}
+
+/// ★ Prefill 短爆发全核 guard: RAII 提升活跃 worker 数, Drop 时恢复原值
+/// (错误路径 `?` 提前返回也能恢复)。
+///
+/// 动机 (225H 实测, 交错基准): decode 长跑限制 9 worker 是热降频最优策略,
+/// 但 prefill 是秒级一次性爆发 —— 9 worker 让 FMA-bound 的块 GEMM 白白
+/// 空置 3-4 核 (gate/up 交错实测 -7~-9%); prefill 结束立即恢复, decode
+/// 的热稳定策略不受影响。
+///
+/// 提升目标默认全核 (n_workers); DAIZA_PREFILL_WORKERS 可覆盖 (如 =9 禁用)。
+pub struct PrefillWorkers {
+    saved: usize,
+}
+
+static PREFILL_BOOST_TARGET: OnceLock<Option<usize>> = OnceLock::new();
+
+impl PrefillWorkers {
+    /// `n_tokens >= min_tokens` 时提升, 否则返回 None (零开销)
+    pub fn boost_if_large(min_tokens: usize) -> Option<Self> {
+        let pool = GLOBAL_POOL.get()?;
+        let saved = pool.shared.n_active_workers.load(Ordering::Relaxed);
+        let target = PREFILL_BOOST_TARGET
+            .get_or_init(|| {
+                std::env::var("DAIZA_PREFILL_WORKERS")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
+            .unwrap_or(pool.n_workers)
+            .min(pool.n_workers);
+        if min_tokens < 32 || target <= saved {
+            return None; // 小批量不值得 unpark 开销 / 已是目标态
+        }
+        pool.set_active_workers(target);
+        Some(PrefillWorkers { saved })
+    }
+}
+
+impl Drop for PrefillWorkers {
+    fn drop(&mut self) {
+        set_active_workers(self.saved);
+    }
+}
+
 // ===========================================================================
 // P0-C: park/unpark 零分配线程池
 // ===========================================================================

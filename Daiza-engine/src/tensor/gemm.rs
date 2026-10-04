@@ -42,14 +42,16 @@
 //! - `t0` tile (4 token): 寄存器上限 (8 acc)
 //! - `g_block` (8 group): x 片段 4 token × 8 group × 512B = 16KB 驻 L1,
 //!   r_block 内全部 pair 共享命中
-//! - `t_sub` (token 子块, 仅 x 总量 > 4MB 时分片): x 切片与 scratch 同驻 L2,
-//!   跨 r_block 复用 —— 窄列 (gate/up, x ≈ 2.6MB) 本就 L3 常驻, 分片纯亏
-//!   (prep 重做 + 每 barrier 等待最慢 worker); 宽列 (down_proj, x ≈ 8.7MB)
-//!   不分片时每 r_block 重读全量 x 走 L3 (实测 2.3× FMA floor)
+//! - `t_sub` (token 子块, 仅宽列 x 总量 > 4MB 时分片, 取 32): 实测主导项是
+//!   每 scatter 的 straggler 尾巴 + prep 重做, 而非 x 走 L3 的带宽 ——
+//!   t_sub 8/16/32 单调变优; 窄列 (x ≈ 2.6MB) 不分片直达
+//! - `steal_chunk` 128 行: 512 行在 ~10 执行者下零偷取弹性, 慢核持块期间
+//!   全场 barrier 等待; 细 chunk 让快核偷走余块, 尾巴缩到 1/4
+//!   (交错基准实测 down_proj 再 -17%)
 //!
-//! 实测 (225H, 14 worker bench): gate/up 0.33 ms/token (batch 2.4×),
-//! down_proj 0.55-0.61 ms/token; CLI 端到端 (9 worker, 142t) prefill
-//! 26.1s → 20.5s (1.27×), greedy 逐字节一致。
+//! 实测 (225H, 交错基准 9/12/13 worker 轮转): gate/up 479→436 ms/12 矩阵,
+//! down_proj 543→543 (chunk 128 + t32 后不再随 worker 数退化);
+//! CLI 端到端 (142t) 见提交信息; greedy 逐字节一致, max_err 1-2e-6。
 //!
 //! 数值与 `dot_q1_0_row_avx2` (batch/decode 参照) 仅浮点结合顺序不同,
 //! bench_prefill 校验 max_err, 端到端 greedy 逐字节比对。
@@ -76,9 +78,10 @@ const SCRATCH_TARGET_BYTES: usize = 700 * 1024;
 const R_BLOCK_MAX: usize = 32;
 
 /// t_sub 分片预算与阈值 (完整 rationale 见文件头 "四层 blocking"):
-/// - 切片 + scratch ≤ ~1.8MB (P L2 2MB 留出 streams 余量)
-/// - 仅 x 总量 > 4MB 才分片, 否则单块直达 (省 prep 重做 + barrier 等待)
-const L2_TOKEN_BUDGET: usize = 1800 * 1024;
+/// 实测 (交错基准) 主导项是 scatter straggler 尾巴 + prep 重做 ——
+/// t_sub 8→16→32 单调变优; 取 32 (切片 2.2MB, 溢出部分走 L3 可接受)。
+/// 仅宽列 (x 总量 > 4MB) 分片, 窄列单块直达。
+const L2_TOKEN_BUDGET: usize = 2856 * 1024;
 const T_SUB_MAX: usize = 32;
 const T_SUB_X_THRESHOLD: usize = 4 * 1024 * 1024;
 
@@ -376,7 +379,10 @@ pub fn gemm_q1_0_batch(
         let x_addr = x.as_ptr() as usize;
         let y_addr = y.as_mut_ptr() as usize;
         let scratch_need = r_block * groups * Q1_0_GROUP_SIZE;
-        let steal_chunk = 512usize;
+        // ★ 细 chunk: 512 行在 ~10 执行者下 ≈ 每人一块、零偷取弹性, 慢核 (E/LP-E)
+        //   持块期间全场 barrier 等待 (straggler 尾巴 ~1-2ms/scatter);
+        //   128 行让快核偷走余块, 尾巴缩到 1/4
+        let steal_chunk = 128usize;
 
         // 每个 t_sub 一次 scatter + barrier: 保证全部 worker 处于同一 token 子块,
         // x 切片在 E-core 簇 L2 内只读共享 (4 worker 只算一份)

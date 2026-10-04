@@ -438,6 +438,9 @@ pub fn forward_batch_with_vision(
     } else {
         n_input
     };
+    // ★ Prefill 短爆发全核: 批量前向临时提升活跃 worker (RAII, 含错误路径),
+    //   结束恢复 decode 长跑的省核策略; 小批量 (<32) 零开销跳过
+    let _prefill_workers = crate::model::workspace::PrefillWorkers::boost_if_large(n_batch);
     ctx.h_buf.resize(n_batch * hidden, 0.0);
     if let Some(vi) = vision_inject.as_ref() {
         let mut out_idx = 0usize;

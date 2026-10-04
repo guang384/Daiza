@@ -89,6 +89,36 @@ fn bench(n_tokens: usize, iters: usize, mats: &[Q1_0Matrix]) {
         n_tokens, path, med, med / N_MATRICES as f64 / n_tokens as f64, max_err, total_mb);
 }
 
+/// 交错轮转 worker 数配置 (热漂移公平对比): 同进程内 9/12/13 轮流跑,
+/// 单进程单配置的跨 run 对比在本机热噪声 (±20%) 下不可信。
+fn bench_workers(mats: &[Q1_0Matrix], saved_active: usize) {
+    let rows = mats[0].rows;
+    let cols = mats[0].cols;
+    let n_tokens = 128usize;
+    let x = vec![0.017f32; n_tokens * cols];
+    let mut y = vec![0.0f32; n_tokens * rows];
+    let configs = [9usize, 12, 13];
+    const ROUNDS: usize = 3;
+    let mut times = [[0f64; 3]; ROUNDS];
+    for r in 0..ROUNDS {
+        for (ci, &n) in configs.iter().enumerate() {
+            workspace::set_active_workers(n);
+            let t0 = Instant::now();
+            for m in mats {
+                m.matvec_batch_into_slice(&x, n_tokens, &mut y);
+            }
+            times[r][ci] = t0.elapsed().as_secs_f64() * 1000.0;
+        }
+    }
+    workspace::set_active_workers(saved_active);
+    for (ci, &n) in configs.iter().enumerate() {
+        let mut med: Vec<f64> = (0..ROUNDS).map(|r| times[r][ci]).collect();
+        med.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("workers={:>2} [{}x{}] median {:>8.2} ms/iter (128t)",
+            n, rows, cols, med[ROUNDS / 2]);
+    }
+}
+
 fn main() {
     workspace::init_thread_pool(N_THREADS);
     // 形状 1: MLP gate/up (17408×5120, r_block=32)
@@ -99,6 +129,14 @@ fn main() {
     let mats_down: Vec<Q1_0Matrix> = (0..N_MATRICES)
         .map(|_| make_random_q10(5120, 17408))
         .collect();
+    // ★ 交错 worker 轮转模式 (DAIZA_BENCH_WORKERS=1): 单进程内公平对比 9/12/13
+    if std::env::var("DAIZA_BENCH_WORKERS").is_ok() {
+        let saved = workspace::active_workers();
+        println!("=== worker-count sweep (interleaved, {} matrices) ===", N_MATRICES);
+        bench_workers(&mats, saved);
+        bench_workers(&mats_down, saved);
+        return;
+    }
     // warmup page-in (两种形状)
     for mats in [&mats, &mats_down] {
         let cols = mats[0].cols;
