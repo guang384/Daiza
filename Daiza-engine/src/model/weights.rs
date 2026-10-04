@@ -648,6 +648,141 @@ impl Q1_0Matrix {
         });
     }
 
+    /// ★ verify4 dispatch: 推测解码 batch-verify 专用 (k=4 硬编码)
+    ///
+    /// `x4`: [4 * cols] 行优先 (token t 在 x4[t*cols..])
+    /// `y`:  [4 * rows] 行优先 (y[t*rows + i] = dot(W_row_i, x4[t]))
+    ///
+    /// 与 `matvec_batch_into_slice(n_batch=4)` 的区别:
+    /// - 使用 `dot_q1_0_row_verify4_avx2` (零 spill, ~45c/group vs 现状 ~169c)
+    /// - 权重 DRAM 流 1 次, 4 token 的 logits 一次产出
+    /// - 单次 scatter_wait_stealing barrier (与 decode 路径一致)
+    #[allow(unsafe_code)]
+    pub fn matvec_verify4_into_slice(&self, x4: &[f32], y: &mut [f32]) {
+        let n_cols = self.cols;
+        let n = self.rows;
+        debug_assert_eq!(x4.len(), 4 * n_cols);
+        debug_assert_eq!(y.len(), 4 * n);
+
+        #[cfg(target_arch = "x86_64")]
+        if !avx2_q1_0_available() {
+            // AVX2 不可用: 回退 batch 通用路径 (正确但慢, 仅老 CPU 触发)
+            self.matvec_batch_into_slice(x4, 4, y);
+            return;
+        }
+
+        if let Some(pool) = crate::model::workspace::get_thread_pool() {
+            let bytes_addr = self.bytes.as_ptr() as usize;
+            let bytes_len = self.bytes.len();
+            let x_addr = x4.as_ptr() as usize;
+            let y_addr = y.as_mut_ptr() as usize;
+            let steal_chunk = 256;
+            pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
+                let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
+                let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, 4 * n_cols) };
+                let mut tmp = [0.0f32; 4];
+                for i in start..end {
+                    unsafe {
+                        crate::tensor::quant::dot_q1_0_row_verify4_avx2(bytes, i, n_cols, x, &mut tmp);
+                        *((y_addr as *mut f32).add(i)) = tmp[0];
+                        *((y_addr as *mut f32).add(n + i)) = tmp[1];
+                        *((y_addr as *mut f32).add(2 * n + i)) = tmp[2];
+                        *((y_addr as *mut f32).add(3 * n + i)) = tmp[3];
+                    }
+                }
+            });
+            return;
+        }
+
+        // 无线程池回退: 串行 verify4
+        let mut tmp = [0.0f32; 4];
+        for i in 0..n {
+            unsafe {
+                crate::tensor::quant::dot_q1_0_row_verify4_avx2(&self.bytes, i, n_cols, x4, &mut tmp);
+            }
+            y[i] = tmp[0];
+            y[n + i] = tmp[1];
+            y[2 * n + i] = tmp[2];
+            y[3 * n + i] = tmp[3];
+        }
+    }
+
+    /// ★ verify4t dispatch: 交错布局版 verify4 (x 预交错, 64 x loads 全 L1 命中)
+    ///
+    /// `x4`: [4 * cols] 行优先 (输入, 任意布局)
+    /// `y`:  [4 * rows] 行优先输出
+    ///
+    /// 内部先把 x4 交错到 workspace 缓冲 (每次调用 ~10μs), 再 scatter kernel。
+    /// 交错缓冲跨调用复用 (thread_local, 避免每层 80KB 堆分配)。
+    #[allow(unsafe_code)]
+    pub fn matvec_verify4t_into_slice(&self, x4: &[f32], y: &mut [f32]) {
+        let n_cols = self.cols;
+        let n = self.rows;
+        debug_assert_eq!(x4.len(), 4 * n_cols);
+        debug_assert_eq!(y.len(), 4 * n);
+
+        #[cfg(target_arch = "x86_64")]
+        if !avx2_q1_0_available() {
+            self.matvec_batch_into_slice(x4, 4, y);
+            return;
+        }
+
+        // x 交错缓冲: thread_local 复用 (每 worker 独立, scatter 内部按行不跨 worker)
+        use std::cell::RefCell;
+        thread_local! {
+            static X_INT: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+        }
+        let interleaved = X_INT.with(|buf| {
+            let mut b = buf.borrow_mut();
+            if b.len() < 4 * n_cols {
+                b.resize(4 * n_cols, 0.0);
+            }
+            crate::tensor::quant::interleave_x4_verify(x4, n_cols, &mut b);
+            // 返回裸指针避免 RefCell 跨 await/作用域借用问题; scatter_wait 阻塞至完成,
+            // 期间本线程不会再 borrow 此 thread_local
+            b.as_ptr() as usize
+        });
+
+        if let Some(pool) = crate::model::workspace::get_thread_pool() {
+            let bytes_addr = self.bytes.as_ptr() as usize;
+            let bytes_len = self.bytes.len();
+            let y_addr = y.as_mut_ptr() as usize;
+            let steal_chunk = 256;
+            pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
+                let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
+                let x_int = unsafe { std::slice::from_raw_parts(interleaved as *const f32, 4 * n_cols) };
+                let mut tmp = [0.0f32; 4];
+                for i in start..end {
+                    unsafe {
+                        crate::tensor::quant::dot_q1_0_row_verify4t_avx2(bytes, i, n_cols, x_int, &mut tmp);
+                        *((y_addr as *mut f32).add(i)) = tmp[0];
+                        *((y_addr as *mut f32).add(n + i)) = tmp[1];
+                        *((y_addr as *mut f32).add(2 * n + i)) = tmp[2];
+                        *((y_addr as *mut f32).add(3 * n + i)) = tmp[3];
+                    }
+                }
+            });
+            return;
+        }
+
+        // 无线程池回退: 串行 verify4t
+        let x_int = {
+            let mut buf = vec![0.0f32; 4 * n_cols];
+            crate::tensor::quant::interleave_x4_verify(x4, n_cols, &mut buf);
+            buf
+        };
+        let mut tmp = [0.0f32; 4];
+        for i in 0..n {
+            unsafe {
+                crate::tensor::quant::dot_q1_0_row_verify4t_avx2(&self.bytes, i, n_cols, &x_int, &mut tmp);
+            }
+            y[i] = tmp[0];
+            y[n + i] = tmp[1];
+            y[2 * n + i] = tmp[2];
+            y[3 * n + i] = tmp[3];
+        }
+    }
+
     /// ★ P0-B: 多矩阵合并 matvec — 多个共享同一输入 x 的矩阵在单次线程池 barrier 内完成
     ///
     /// **动机**: 原 attention Q/K/V、MLP gate/up、SSM qkv/gate 各自独立调用 matvec_into_slice,

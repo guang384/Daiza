@@ -225,6 +225,12 @@ const SIGN_LUT: [SignLutEntry; 256] = {
     lut
 };
 
+/// 返回 SIGN_LUT[byte] 的 8-lane ±1.0 向量 (供 gemm.rs 的块反量化复用)
+#[inline]
+pub fn sign_lut_entry(byte: u8) -> &'static [f32; 8] {
+    &SIGN_LUT[byte as usize].0
+}
+
 /// 一次性 runtime AVX2+FMA+F16C feature 检测 (P2-1)
 ///
 /// 供 `weights.rs` 在循环外调用一次, 避免每行 `dot_q1_0_row` 内部的
@@ -1120,6 +1126,210 @@ pub unsafe fn dot_q1_0_row_batch4_avx2(
     *y.get_unchecked_mut(1) = hsum_ps(row_acc1);
     *y.get_unchecked_mut(2) = hsum_ps(row_acc2);
     *y.get_unchecked_mut(3) = hsum_ps(row_acc3);
+}
+
+/// ★ verify4 kernel: 推测解码 batch-verify 专用 (1 权重行 × 4 token)
+///
+/// 与 `dot_q1_0_row_batch4_avx2` 的差异 (性能修复):
+///
+/// | | batch4_avx2 (现状) | verify4 (本内核) |
+/// |---|---|---|
+/// | 长寿命 ymm | 8 group_acc + 4 row_acc = 12 | 4 group_acc + 4 row_acc = 8 |
+/// | x 临时 | 8 (x0a..x1d 同时活跃) | 2-4 (xa..xd FMA 后即死, 编译器复用) |
+/// | 寄存器总量 | ~20 ymm → 必然 spill | ~13 ymm → 零 spill |
+/// | 实测 | ~169 cycles/group | 目标 ~45c/group |
+///
+/// 每 group (128 权重 = 16 sign bytes):
+/// - 16 LUT loads (4 token 共享, 每 byte 1 次)
+/// - 64 x loads (每 token 每 byte 1 次 32B)
+/// - 64 FMA (FMA 端口下限 64/2 = 32 cycles)
+/// - 4 scale FMA (group 末)
+///
+/// 依赖链: 每 token 单 group_acc 链 (16 FMA × ~4c = 64c 延迟),
+/// 4 条独立链交错发射填满 2 FMA/cycle, 延迟被完全遮盖。
+///
+/// 用途: speculative decode 的 batch verify — 一次权重 DRAM 流产出
+/// 4 个 token 的该行点积, 将 257 barriers/token 的同步开销摊薄 4 倍。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+#[allow(unsafe_code)]
+#[inline]
+pub unsafe fn dot_q1_0_row_verify4_avx2(
+    data: &[u8],
+    row_idx: usize,
+    n_cols: usize,
+    x: &[f32],   // [4 * n_cols] 行优先: token t 在 x[t*n_cols..]
+    y: &mut [f32], // [4] 输出
+) {
+    use std::arch::x86_64::*;
+    debug_assert!(x.len() >= 4 * n_cols);
+    debug_assert!(y.len() >= 4);
+
+    let groups_per_row = n_cols / Q1_0_GROUP_SIZE;
+    let row_byte_offset = row_idx * (groups_per_row * Q1_0_BLOCK_BYTES);
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    let x_base = x.as_ptr();
+    let stride = n_cols;
+
+    for g in 0..groups_per_row {
+        let block_start = row_byte_offset + g * Q1_0_BLOCK_BYTES;
+        let scale_bits = u16::from_le_bytes([
+            *data.get_unchecked(block_start),
+            *data.get_unchecked(block_start + 1),
+        ]);
+        let scale_v = _mm256_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
+        let sign_ptr = data.as_ptr().add(block_start + 2);
+        let xg = x_base.add(g * Q1_0_GROUP_SIZE);
+
+        // 每 byte: 1 LUT load (4 token 共享) + 4 x load + 4 FMA
+        let mut g0 = _mm256_setzero_ps();
+        let mut g1 = _mm256_setzero_ps();
+        let mut g2 = _mm256_setzero_ps();
+        let mut g3 = _mm256_setzero_ps();
+        for byte_idx in 0..16 {
+            let lut = _mm256_loadu_ps(SIGN_LUT[*sign_ptr.add(byte_idx) as usize].0.as_ptr());
+            let xa = _mm256_loadu_ps(xg.add(byte_idx * 8));
+            let xb = _mm256_loadu_ps(xg.add(stride + byte_idx * 8));
+            let xc = _mm256_loadu_ps(xg.add(2 * stride + byte_idx * 8));
+            let xd = _mm256_loadu_ps(xg.add(3 * stride + byte_idx * 8));
+            g0 = _mm256_fmadd_ps(lut, xa, g0);
+            g1 = _mm256_fmadd_ps(lut, xb, g1);
+            g2 = _mm256_fmadd_ps(lut, xc, g2);
+            g3 = _mm256_fmadd_ps(lut, xd, g3);
+        }
+        acc0 = _mm256_fmadd_ps(scale_v, g0, acc0);
+        acc1 = _mm256_fmadd_ps(scale_v, g1, acc1);
+        acc2 = _mm256_fmadd_ps(scale_v, g2, acc2);
+        acc3 = _mm256_fmadd_ps(scale_v, g3, acc3);
+    }
+
+    *y.get_unchecked_mut(0) = hsum_ps(acc0);
+    *y.get_unchecked_mut(1) = hsum_ps(acc1);
+    *y.get_unchecked_mut(2) = hsum_ps(acc2);
+    *y.get_unchecked_mut(3) = hsum_ps(acc3);
+}
+
+/// ★ verify4 x 交错布局: [group][token][128 列]
+///
+/// x_int[(g * 4 + t) * 128 .. +128] = x4[t * n_cols + g * 128 .. +128]
+///
+/// kernel 每 group 只触碰 512B 连续区域 (8 cache lines), 64 次 x loads 全部
+/// L1 命中 —— 消除 verify4 行优先布局下 4 路跨 n_cols*4B stride 的 L2 访问
+/// (x 总量 4×20KB=80KB > L1 32KB, 行优先时每次 group 都 miss)。
+///
+/// 交错成本 ~10μs/调用 (80KB×2 读写), 相对 verify 的 ~160ms 权重流可忽略。
+pub fn interleave_x4_verify(x4: &[f32], n_cols: usize, out: &mut [f32]) {
+    debug_assert_eq!(x4.len(), 4 * n_cols);
+    debug_assert!(out.len() >= 4 * n_cols);
+    let groups = n_cols / Q1_0_GROUP_SIZE;
+    for g in 0..groups {
+        for t in 0..4 {
+            let src = t * n_cols + g * Q1_0_GROUP_SIZE;
+            let dst = (g * 4 + t) * Q1_0_GROUP_SIZE;
+            out[dst..dst + Q1_0_GROUP_SIZE]
+                .copy_from_slice(&x4[src..src + Q1_0_GROUP_SIZE]);
+        }
+    }
+}
+
+/// ★ verify4t kernel: 交错布局版 (L1 命中优化)
+///
+/// x_int 必须由 `interleave_x4_verify` 生成: [group][token][128] 交错,
+/// 每 group 512B 连续 —— 与 verify4 相比 x loads 从 L2 降为 L1。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+#[allow(unsafe_code)]
+#[inline]
+pub unsafe fn dot_q1_0_row_verify4t_avx2(
+    data: &[u8],
+    row_idx: usize,
+    n_cols: usize,
+    x_int: &[f32],  // [4 * n_cols] 交错布局
+    y: &mut [f32],  // [4]
+) {
+    use std::arch::x86_64::*;
+    debug_assert!(x_int.len() >= 4 * n_cols);
+    debug_assert!(y.len() >= 4);
+
+    let groups_per_row = n_cols / Q1_0_GROUP_SIZE;
+    let row_byte_offset = row_idx * (groups_per_row * Q1_0_BLOCK_BYTES);
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    let x_base = x_int.as_ptr();
+    let gstride = 4 * Q1_0_GROUP_SIZE; // 512B per group
+
+    for g in 0..groups_per_row {
+        let block_start = row_byte_offset + g * Q1_0_BLOCK_BYTES;
+        // ★ 软件预取: 下一个 group 的 sign bytes 提前 ~200c 拉入 L1,
+        //   遮盖 DRAM 延迟 (权重流是本 kernel 唯一的 DRAM 访问)
+        if g + 1 < groups_per_row {
+            _mm_prefetch::<_MM_HINT_T0>(
+                data.as_ptr().add(block_start + Q1_0_BLOCK_BYTES) as *const i8,
+            );
+        }
+        let scale_bits = u16::from_le_bytes([
+            *data.get_unchecked(block_start),
+            *data.get_unchecked(block_start + 1),
+        ]);
+        let scale_v = _mm256_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
+        let sign_ptr = data.as_ptr().add(block_start + 2);
+        let xg = x_base.add(g * gstride); // token t 在 xg + t*128
+
+        // ★ 8 条独立 FMA 链 (每 token 2 链: 偶/奇 byte) + 手动全展开
+        //   16 bytes 平铺消除循环开销, 编译器静态调度 loads/FMA 交错。
+        let mut g0a = _mm256_setzero_ps();
+        let mut g1a = _mm256_setzero_ps();
+        let mut g0b = _mm256_setzero_ps();
+        let mut g1b = _mm256_setzero_ps();
+        let mut g0c = _mm256_setzero_ps();
+        let mut g1c = _mm256_setzero_ps();
+        let mut g0d = _mm256_setzero_ps();
+        let mut g1d = _mm256_setzero_ps();
+        // 手动展开的 8 轮 (原 (0..16).step_by(2))
+        let mut r = 0usize;
+        while r < 16 {
+            let lut0 = _mm256_loadu_ps(SIGN_LUT[*sign_ptr.add(r) as usize].0.as_ptr());
+            let lut1 = _mm256_loadu_ps(SIGN_LUT[*sign_ptr.add(r + 1) as usize].0.as_ptr());
+            let off0 = r * 8;
+            let off1 = (r + 1) * 8;
+            let xa0 = _mm256_loadu_ps(xg.add(off0));
+            let xa1 = _mm256_loadu_ps(xg.add(off1));
+            let xb0 = _mm256_loadu_ps(xg.add(Q1_0_GROUP_SIZE + off0));
+            let xb1 = _mm256_loadu_ps(xg.add(Q1_0_GROUP_SIZE + off1));
+            let xc0 = _mm256_loadu_ps(xg.add(2 * Q1_0_GROUP_SIZE + off0));
+            let xc1 = _mm256_loadu_ps(xg.add(2 * Q1_0_GROUP_SIZE + off1));
+            let xd0 = _mm256_loadu_ps(xg.add(3 * Q1_0_GROUP_SIZE + off0));
+            let xd1 = _mm256_loadu_ps(xg.add(3 * Q1_0_GROUP_SIZE + off1));
+            g0a = _mm256_fmadd_ps(lut0, xa0, g0a);
+            g1a = _mm256_fmadd_ps(lut1, xa1, g1a);
+            g0b = _mm256_fmadd_ps(lut0, xb0, g0b);
+            g1b = _mm256_fmadd_ps(lut1, xb1, g1b);
+            g0c = _mm256_fmadd_ps(lut0, xc0, g0c);
+            g1c = _mm256_fmadd_ps(lut1, xc1, g1c);
+            g0d = _mm256_fmadd_ps(lut0, xd0, g0d);
+            g1d = _mm256_fmadd_ps(lut1, xd1, g1d);
+            r += 2;
+        }
+        // 8 链 merge → 4 token group acc → scale FMA → row acc
+        acc0 = _mm256_fmadd_ps(scale_v, _mm256_add_ps(g0a, g1a), acc0);
+        acc1 = _mm256_fmadd_ps(scale_v, _mm256_add_ps(g0b, g1b), acc1);
+        acc2 = _mm256_fmadd_ps(scale_v, _mm256_add_ps(g0c, g1c), acc2);
+        acc3 = _mm256_fmadd_ps(scale_v, _mm256_add_ps(g0d, g1d), acc3);
+    }
+
+    *y.get_unchecked_mut(0) = hsum_ps(acc0);
+    *y.get_unchecked_mut(1) = hsum_ps(acc1);
+    *y.get_unchecked_mut(2) = hsum_ps(acc2);
+    *y.get_unchecked_mut(3) = hsum_ps(acc3);
 }
 
 // ============================================================================
