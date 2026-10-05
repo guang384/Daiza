@@ -79,11 +79,23 @@ const R_BLOCK_MAX: usize = 32;
 
 /// t_sub 分片预算与阈值 (完整 rationale 见文件头 "四层 blocking"):
 /// 实测 (交错基准) 主导项是 scatter straggler 尾巴 + prep 重做 ——
-/// t_sub 8→16→32 单调变优; 取 32 (切片 2.2MB, 溢出部分走 L3 可接受)。
+/// t_sub 8→16→32 单调变优; DAIZA_GEMM_T_SUB 可覆盖 (A/B 实验用)。
 /// 仅宽列 (x 总量 > 4MB) 分片, 窄列单块直达。
 const L2_TOKEN_BUDGET: usize = 2856 * 1024;
-const T_SUB_MAX: usize = 32;
 const T_SUB_X_THRESHOLD: usize = 4 * 1024 * 1024;
+
+/// t_sub 上限: 默认 32; DAIZA_GEMM_T_SUB env 可覆盖 (A/B 实验)
+fn t_sub_max() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DAIZA_GEMM_T_SUB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v| v >= 4)
+            .unwrap_or(32)
+    })
+}
 
 // ---------------------------------------------------------------------------
 // prep: 预缩放 LUT scratch —— scratch[r][g][b] = scale_v × LUT[sign_byte]
@@ -352,7 +364,7 @@ pub fn gemm_q1_0_batch(
         let scratch_block = r_block * groups * Q1_0_GROUP_SIZE * 4;
         let t_sub = if n_tokens * cols * 4 > T_SUB_X_THRESHOLD {
             (L2_TOKEN_BUDGET.saturating_sub(scratch_block) / (cols * 4))
-                .clamp(4, T_SUB_MAX)
+                .clamp(4, t_sub_max())
                 & !3
         } else {
             n_tokens
