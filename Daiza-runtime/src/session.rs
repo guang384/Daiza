@@ -205,9 +205,11 @@ fn escape_json_inline(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
-/// 分批 prefill: forward_batch 内部 tmp 数组限制 n_batch ≤ 64,
+/// 分批 prefill: forward_batch 支持 n_batch > 64 (GEMM 内部 t_sub 自行处理 L2),
 /// 超过时需分批调用, 每批 ≤ MAX_PREFILL_BATCH 个 token, 从 ctx.state.pos 继续。
-const MAX_PREFILL_BATCH: usize = 64;
+/// ★ 256: 与 DSpark prefill MAX_BATCH 对齐, 消除尾块 n_batch<64 退回 batch4 kernel
+///   (142 token 的 64+64+14 分块中 14-token 尾块不走 GEMM dispatch)
+const MAX_PREFILL_BATCH: usize = 256;
 
 fn prefill_batched(ctx: &mut ForwardContext<'_>, input_ids: &[u32], start_pos: usize) -> Result<()> {
     prefill_batched_with_progress(ctx, input_ids, start_pos, None)
