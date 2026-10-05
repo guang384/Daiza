@@ -1325,7 +1325,10 @@ impl Engine {
                 if !accepted {
                     // Reject: 用 ctx.logits_buf 采样 bonus (预测 draft[i] 的分布)
                     // ★ 重复惩罚: 对 target_logits_i 应用 (reject 路径)
-                    apply_repetition_penalty(target_logits_i, &generated_ids, params.repetition_penalty, params.frequency_penalty);
+                    //   DAIZA_NO_PENALTY=1 跳过 (诊断用: 与原生 generate_inner 对齐验证 PLD 透明性)
+                    if std::env::var("DAIZA_NO_PENALTY").is_err() {
+                        apply_repetition_penalty(target_logits_i, &generated_ids, params.repetition_penalty, params.frequency_penalty);
+                    }
                     bonus_token = Some(if params.temperature <= 0.0 {
                         // greedy: 直接 argmax target (省 sample_bonus 的 p/q softmax)
                         sample_top_k_top_p_into(
@@ -1444,7 +1447,10 @@ impl Engine {
             } else {
                 // All-accept: 从 ctx.logits_buf 采样 (最后一个 forward 的输出, 预测 pos_before+k)
                 // ★ 重复惩罚: bonus 路径 (all-accept 时 bonus_token 为 None)
-                apply_repetition_penalty(&mut ctx.logits_buf, &generated_ids, params.repetition_penalty, params.frequency_penalty);
+                //   DAIZA_NO_PENALTY=1 跳过 (诊断用)
+                if std::env::var("DAIZA_NO_PENALTY").is_err() {
+                    apply_repetition_penalty(&mut ctx.logits_buf, &generated_ids, params.repetition_penalty, params.frequency_penalty);
+                }
                 sample_top_k_top_p_into(
                     &ctx.logits_buf, params,
                     &mut || rng.next_f32(), &mut sampling_buf,
