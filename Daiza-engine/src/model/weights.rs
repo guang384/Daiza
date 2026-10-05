@@ -994,12 +994,36 @@ impl Q1_0Matrix {
         if n_batch >= 64 && n >= 4096 && n_cols >= 8192 && crate::tensor::quant::avx2_q1_0_available() {
             let mut tmp = vec![0.0f32; n_batch * n];
             crate::tensor::gemm::gemm_q1_0_batch(&self.bytes, n, n_cols, x, n_batch, &mut tmp);
-            // y[t][i] += tmp[t][i]
-            for t in 0..n_batch {
-                let dst = t * n;
-                let src = t * n;
-                for i in 0..n {
-                    y[dst + i] += tmp[src + i];
+            // y[t][i] += tmp[t][i] — AVX2 向量化 (n=5120 是 8 的倍数, 无尾处理)
+            #[cfg(target_arch = "x86_64")]
+            if crate::tensor::quant::avx2_q1_0_available() && n % 8 == 0 {
+                use std::arch::x86_64::*;
+                unsafe {
+                    for t in 0..n_batch {
+                        let dst = t * n;
+                        let src = t * n;
+                        let mut i = 0;
+                        while i + 8 <= n {
+                            let yv = _mm256_loadu_ps(y.as_ptr().add(dst + i));
+                            let tv = _mm256_loadu_ps(tmp.as_ptr().add(src + i));
+                            _mm256_storeu_ps(
+                                y.as_mut_ptr().add(dst + i),
+                                _mm256_add_ps(yv, tv),
+                            );
+                            i += 8;
+                        }
+                        while i < n {
+                            y[dst + i] += tmp[src + i];
+                            i += 1;
+                        }
+                    }
+                }
+            } else {
+                for t in 0..n_batch {
+                    let dst = t * n;
+                    for i in 0..n {
+                        y[dst + i] += tmp[t * n + i];
+                    }
                 }
             }
             return;
