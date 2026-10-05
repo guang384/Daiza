@@ -98,7 +98,8 @@ fn t_sub_max() -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// prep: 预缩放 LUT scratch —— scratch[r][g][b] = scale_v × LUT[sign_byte]
+// prep: 预缩放 LUT scratch —— scratch[r][g][b] = f16(scale_v × LUT[sign_byte])
+// f16 存储: Q1_0 scale 本身是 f16, ±scale 在 f16 中无损。scratch 写入减半。
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -109,11 +110,11 @@ unsafe fn prep_scratch_avx2(
     r_lo: usize,
     r_hi: usize,
     cols: usize,
-    scratch: &mut [f32],
+    scratch: &mut [u16],
 ) {
     use std::arch::x86_64::*;
     let groups = cols / Q1_0_GROUP_SIZE;
-    let row_stride = groups * Q1_0_GROUP_SIZE; // f32/行 = groups × 128
+    let row_stride = groups * Q1_0_GROUP_SIZE; // u16/行 = groups × 128
     for r in r_lo..r_hi {
         let lr = r - r_lo;
         let w_row = w_bytes.as_ptr().add(r * groups * Q1_0_BLOCK_BYTES);
@@ -128,7 +129,9 @@ unsafe fn prep_scratch_avx2(
                 let lut = _mm256_loadu_ps(
                     crate::tensor::quant::sign_lut_entry(*wb.add(2 + b)).as_ptr(),
                 );
-                _mm256_storeu_ps(dst.add(b * 8), _mm256_mul_ps(scale_v, lut));
+                // f32 → f16 (无损: ±scale 本身是 f16)
+                let f16x8 = _mm256_cvtps_ph(_mm256_mul_ps(scale_v, lut), 0);
+                _mm_storeu_si128(dst.add(b * 8) as *mut __m128i, f16x8);
             }
         }
     }
@@ -150,7 +153,7 @@ unsafe fn gemm_pair4t_gb_avx2(
     x: &[f32],
     cols: usize,
     t_hi: usize,
-    scratch: &[f32],
+    scratch: &[u16],
     rb: usize,
     r: usize,
     t0: usize,
@@ -191,8 +194,9 @@ unsafe fn gemm_pair4t_gb_avx2(
         let x2 = xg[2].add(g * Q1_0_GROUP_SIZE);
         let x3 = xg[3].add(g * Q1_0_GROUP_SIZE);
         for b in 0..16 {
-            let sl0 = _mm256_loadu_ps(sg0.add(b * 8));
-            let sl1 = _mm256_loadu_ps(sg1.add(b * 8));
+            // f16 scratch load + cvtph_ps → f32 (port 5, 不抢 FMA port 0/1)
+            let sl0 = _mm256_cvtph_ps(_mm_loadu_si128(sg0.add(b * 8) as *const __m128i));
+            let sl1 = _mm256_cvtph_ps(_mm_loadu_si128(sg1.add(b * 8) as *const __m128i));
             let v0 = _mm256_loadu_ps(x0.add(b * 8));
             let v1 = _mm256_loadu_ps(x1.add(b * 8));
             let v2 = _mm256_loadu_ps(x2.add(b * 8));
@@ -236,7 +240,7 @@ fn gemm_rows_range_avx2(
     start: usize,
     end: usize,
     r_block: usize,
-    scratch: &mut [f32],
+    scratch: &mut [u16],
 ) {
     let groups = cols / Q1_0_GROUP_SIZE;
     let g_tiles = groups.div_ceil(G_BLOCK);
@@ -355,13 +359,13 @@ pub fn gemm_q1_0_batch(
         }
 
         let groups = cols / Q1_0_GROUP_SIZE;
-        // r_block: scratch ~700KB 为目标的自适应行块
-        let r_block = (SCRATCH_TARGET_BYTES / (groups * Q1_0_GROUP_SIZE * 4))
+        // r_block: scratch ~700KB 为目标的自适应行块 (f16: 2 bytes/element)
+        let r_block = (SCRATCH_TARGET_BYTES / (groups * Q1_0_GROUP_SIZE * 2))
             .clamp(2, R_BLOCK_MAX)
             & !1;
         // t_sub: x 切片与 scratch 同驻 L2 的 token 子块 (4 对齐, [4, 32]);
         // 仅宽列大 batch 分片 (T_SUB_X_THRESHOLD), 其余单块直达
-        let scratch_block = r_block * groups * Q1_0_GROUP_SIZE * 4;
+        let scratch_block = r_block * groups * Q1_0_GROUP_SIZE * 2;
         let t_sub = if n_tokens * cols * 4 > T_SUB_X_THRESHOLD {
             (L2_TOKEN_BUDGET.saturating_sub(scratch_block) / (cols * 4))
                 .clamp(4, t_sub_max())
@@ -373,7 +377,7 @@ pub fn gemm_q1_0_batch(
         let pool = match workspace::get_thread_pool() {
             Some(p) => p,
             None => {
-                let mut scratch = vec![0.0f32; r_block * groups * Q1_0_GROUP_SIZE];
+                let mut scratch = vec![0u16; r_block * groups * Q1_0_GROUP_SIZE];
                 let mut t_lo = 0;
                 while t_lo < n_tokens {
                     let t_hi = (t_lo + t_sub).min(n_tokens);
@@ -391,7 +395,7 @@ pub fn gemm_q1_0_batch(
         let x_addr = x.as_ptr() as usize;
         let y_addr = y.as_mut_ptr() as usize;
         let scratch_need = r_block * groups * Q1_0_GROUP_SIZE;
-        // ★ 细 chunk: 512 行在 ~10 执行者下 ≈ 每人一块、零偷取弹性, 慢核 (E/LP-E)
+        // 细 chunk: 512 行在 ~10 执行者下每人一块、零偷取弹性, 慢核 (E/LP-E)
         //   持块期间全场 barrier 等待 (straggler 尾巴 ~1-2ms/scatter);
         //   128 行让快核偷走余块, 尾巴缩到 1/4
         let steal_chunk = 128usize;
@@ -403,12 +407,12 @@ pub fn gemm_q1_0_batch(
             let t_hi = (t_lo + t_sub).min(n_tokens);
             pool.scatter_wait_stealing(rows, steal_chunk, move |start, end| {
                 thread_local! {
-                    static SCRATCH: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+                    static SCRATCH: RefCell<Vec<u16>> = RefCell::new(Vec::new());
                 }
                 SCRATCH.with(|buf| {
                     let mut b = buf.borrow_mut();
                     if b.len() < scratch_need {
-                        b.resize(scratch_need, 0.0);
+                        b.resize(scratch_need, 0);
                     }
                     let w = unsafe {
                         std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len)
