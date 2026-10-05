@@ -982,13 +982,13 @@ impl Q1_0Matrix {
         }
 
         // ★ GEMM dispatch (与 matvec_batch_into_slice L489 条件一致):
-        //   大矩阵 (rows >= 4096) + 大 batch (>= 64) 时走 k-lane GEMM。
-        //   down_proj (rows=5120, cols=17408) 在 prefill batch=64 时原走 batch4 逐行
-        //   kernel, 宽列 17408 的 LUT+bcast 开销远超 GEMM 的预缩放 scratch 优势。
+        //   大矩阵 (rows >= 4096) + 大 batch (>= 64) + 宽列 (cols >= 8192) 时走 k-lane GEMM。
+        //   down_proj (rows=5120, cols=17408) 宽列受益于 GEMM 预缩放 scratch;
+        //   attn_output/ssm_out (cols=6144) 窄列 GEMM prep 开销 > FMA 收益, 不 dispatch。
         //   GEMM 覆盖写入临时 buffer, 再逐元素加到 y (保持 += 语义)。
         //   临时 buffer = n_batch × n × 4B (down_proj 64×5120×4 = 1.28MB, 可接受)。
         #[cfg(target_arch = "x86_64")]
-        if n_batch >= 64 && n >= 4096 && crate::tensor::quant::avx2_q1_0_available() {
+        if n_batch >= 64 && n >= 4096 && n_cols >= 8192 && crate::tensor::quant::avx2_q1_0_available() {
             let mut tmp = vec![0.0f32; n_batch * n];
             crate::tensor::gemm::gemm_q1_0_batch(&self.bytes, n, n_cols, x, n_batch, &mut tmp);
             // y[t][i] += tmp[t][i]
