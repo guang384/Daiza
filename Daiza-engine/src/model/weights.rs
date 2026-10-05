@@ -204,8 +204,10 @@ impl Q1_0Matrix {
             let bytes_len = self.bytes.len();
             let x_addr = x.as_ptr() as usize;
             let y_addr = y.as_mut_ptr() as usize;
-            // ★ Work-stealing: chunk_size=256 改善负载均衡
-            let steal_chunk = 256;
+            // ★ Work-stealing: chunk_size 跟随 DAIZA_MATVEC_CHUNK (默认 128)
+            //   bench_klab 交错实测: 128 比 256 快 ~15%@9w (E 核 straggler 尾巴更短)
+            //   原硬编码 256 是遗漏, 与 decode matvec_multi 路径的 steal_chunk=128 对齐
+            let steal_chunk = matvec_steal_chunk();
             let km = kernel_mode;
 
             // ★ 整数乘加 kernel 路径 (模仿 llama.cpp)
