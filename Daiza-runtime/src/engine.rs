@@ -1071,8 +1071,11 @@ impl Engine {
             //   greedy argmax 翻转 (先前 DSpark 与原生 greedy 在近平局处分歧的根因)。
             //   hidden_tap_batch_buf 覆盖 batch 内全部 token (含 anchor 末行),
             //   logits_buf = batch 末位 = anchor 的下一 token 分布 (draft[0] 的 target 分布)。
+            // ★ MAX_BATCH=256: 142 token 一次过 GEMM (n_batch>=64 触发 k-lane dispatch),
+            //   消除 64+64+14 分块中 14-token 尾块退回 batch4 逐行 kernel 的开销。
+            //   GEMM 内部 t_sub=32 自行处理 L2 压力, 256 上限覆盖常见 prompt 长度。
             let prefill_ids = &input_ids[..];   // 全部 token (含 anchor)
-            const MAX_BATCH: usize = 64;
+            const MAX_BATCH: usize = 256;
             let np = prefill_ids.len();
             let mut off = 0usize;
             while off < np {
