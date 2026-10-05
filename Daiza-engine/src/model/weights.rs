@@ -384,8 +384,9 @@ impl Q1_0Matrix {
             let bytes_len = self.bytes.len();
             let x_addr = x.as_ptr() as usize;
             let y_addr = y.as_mut_ptr() as usize;
-            // ★ Work-stealing: chunk_size=256 改善负载均衡
-            let steal_chunk = 256;
+            // ★ Work-stealing: chunk_size 跟随 DAIZA_MATVEC_CHUNK (默认 128)
+            //   与 matvec_into_slice / matvec_multi / GEMM 路径对齐
+            let steal_chunk = matvec_steal_chunk();
 
             pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
@@ -708,7 +709,7 @@ impl Q1_0Matrix {
             let bytes_len = self.bytes.len();
             let x_addr = x4.as_ptr() as usize;
             let y_addr = y.as_mut_ptr() as usize;
-            let steal_chunk = 256;
+            let steal_chunk = matvec_steal_chunk();
             pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x = unsafe { std::slice::from_raw_parts(x_addr as *const f32, 4 * n_cols) };
@@ -779,7 +780,7 @@ impl Q1_0Matrix {
             let bytes_addr = self.bytes.as_ptr() as usize;
             let bytes_len = self.bytes.len();
             let y_addr = y.as_mut_ptr() as usize;
-            let steal_chunk = 256;
+            let steal_chunk = matvec_steal_chunk();
             pool.scatter_wait_stealing(n, steal_chunk, move |start, end| {
                 let bytes = unsafe { std::slice::from_raw_parts(bytes_addr as *const u8, bytes_len) };
                 let x_int = unsafe { std::slice::from_raw_parts(interleaved as *const f32, 4 * n_cols) };
