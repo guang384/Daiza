@@ -5,8 +5,8 @@
 //! ## 使用方式
 //!
 //! ```no_run
-//! use daiza_engine::engine::Engine;
-//! let mut engine = Engine::load("../Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf").unwrap();
+//! use daiza_runtime::engine::Engine;
+//! let mut engine = Engine::load(std::path::Path::new("../Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf")).unwrap();
 //! let out = engine.generate("你好", 64).unwrap();
 //! println!("{out}");
 //! ```
@@ -19,6 +19,7 @@ use daiza_engine::model::config::Config;
 use daiza_engine::model::dspark::{
     weights::DrafterWeights,
     speculative::SpeculativeContext,
+    ngram::NgramDrafter,
 };
 use daiza_engine::model::forward::{forward_batch, forward_batch_with_vision, forward_single_token, make_context, VisionInject, ForwardContext};
 use daiza_engine::model::vision::{
@@ -932,6 +933,20 @@ impl Engine {
             ));
         }
 
+        // ★ PLD (Prompt Lookup Decoding) 模式: DAIZA_PLD 未设为 0/false/no 即开启。
+        //   Phase 1 用 2-gram 查表 (~100ns) 替代神经 drafter forward (~53ms/call),
+        //   draft overhead → 0 → DSpark 路径与原生 decode 持平 (不触发 probe fallback)。
+        //   仍要求 load_drafter: hidden tap 层表来自 spec 配置, 且 tap history 累积
+        //   保证 session 在 PLD/神经 DSpark 间切换时 drafter context 一致。
+        //   注: sequential verify 下 forwards/token 恒 = 1.0, PLD 不加速 decode;
+        //   价值 = 零成本保留 DSpark (Draft 乐观 UI) + 实测接受率 p 供 batched
+        //   verify 方向决策。greedy 下输出与原生 decode 逐字节一致: draft 接受 ⟺
+        //   argmax 匹配, 拒绝时 bonus = argmax, 均为原生下一个 token。
+        let pld_mode = match std::env::var("DAIZA_PLD") {
+            Ok(v) => !matches!(v.as_str(), "0" | "false" | "no"),
+            Err(_) => false,
+        };
+
         // 1. 构造输入
         // ★ DAIZA_DSPARK_RAW=1: 用 raw prompt (不走 chat template), 对齐 llama.cpp test-dspark-real-eval
         // ★ 若 prompt 已包含 <|im_start|> (Web 端 handle_chat_dspark 构造的完整 chat 格式,
@@ -1051,7 +1066,12 @@ impl Engine {
             eprintln!("[dspark] replayed {} history tokens, start_pos now {}", np, start_pos);
         }
         if n_input >= 2 {
-            let prefill_ids = &input_ids[..n_input - 1];
+            // ★ 与原生 generate_inner (L806) 逐位对齐: anchor (末位 token) 走 batch matvec
+            //   内核而非 forward_single_token 的单 token 内核 — 消除 ~1e-6 数值差导致的
+            //   greedy argmax 翻转 (先前 DSpark 与原生 greedy 在近平局处分歧的根因)。
+            //   hidden_tap_batch_buf 覆盖 batch 内全部 token (含 anchor 末行),
+            //   logits_buf = batch 末位 = anchor 的下一 token 分布 (draft[0] 的 target 分布)。
+            let prefill_ids = &input_ids[..];   // 全部 token (含 anchor)
             const MAX_BATCH: usize = 64;
             let np = prefill_ids.len();
             let mut off = 0usize;
@@ -1063,7 +1083,7 @@ impl Engine {
             }
         }
         let prefill_ms = prefill_start.elapsed().as_millis();
-        let n_prefill = if n_input >= 2 { n_input - 1 } else { 0 };
+        let n_prefill = n_input;   // 含 anchor (batch 已 forward)
         eprintln!("\r[prefill] {n_prefill}/{n_input} done in {prefill_ms}ms (start_pos={start_pos})");
 
         // 5. DSpark decode 循环
@@ -1088,13 +1108,18 @@ impl Engine {
         // 直接追加到 target_tap_history (增量模式下 history 已含历史行)
         target_tap_history.extend_from_slice(&prefill_tap_acc);
 
-        // anchor = 最后一个 prefill token (对齐 llama.cpp: id_last = inp.back())
+        // anchor = 最后一个 input token (对齐 llama.cpp: id_last = inp.back())
         // 不 sample, 不加入 generated_ids (anchor 不是生成的 token)
         let mut anchor_token = input_ids[n_input - 1];
-        // forward anchor 以获取其 hidden tap + 更新 cache + 产生 logits for draft[0]
-        forward_single_token(&mut ctx, anchor_token)?;
-        // 累积 anchor 的 hidden tap
-        target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
+        if n_input == 1 {
+            // n_input==1: batch 无意义, 单 token forward (与原生 generate_inner L803 对齐)
+            // —— 原生 n_input==1 也走 forward_single_token, 这里保持一致
+            forward_single_token(&mut ctx, anchor_token)?;
+            target_tap_history.extend_from_slice(&ctx.hidden_tap_buf);
+        }
+        // n_input>=2: anchor 已在 batch prefill 中 forward (末行), hidden tap 由
+        //   prefill_tap_acc 末行提供 (已 extend 进 target_tap_history),
+        //   logits_buf = batch 末位 = draft[0] 的 target 分布。不再单独 forward。
 
         // ★ think 关闭时, build_increment / handle_chat_dspark 已在 prompt 末尾预填空 think 块
         //   <think></think>\n, 模型不再生成 <think>...</think> 内容, 直接输出正式回答。
@@ -1103,6 +1128,20 @@ impl Engine {
         let _think_enabled = session_take.as_ref().map(|s| s.think_enabled).unwrap_or(false);
         let mut think_suppress = false;
         let mut suppress_buf: String = String::new();
+
+        // ★ PLD drafter: 2-gram 表从完整 token 流 (session 历史 + 本轮输入) 构建
+        let mut ngram = if pld_mode {
+            let mut stream: Vec<u32> = Vec::new();
+            if let Some(s) = session_take.as_ref() {
+                stream.extend_from_slice(&s.history_tokens);
+            }
+            stream.extend_from_slice(&input_ids);
+            let d = NgramDrafter::from_stream(&stream);
+            eprintln!("[pld] 2-gram table: {} entries from {} tokens", d.len(), stream.len());
+            d
+        } else {
+            NgramDrafter::from_stream(&[])
+        };
 
         let decode_start = std::time::Instant::now();
         let stream_output = !matches!(std::env::var("DAIZA_STREAM").as_deref(),
@@ -1144,6 +1183,7 @@ impl Engine {
         let mut total_accepted = 0usize;
         let mut total_bonus = 0usize;
         let mut total_draft_truncated = 0usize;  // confidence head 截断的 token 数
+        let mut total_pld_hits = 0usize;         // PLD: 2-gram 表命中的 cycle 数
         // ★ 性能分析: 各阶段累计耗时 (DAIZA_PROFILE 控制)
         let profile_dspark = std::env::var("DAIZA_PROFILE").is_ok();
         let mut t_draft = 0u128;       // Phase 1: drafter forward
@@ -1169,9 +1209,16 @@ impl Engine {
 
         while generated_ids.len() < max_tokens {
             // --- Phase 1: Draft ---
+            // ★ PLD 模式: 2-gram 查表 (k=1, ~100ns), miss → 空 draft → 跳过 verify
+            //   直接 bonus (与 all-reject 等价, 1 forward/1 token, 零损失)。
+            //   神经 drafter 路径的 set_target_tap / confidence head 不参与。
             let draft_start = std::time::Instant::now();
-            let draft_tokens: Vec<u32>;
-            {
+            let draft_tokens: Vec<u32> = if pld_mode {
+                match ngram.lookup_next() {
+                    Some(t) => { total_pld_hits += 1; vec![t] }
+                    None => Vec::new(),
+                }
+            } else {
                 let spec = self.spec_ctx.as_mut().unwrap();
                 // 位置语义 (对齐 llama.cpp dspark speculative.cpp):
                 //   context 行 = target hidden tap [L, ..., start-1] (不含 anchor)
@@ -1186,15 +1233,14 @@ impl Engine {
                 //   ctx_len 变小 (3-5),若 start_pos = ctx_len (相对位置) 会与 target 绝对位置
                 //   严重偏移,导致 RoPE 频率错误 → 接受率下降。
                 let history_rows = target_tap_history.len() / n_embd_cap;
-            let ctx_len = history_rows - 1;
-            let start_pos = ctx.state.pos - 1;
-            spec.set_target_tap(
-                &target_tap_history[..ctx_len * n_embd_cap],
-                ctx_len,
-            );
-                let dt = spec.draft(anchor_token, start_pos, params.temperature > 0.0).to_vec();
-                draft_tokens = dt;
-            }
+                let ctx_len = history_rows - 1;
+                let start_pos = ctx.state.pos - 1;
+                spec.set_target_tap(
+                    &target_tap_history[..ctx_len * n_embd_cap],
+                    ctx_len,
+                );
+                spec.draft(anchor_token, start_pos, params.temperature > 0.0).to_vec()
+            };
             t_draft += draft_start.elapsed().as_millis();
             total_draft_calls += 1;
 
@@ -1202,9 +1248,16 @@ impl Engine {
             // 只 verify 前 n_draft_to_verify 个, 后面的 draft token 直接跳过 (省 target forward)
             // n_draft_to_verify == 0 → 跳过 Phase 2, 直接 bonus (与 all-reject 等价)
             // n_draft_to_verify == block_size → 不截断, 原行为
-            let n_draft_to_verify = self.spec_ctx.as_ref().unwrap()
-                .confident_prefix_length(confidence_threshold);
-            total_draft_truncated += block_size - n_draft_to_verify;
+            // PLD 模式: k=1 无 confidence head, n = draft 长度 (0 或 1)
+            let n_draft_to_verify = if pld_mode {
+                draft_tokens.len()
+            } else {
+                self.spec_ctx.as_ref().unwrap()
+                    .confident_prefix_length(confidence_threshold)
+            };
+            if !pld_mode {
+                total_draft_truncated += block_size - n_draft_to_verify;
+            }
 
             // === 乐观显示: emit Draft 事件 (前端灰色显示预测文本) ===
             // ★ think_suppress 时不发送 Draft 事件: 避免 drafter 预测的 think 内容
@@ -1325,6 +1378,9 @@ impl Engine {
                     break;
                 }
                 generated_ids.push(dt);
+                if pld_mode {
+                    ngram.commit(dt);
+                }
                 forward_single_token(&mut ctx, dt)?;
                 n_target_forwards += 1;
                 // ★ think_suppress 模式: accept 的 token 通过 emit_delta! 发送 (带 think 过滤)
@@ -1401,6 +1457,9 @@ impl Engine {
             }
             generated_ids.push(bt);
             anchor_token = bt;
+            if pld_mode {
+                ngram.commit(bt);
+            }
             forward_single_token(&mut ctx, bt)?;
             emit_delta!(bt);
             n_target_forwards += 1;
@@ -1487,11 +1546,25 @@ impl Engine {
         eprintln!("[bench] dspark decode({n_gen}t)={decode_ms}ms (~{}ms/tok ~{:.2} tok/s)",
             if n_gen > 0 { decode_ms / n_gen as u128 } else { 0 },
             if decode_ms > 0 { n_gen as f64 * 1000.0 / decode_ms as f64 } else { 0.0 });
-        eprintln!("[dspark] draft_calls={total_draft_calls} accepted={total_accepted} \
-            (avg {:.2}/{block_size}) bonus={total_bonus} truncated={total_draft_truncated} \
-            (conf_threshold={confidence_threshold})",
-            if total_draft_calls > 0 { total_accepted as f64 / total_draft_calls as f64 }
-            else { 0.0 });
+        if pld_mode {
+            // PLD k=1: p = 接受率 (每 cycle 至多接受 1 个 draft);
+            // hit = 2-gram 表命中 cycle 数 (hit 率低 → 文本无重复; hit 高但 p 低 → 表预测不准)
+            let p = if total_draft_calls > 0 {
+                total_accepted as f64 / total_draft_calls as f64
+            } else { 0.0 };
+            let hit_rate = if total_draft_calls > 0 {
+                total_pld_hits as f64 / total_draft_calls as f64
+            } else { 0.0 };
+            eprintln!("[pld] cycles={total_draft_calls} hits={total_pld_hits} ({:.0}%) \
+                accepted={total_accepted} (p={p:.2}) bonus={total_bonus} table_entries={}",
+                hit_rate * 100.0, ngram.len());
+        } else {
+            eprintln!("[dspark] draft_calls={total_draft_calls} accepted={total_accepted} \
+                (avg {:.2}/{block_size}) bonus={total_bonus} truncated={total_draft_truncated} \
+                (conf_threshold={confidence_threshold})",
+                if total_draft_calls > 0 { total_accepted as f64 / total_draft_calls as f64 }
+                else { 0.0 });
+        }
 
         // ★ 性能分析: 各阶段耗时分解 (DAIZA_PROFILE)
         if profile_dspark {

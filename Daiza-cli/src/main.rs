@@ -51,7 +51,8 @@ fn print_usage() {
     eprintln!("  --image <path>              输入图像路径 (可多次指定, 需 --mmproj)");
     eprintln!("  --raw                       跳过 chat 模板, 直接编码 prompt (调试用)");
     eprintln!("  --greedy                    贪心解码 (temperature=0, 确定性输出)");
-    eprintln!("  --confidence-threshold <f>  DSpark confidence 早停阈值 (默认 0.0)");
+        eprintln!("  --confidence-threshold <f>  DSpark confidence 早停阈值 (默认 0.0)");
+        eprintln!("  --pld                       DSpark 改用 2-gram PLD 查表 drafter (零成本替代神经 drafter)");
     eprintln!("  --inspect                   只显示模型元信息");
     eprintln!("  --dump-template             输出 chat_template 原始字节 (调试用)");
     eprintln!("  --interactive               启动交互式 REPL (多轮对话, 复用 KV/SSM state)");
@@ -989,6 +990,7 @@ fn main() -> Result<()> {
     let confidence_threshold: f32 = get_opt(&args, "--confidence-threshold")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
+    let pld = args.iter().any(|a| a == "--pld");
 
     println!("[daiza-cli] Loading: {}", gguf_path.display());
 
@@ -1122,8 +1124,14 @@ fn main() -> Result<()> {
     println!("[daiza-cli] Prompt: {prompt:?}");
     println!("[daiza-cli] Max tokens: {max_tokens}");
     println!("[daiza-cli] Raw mode: {raw_mode}");
+    if pld && dspark_path.is_none() {
+        eprintln!("[daiza-cli] warning: --pld requires --dspark <path>; ignored");
+    }
     if dspark_path.is_some() {
         println!("[daiza-cli] DSpark: ENABLED");
+        if pld {
+            println!("[daiza-cli] DSpark drafter: PLD (2-gram lookup, zero-cost)");
+        }
         if confidence_threshold > 0.0 {
             println!("[daiza-cli] Confidence threshold: {confidence_threshold}");
         }
@@ -1140,6 +1148,9 @@ fn main() -> Result<()> {
         engine.generate_with_image(&prompt, &image_paths, max_tokens, params, Some(system))?
     } else if dspark_path.is_some() {
         let system = "You are a helpful assistant.";
+        if pld {
+            std::env::set_var("DAIZA_PLD", "1");
+        }
         let fallback = !matches!(
             std::env::var("DAIZA_DSPARK_FALLBACK").as_deref(),
             Ok("0") | Ok("false") | Ok("no")

@@ -1,7 +1,7 @@
 //! Qwen3-VL 视觉编码器配置 (从 mmproj GGUF metadata 解析)
 //!
 //! 关键 metadata (实测 Bonsai-27B-mmproj-Q8_0.gguf):
-//! ```
+//! ```text
 //! clip.has_vision_encoder = true
 //! clip.projector_type = qwen3vl_merger
 //! clip.use_gelu = true

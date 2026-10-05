@@ -16,13 +16,16 @@
 //! - `drafter`: block-parallel forward (非因果 attention + log_snr + target tap)
 //! - `markov`: Markov head 顺序链式 resample
 //! - `speculative`: verify + rejection sampling + KV/SSM cache rollback
+//! - `ngram`: PLD (prompt lookup) 2-gram 查表 drafter (零成本替代神经 drafter)
 
 pub mod config;
 pub mod weights;
 pub mod drafter;
 pub mod markov;
 pub mod speculative;
+pub mod ngram;
 
 pub use config::DrafterConfig;
 pub use weights::DrafterWeights;
 pub use drafter::DrafterContext;
+pub use ngram::NgramDrafter;
