@@ -12,14 +12,17 @@ use crate::gguf::parser::GgufFile;
 use crate::gguf::tensor_info::TensorType;
 use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::load_as_f32;
+#[cfg(not(target_arch = "x86_64"))]
 use crate::tensor::quant::{
     avx2_q1_0_available, dot_q1_0_row_batch, dot_q1_0_row_scalar,
     quantize_dequantize_q8_0_into, quantize_f32_to_q8_0_simple, dot_q1_0_q8_0_row_avx2,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::tensor::quant::{
-    dot_q1_0_row_avx2, dot_q1_0_row_batch4_avx2, dot_q1_0_row_batch_avx2,
-    dot_q1_0_row_dual_avx2, dot_q1_0_row_triple_avx2, dot_q1_0_row_quad_avx2,
+    avx2_q1_0_available, dot_q1_0_q8_0_row_avx2, dot_q1_0_row_avx2, dot_q1_0_row_batch4_avx2,
+    dot_q1_0_row_batch_avx2, dot_q1_0_row_batch, dot_q1_0_row_dual_avx2, dot_q1_0_row_quad_avx2,
+    dot_q1_0_row_scalar, dot_q1_0_row_triple_avx2,
+    quantize_dequantize_q8_0_into, quantize_f32_to_q8_0_simple,
 };
 use crate::BonsaiError;
 
@@ -47,6 +50,22 @@ fn int_kernel_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("DAIZA_INT_KERNEL").is_ok())
+}
+
+/// ★ DAIZA_MATVEC_CHUNK: work-stealing chunk 尺寸 (默认 128)
+///
+/// bench_klab 交错实测: 128 比 256 快 ~15%@9w (E 核 straggler 尾巴更短)。
+/// 仅影响 decode matvec 路径; prefill 走 GEMM/batch 不经过此参数。
+fn matvec_steal_chunk() -> usize {
+    use std::sync::OnceLock;
+    static CHUNK: OnceLock<usize> = OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("DAIZA_MATVEC_CHUNK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v: &usize| v > 0)
+            .unwrap_or(128)
+    })
 }
 
 /// 如果 Q8_PATH 启用, 把 x 量化为 Q8_0 再反量化回 F32 (引入量化误差), 返回 Cow::Owned
@@ -870,9 +889,10 @@ impl Q1_0Matrix {
         // 持久线程池: 单次 barrier 分发所有矩阵的行
         if let Some(pool) = crate::model::workspace::get_thread_pool() {
             let x_addr = x.as_ptr() as usize;
-            // ★ Work-stealing: chunk_size=256 让快线程多抢 chunk, 改善负载均衡
-            // (原 static chunk: tid × (total/N), 慢线程拖整 barrier)
-            let steal_chunk = 256;
+            // ★ Work-stealing: chunk_size=128 让快线程多抢 chunk, 改善负载均衡
+            //   (原 static chunk: tid × (total/N), 慢线程拖整 barrier)
+            //   bench_klab 交错实测 decode matvec 128 比 256 快 ~15%@9w (E 核尾巴更短)
+            let steal_chunk = matvec_steal_chunk();
 
             pool.scatter_wait_stealing(total_rows, steal_chunk, move |start, end| {
                 if start >= end {
