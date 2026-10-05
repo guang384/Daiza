@@ -72,10 +72,10 @@ use crate::tensor::dtype::{Q1_0_BLOCK_BYTES, Q1_0_GROUP_SIZE};
 const G_BLOCK: usize = 8;
 
 /// prep scratch 目标容量/worker: r_block = target / 每行 scratch 字节,
-/// clamp 到 [2, 32] 且偶对齐。上限受 E-core 簇 L2 (4MB 共享 4 核) 驻留约束:
-/// 实测 r_block=20 (scratch 1.4MB, 4 worker × 1.4MB > 4MB) 反而退化 17%。
+/// clamp 到 [2, R_BLOCK_MAX] 且偶对齐。上限受 E-core 簇 L2 (4MB 共享 4 核) 驻留约束:
+/// f16 scratch: r_block=64 → 655KB/worker, 4 worker × 655KB = 2.6MB < 4MB (安全)
 const SCRATCH_TARGET_BYTES: usize = 700 * 1024;
-const R_BLOCK_MAX: usize = 32;
+const R_BLOCK_MAX: usize = 64;
 
 /// t_sub 分片预算与阈值 (完整 rationale 见文件头 "四层 blocking"):
 /// 实测 (交错基准) 主导项是 scatter straggler 尾巴 + prep 重做 ——
