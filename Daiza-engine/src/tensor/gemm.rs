@@ -71,10 +71,10 @@ use crate::tensor::dtype::{Q1_0_BLOCK_BYTES, Q1_0_GROUP_SIZE};
 /// x 片段 4 token × 8 group × 512B = 16KB, 驻 L1 (P 48KB / E 32KB)。
 const G_BLOCK: usize = 8;
 
-/// prep scratch 目标容量/worker: r_block = target / 每行 scratch 字节,
-/// clamp 到 [2, R_BLOCK_MAX] 且偶对齐。上限受 E-core 簇 L2 (4MB 共享 4 核) 驻留约束:
-/// f16 scratch: r_block=64 → 655KB/worker, 4 worker × 655KB = 2.6MB < 4MB (安全)
-const SCRATCH_TARGET_BYTES: usize = 700 * 1024;
+/// prep scratch 目标容量/worker: f16 400KB (bench_prefill 交错实测最优)
+/// 4 worker × 400KB = 1.6MB < 4MB E-core L2 (低压, x 切片获得更多 L2 空间)
+/// 实测 700KB 退化 8% (L2 x 切片被 scratch 挤出), 400KB 最优
+const SCRATCH_TARGET_BYTES: usize = 400 * 1024;
 const R_BLOCK_MAX: usize = 64;
 
 /// t_sub 分片预算与阈值 (完整 rationale 见文件头 "四层 blocking"):
