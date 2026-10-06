@@ -272,8 +272,8 @@ pub(crate) unsafe fn ssm_output_gate_avx2(
             let y_v = _mm256_loadu_ps(y.as_ptr().add(off + i));
             let nw_v = _mm256_loadu_ps(norm_w.as_ptr().add(i));
             let z_v = _mm256_loadu_ps(z.as_ptr().add(off + i));
-            // y = (y * inv_rms) * norm_w * z,先 FMA: tmp = norm_w * inv_rms * y,
-            // 再 mul z。但更精确的写法:y * inv_rms → FMA(norm_w, ·, 0) → * z
+            // y = (y * inv_rms) * norm_w * z — 3 次 FMUL 链 (先 scale, 再 norm_w,
+            // 最后乘 z), 乘法顺序与标量版/ssm_output_gate_head 逐指令一致
             let scaled = _mm256_mul_ps(y_v, inv_rms_v);
             let gated = _mm256_mul_ps(scaled, nw_v);
             let result = _mm256_mul_ps(gated, z_v);

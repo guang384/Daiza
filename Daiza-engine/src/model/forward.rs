@@ -9,7 +9,8 @@ use crate::model::workspace::Workspace;
 /// 串行段并行化的最小批量阈值 (与 PrefillWorkers::boost_if_large 对齐):
 /// ≥ 此值时 prefill 有全核 boost, attention online softmax / SSM scan / swiglu
 /// 走跨 token 并行路径; 小批量 (DSpark 增量 prefill) 保留旧串行路径,
-/// 避免每 block 额外 barrier 开销 (~64 block × ~20μs) 反噬。
+/// 避免每 block 净增 3 个 barrier (attn 1 + ssm 2 + swiglu 1, 减去旧路径
+/// ssm 每 token 已有的 1 个) × 64 block ≈ 数 ms 反噬小批量调用。
 const BATCH_PARALLEL_MIN: usize = 32;
 
 /// 多模态 vision embedding 注入参数 (用于 forward_batch_with_vision)
@@ -573,7 +574,7 @@ pub fn forward_batch_with_vision(
         if is_full {
             let kv = ctx.state.kv_caches[blk_idx].as_mut().unwrap();
             let w = block_w.as_full_attention();
-            // ★ scale 已预烘焙到 Q (见 token 循环内 q_scale_t), 这里不再保留 attn_scale
+            // ★ scale 已预烘焙到 Q (两条 attention 路径各有局部 q_scale 变量), 这里不再保留 attn_scale
             let group_size = n_q_heads / n_kv_heads;
 
             // 3a. Batch rmsnorm (跨 token 并行, n_batch >= 4 时启用线程池)
@@ -592,7 +593,7 @@ pub fn forward_batch_with_vision(
             // 3d. Per-token attention (sequential)
             let ts_attn = if profile { Some(std::time::Instant::now()) } else { None };
             if use_parallel_serial {
-                // ★ 并行路径 (n_batch ≥ BATCH_PARALLEL_MIN, 实测 serial_ratio 7.9% 中的 attn 段):
+                // ★ 并行路径 (n_batch ≥ BATCH_PARALLEL_MIN; 重构前 serial_ratio 7.9%, 其中 attn 段 194ms/142t 热态):
                 //   阶段 1 (串行, ~0.2ms/block): K norm+RoPE + KV append 前置 —
                 //     online softmax 各 token 只读共享 KV cache、写各自独立 out 行,
                 //     append 全部提前后 token 间不再有因果写依赖;
@@ -877,7 +878,7 @@ pub fn forward_batch_with_vision(
             //   - qkv 在 conv1d 里只用于 copy 进 conv_history,直接用 batch buffer
             let ts_ssm = if profile { Some(std::time::Instant::now()) } else { None };
             if use_parallel_serial {
-                // ★ 两阶段并行路径 (n_batch ≥ BATCH_PARALLEL_MIN; ssm 段占 serial 800ms/142t 热态):
+                // ★ 两阶段并行路径 (n_batch ≥ BATCH_PARALLEL_MIN; 重构前 ssm 段 800ms/142t 热态):
                 //   旧路径每 token 1 次 scatter_wait barrier (142 token × 48 block = 6816 次/prefill,
                 //   barrier 唤醒+同步开销占大半), 且 conv1d/silu/L2norm 逐 token 串行 + 3 次 split copy。
                 //
@@ -886,7 +887,8 @@ pub fn forward_batch_with_vision(
                 //     token 直读 qkv_buf, 批前 token 读环形 history (只读, 更新延后);
                 //   (串行) 环形 history 更新 — 复刻逐 token 写入的最终状态 (末 conv_k 行 + head 前进);
                 //   Phase B (1 barrier): 48 条 v_head 状态链, 每链串行扫全 batch t=0..n_batch
-                //     (scan 逐 token 状态演化顺序不变), scan+gate 逐 (t,vh) 与旧路径同序。
+                //     (scan 逐 token 状态演化顺序不变), scan+gate 逐 (t,vh) 与旧路径同序;
+                //     链不可分割, 分配用 work-stealing (P/E/LP-E 混核均衡, 见下方调用处注释)。
                 //   每元素运算序列与旧路径一致 → 逐字节一致; barrier 6816 → 96/prefill。
                 let pool = ssm_pool.unwrap();
                 if ssm.conv_history.is_empty() {
@@ -979,8 +981,6 @@ pub fn forward_batch_with_vision(
                     });
                 }
                 // ---- 环形 history 更新 (Phase A barrier 后串行; 与逐 token 写入的终态一致) ----
-                if let Some(t) = ts_pa { p_ssm_phase_a += t.elapsed(); }
-                let ts_pb = if profile { Some(std::time::Instant::now()) } else { None };
                 {
                     let m = conv_k.min(n_batch);
                     for k in 0..m {
@@ -991,7 +991,10 @@ pub fn forward_batch_with_vision(
                     }
                     ssm.conv_head = (conv_head0 + n_batch) % conv_k;
                 }
-                // ---- Phase B: 48 条 v_head 状态链 (链等长 → 静态 stride 分块), 每链串行扫全 batch ----
+                // phase_a 计时含 Phase A scatter + 环形更新 (~0.5ms/prefill, 归属 A 的收尾工作)
+                if let Some(t) = ts_pa { p_ssm_phase_a += t.elapsed(); }
+                let ts_pb = if profile { Some(std::time::Instant::now()) } else { None };
+                // ---- Phase B: 48 条 v_head 状态链 (work-stealing, chunk=1 条链), 每链串行扫全 batch ----
                 {
                     let qkv2_a = ssm_qkv2_buf.as_ptr() as usize;
                     let state_a = ssm.state.as_mut_ptr() as usize;
@@ -1237,7 +1240,7 @@ pub fn forward_batch_with_vision(
         //    ★ 两 buffer 连续, 合并为单次调用 (消除 n_batch-1 次函数调用 + 尾部分支)
         //    ffn_dim=17408 是 8 的倍数, n_batch*ffn_dim 仍是 8 的倍数, 无尾处理
         //    ★ 并行化: 纯元素级操作 (silu(g)*u), 任一切分与单次全量调用逐元素一致;
-        //      大批量 (swiglu 段实测 110ms/142t 热态) 以 token 行为单元 work-stealing。
+        //      大批量 (重构前实测 110ms/142t 热态) 以 token 行为单元 work-stealing。
         let ts = if profile { Some(std::time::Instant::now()) } else { None };
         if use_parallel_serial {
             let pool = crate::model::workspace::get_thread_pool().unwrap();

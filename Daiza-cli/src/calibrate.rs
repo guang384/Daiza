@@ -78,7 +78,9 @@ impl Candidate {
 /// 子进程 [bench] 解析结果
 struct ChildBench {
     prefill_ms: f64,
-    /// 无 decode 段时为 NaN (`--max-tokens 1`)
+    /// decode 段 ms/tok。max_tokens ≥ 1 时 [bench] 总会输出 decode 行
+    /// (`decode(1t)=145ms (~145ms/tok)`), 但单 token 均值无统计意义 —
+    /// Stage 1 (max-tokens 1) 只用 prefill 指标, 不读此字段
     decode_ms_per_tok: f64,
 }
 
@@ -263,7 +265,8 @@ fn sweep_stage(
 }
 
 /// 确认门限: sweep 赢家 vs 默认, 4 轮交错 [赢,默,默,赢], 各取 min。
-/// 赢家 min 比默认 min 好 ≥ CONFIRM_GAIN_MIN 才返回 Some(winner), 否则 None。
+/// 赢家 min 比默认 min 好 ≥ CONFIRM_GAIN_MIN 时返回 Ok(true) (覆盖默认), 否则 Ok(false);
+/// 任一侧两轮均运行失败时保守返回 Ok(false)。
 #[allow(clippy::too_many_arguments)]
 fn confirm_override(
     env_key: &str,

@@ -21,7 +21,7 @@
 - **M-RoPE**:多模态 RoPE,文本推理时仅旋转时间维(22/64 维)
 - **Gated DeltaNet**:SSM 层使用 Gated Delta Rule 循环更新
 - **Qwen3.6 chat 模板**:支持 `<|im_start|>` 格式与 `mind` 思考模式标记
-- **DSpark 推测解码**:6 层 block-parallel drafter + Markov head + Leviathan rejection sampling,~5.5 tok/s
+- **DSpark 推测解码**:6 层 block-parallel drafter + Markov head + Leviathan rejection sampling;2-gram PLD 查表 drafter 零成本替代神经 drafter,decode 与纯 target 持速 (~7 tok/s)
 - **多线程并行**:持久线程池 (park/unpark 零分配),14 线程 GEMM 并行
 - **Qwen3-VL 多模态**:CLIP ViT (27 层) + qwen3vl_merger 投影器,支持图像输入,text-only decode 零退化
 
@@ -406,24 +406,51 @@ Vision prefill 从逐 token 注入 (132s) 改为分批 batched 注入 (MAX_VISIO
 
 这些设置用于 Bonsai 27B 所有 benchmark 结果(thinking mode)。
 
-## 📊 性能参考(纯 CPU,单 token decode)
+## 🏎️ 性能调优
+
+性能旋钮通过环境变量配置(进程级 OnceLock 缓存,启动时读取一次)。换硬件/散热条件后,
+用内置自调优一键找到推荐配置:
+
+```powershell
+# 交错子进程 sweep + 确认门限 (≥5% 优势才覆盖默认), 耗时 ~8-15 分钟
+.\target\release\daiza-cli.exe --model <gguf_path> --calibrate
+```
+
+核心旋钮:
+
+| 环境变量 | 作用 | 默认 | 225H 实测 |
+|----------|------|------|----------|
+| `DAIZA_GEMM_T_SUB` | prefill GEMM t-subdivision(×切片粒度:L2 驻留与 prep 重复的平衡) | 32 | 32 最优(孤立 bench 中 64/128 退化 2%/9%,E2E 打平) |
+| `DAIZA_ACTIVE_WORKERS` | 长跑活跃 worker 数(热平衡:超过热预算后降频反噬) | min(9, 全核) | 9 (13 线程: 4P+8E+2LP-E) |
+| `DAIZA_MATVEC_CHUNK` | decode matvec work-stealing 粒度 | 128 | 128 比 256 快 ~15%(E 核 straggler 尾巴更短) |
+
+> 笔记本等热耦合设备上短跑基准的槽位噪声可达 ±5%~50%;手动调参请用交错 A/B + min,
+> 或直接信任 `--calibrate` 的确认门限。
+
+## 📊 性能参考(纯 CPU)
 
 测试硬件:Intel Core Ultra 5 225H (Meteor Lake, 14 核, AVX2 + FMA, LPDDR5X-7467)
-测试条件:CPU turbo 频率,greedy/默认采样,短 prompt (≤30 tokens) + 48-64 tokens 生成
+测试条件:greedy 采样,142-token prompt
 
-| 模式 | 吞吐量 | 接受率 | 说明 |
-|------|--------|--------|------|
-| 纯基础模型 (无 DSpark) | ~6.24 tok/s | — | 64 层前向 ~160ms/tok |
-| DSpark 推测解码 | ~6.18 tok/s | ~100% (短序列) | drafter 53ms/call + target verify,与纯 target 持平 |
-| Vision (text-only,加载 mmproj) | ~6.22 tok/s | — | 加载 mmproj 对 text-only decode 零退化 |
-| Vision (with image) | ~5.78 tok/s | — | decode 173ms/tok,vision 一次性成本 (enc 8.2s + prefill 103s) |
+| 阶段 | 性能 | 说明 |
+|------|--------|------|
+| prefill (142 token) | ~10.0s (~71ms/token) | 达 FMA roofline ~95%(实测 ~715 GFLOPS vs 峰值 755) |
+| decode | ~143ms/token (7.0 tok/s) | Q1_0 LUT 内核 FMA port 饱和,V0-V6 变体空间已穷尽 |
 
-- decode 阶段:block 总耗时 ~155ms (attn 34ms + ssm 115ms + mlp 92ms) + lm_head 6ms
+- decode 阶段 block 分解(热态 profile):attn(16) ~34ms + ssm(48) ~102ms + mlp(64) ~85ms + lm_head 6ms,MLP 占 58% 已饱和
+- 内存带宽实测 ~120 GB/s;decode 为 compute-bound(带宽地板 ~29ms vs 实测 143ms),瓶颈在 LUT 查表的 FMA 吞吐而非带宽
 - 内存占用:~13 GB (Q1_0 权重) + ~1.3 GB (KV/SSM/激活) + ~1.6 GB (mmproj,可选)
-- DSpark 加速比:在 k=4 架构约束和 LPDDR5X 带宽瓶颈下,理论极限仅 1.10x (100% accept rate),短序列实测与纯 target 持平
+- prefill 优化战役(17 个 perf commit):GEMM dispatch 修复 + f16 scratch + L2 布局参数调优 +
+  串行段并行化(attention online softmax/SSM scan/swiglu 跨 token 并行)+ 混核 work-stealing,
+  16.4s → 10.0s (-39%);所有优化 greedy 逐字节一致,零质量损失
+- DSpark:n-gram PLD drafter 消除 53ms 神经 drafter 开销,decode 与纯 target 持速;
+  batched verify 经数据否决(Q1_0 LUT compute-bound 下无摊销空间,接受率 p=0.08 时效率 0.62×)
+- Vision:text-only 加载 mmproj 零退化;with-image 旧测 decode ~173ms/token,一次性成本
+  (ViT 编码 ~8s + vision prefill ~100s)——优化战役前测量,仅供参考
 
-**说明**:这是学习项目。当前性能已接近 LPDDR5X 单通道带宽极限 (~22 GB/s 实测 vs 60 GB/s 理论),
-MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](https://github.com/PrismML-Eng/llama.cpp)。
+**说明**:这是学习项目。纯 CPU + Q1_0 + 逐字节一致约束下,当前已触及本硬件极限
+(prefill 达 FMA roofline 95%,decode 达 LUT 内核 FMA port 饱和);进一步突破需 AVX-512/AMX(本机无)。
+商业部署请使用 [llama.cpp PrismML fork](https://github.com/PrismML-Eng/llama.cpp)。
 
 ## 🗺️ 路线图
 
@@ -435,8 +462,12 @@ MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](
 - [x] 多模态视觉输入(`Bonsai-27B-mmproj-Q8_0.gguf`)
 - [x] ViT encoder AVX2 向量化 + 线程池并行(173s/图 → 7.9s/图,22× 加速)
 - [x] Vision prefill batched(逐 token 注入 → 分批 64 个,132s → 100s,text-only 零退化)
+- [x] prefill GEMM 优化战役(17 个 perf commit,16.4s → 10.0s,-39%,逐字节一致):GEMM dispatch 修复、f16 scratch、L2 布局调优、串行段跨 token 并行、P/E/LP-E 混核 work-stealing
+- [x] `--calibrate` 自调优子命令(交错 sweep + 确认门限,一键输出推荐 env)
 
-> 路线图已完成。进一步加速需算法变更(drafter early exit / 减小 block_size / 共享 target tap 投影)或硬件升级(DDR5 双通道 / HBM),超出纯代码优化范围。KV cache 4-bit 量化经调研后判定不值得实施(KV cache 读取占带宽 <0.01%,4-bit 量化收益 <1%,且违反"不得降低模型精度"硬约束)。
+> 路线图已完成。纯 CPU + Q1_0 + 逐字节一致约束下已触及本硬件极限:prefill 达 FMA roofline ~95%,
+> decode 达 LUT 内核 FMA port 饱和(进一步突破需 AVX-512/AMX)。KV cache 4-bit 量化经调研后判定
+> 不值得实施(KV cache 读取占带宽 <0.01%,4-bit 量化收益 <1%,且违反"不得降低模型精度"硬约束)。
 
 ## 📚 参考资料
 
@@ -450,3 +481,5 @@ MLP 层占 58% 时间已饱和。商业部署请使用 [llama.cpp PrismML fork](
 ## 📄 许可证
 
 Apache-2.0(与上游 Bonsai 27B 模型一致)
+
+> AI生成

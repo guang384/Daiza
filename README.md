@@ -21,7 +21,7 @@ A learning project: from-scratch implementation of GGUF parsing, Q1_0 dequantiza
 - **M-RoPE**: multimodal RoPE; for text inference, only the time dimension (22/64 dims) is rotated.
 - **Gated DeltaNet**: SSM layers use Gated Delta Rule recurrent updates.
 - **Qwen3.6 chat template**: supports `<|im_start|>` format and `mind` thinking-mode marker.
-- **DSpark speculative decoding**: 6-layer block-parallel drafter + Markov head + Leviathan rejection sampling, ~5.5 tok/s.
+- **DSpark speculative decoding**: 6-layer block-parallel drafter + Markov head + Leviathan rejection sampling; the 2-gram PLD lookup drafter replaces the neural drafter at zero cost, decode on par with the pure target (~7 tok/s).
 - **Multi-threaded parallelism**: persistent thread pool (park/unpark zero-alloc), 14-thread GEMM parallelism.
 - **Qwen3-VL multimodal**: CLIP ViT (27 layers) + qwen3vl_merger projector, supports image input, zero-degradation text-only decode.
 
@@ -406,23 +406,44 @@ Vision prefill changed from per-token injection (132s) to batched injection (MAX
 
 These settings are used for all Bonsai 27B benchmark results (thinking mode).
 
-## 📊 Performance Reference (pure CPU, single-token decode)
+## 🏎️ Performance Tuning
+
+Performance knobs are configured via environment variables (process-level OnceLock cache, read once at startup). When switching hardware/thermal conditions, use the built-in auto-calibration:
+
+```powershell
+# Interleaved subprocess sweep + confirmation gate (≥5% advantage required to override the default), takes ~8-15 minutes
+.\target\release\daiza-cli.exe --model <gguf_path> --calibrate
+```
+
+Core knobs:
+
+| Env variable | Purpose | Default | Measured on 225H |
+|--------------|---------|---------|------------------|
+| `DAIZA_GEMM_T_SUB` | Prefill GEMM t-subdivision (×-slice granularity: balance between L2 residency and prep re-computation) | 32 | 32 optimal (64/128 degrade 2%/9% in isolated bench, on par E2E) |
+| `DAIZA_ACTIVE_WORKERS` | Active worker count for sustained decode (thermal balance: exceeding the thermal budget backfires via throttling) | min(9, all cores) | 9 (13 threads: 4P+8E+2LP-E) |
+| `DAIZA_MATVEC_CHUNK` | Decode matvec work-stealing granularity | 128 | 128 is ~15% faster than 256 (shorter E-core straggler tail) |
+
+> On thermally coupled devices (laptops), slot noise in short benchmark runs can reach ±5%~50%.
+> For manual tuning use interleaved A/B + min, or simply trust the `--calibrate` confirmation gate.
+
+## 📊 Performance Reference (pure CPU)
 
 Test hardware: Intel Core Ultra 5 225H (Meteor Lake, 14 cores, AVX2 + FMA, LPDDR5X-7467).
-Test conditions: CPU turbo frequency, greedy/default sampling, short prompt (≤30 tokens) + 48-64 tokens generated.
+Test conditions: greedy sampling, 142-token prompt.
 
-| Mode | Throughput | Accept rate | Notes |
-|------|------------|-------------|-------|
-| Base model only (no DSpark) | ~6.24 tok/s | — | 64-layer forward ~160ms/tok |
-| DSpark speculative decoding | ~6.18 tok/s | ~100% (short sequences) | drafter 53ms/call + target verify, on par with pure target |
-| Vision (text-only, mmproj loaded) | ~6.22 tok/s | — | Loading mmproj causes zero degradation to text-only decode |
-| Vision (with image) | ~5.78 tok/s | — | decode 173ms/tok, vision one-time cost (enc 8.2s + prefill 103s) |
+| Stage | Performance | Notes |
+|-------|-------------|-------|
+| Prefill (142 tokens) | ~10.0s (~71ms/token) | ~95% of the FMA roofline (~715 GFLOPS measured vs 755 peak) |
+| Decode | ~143ms/token (7.0 tok/s) | Q1_0 LUT kernel saturated at FMA ports; V0-V6 variant space exhausted |
 
-- Decode stage: total block time ~155ms (attn 34ms + ssm 115ms + mlp 92ms) + lm_head 6ms.
+- Decode block breakdown (hot-state profile): attn(16) ~34ms + ssm(48) ~102ms + mlp(64) ~85ms + lm_head 6ms; MLP takes 58% and is saturated.
+- Measured memory bandwidth ~120 GB/s; decode is compute-bound (bandwidth floor ~29ms vs 143ms measured) — the bottleneck is FMA throughput of the LUT lookups, not bandwidth.
 - Memory footprint: ~13 GB (Q1_0 weights) + ~1.3 GB (KV/SSM/activations) + ~1.6 GB (mmproj, optional).
-- DSpark speedup: under the k=4 architecture constraint and LPDDR5X bandwidth bottleneck, the theoretical limit is only 1.10× (100% accept rate); for short sequences the measured result is on par with the pure target.
+- Prefill optimization campaign (17 perf commits): GEMM dispatch fixes + f16 scratch + L2 layout tuning + serial-segment parallelization (attention online-softmax / SSM scan / swiglu across tokens) + heterogeneous work-stealing, 16.4s → 10.0s (-39%); all optimizations byte-identical under greedy, zero quality loss.
+- DSpark: the n-gram PLD drafter eliminates the 53ms neural-drafter overhead, decode on par with the pure target; batched verify was rejected by data (no amortization headroom with a compute-bound Q1_0 LUT decoder; efficiency 0.62× at acceptance rate p=0.08).
+- Vision: zero degradation for text-only with mmproj loaded; with-image previously measured ~173ms/token decode, one-time cost (ViT encoding ~8s + vision prefill ~100s) — pre-campaign measurements, for reference only.
 
-**Note**: This is a learning project. Current performance is already close to the LPDDR5X single-channel bandwidth limit (~22 GB/s measured vs 60 GB/s theoretical); the MLP layer, which accounts for 58% of time, is already saturated. For commercial deployment please use the [llama.cpp PrismML fork](https://github.com/PrismML-Eng/llama.cpp).
+**Note**: This is a learning project. Under the pure-CPU + Q1_0 + byte-identical constraints, the current implementation has reached this machine's limits (prefill at ~95% of the FMA roofline, decode at LUT-kernel FMA-port saturation); further breakthroughs require AVX-512/AMX (not available on this machine). For commercial deployment please use the [llama.cpp PrismML fork](https://github.com/PrismML-Eng/llama.cpp).
 
 ## 🗺️ Roadmap
 
@@ -434,8 +455,10 @@ Test conditions: CPU turbo frequency, greedy/default sampling, short prompt (≤
 - [x] Multimodal vision input (`Bonsai-27B-mmproj-Q8_0.gguf`)
 - [x] ViT encoder AVX2 vectorization + thread-pool parallelism (173s/image → 7.9s/image, 22× speedup)
 - [x] Vision prefill batched (per-token injection → batches of 64, 132s → 100s, zero text-only degradation)
+- [x] Prefill GEMM optimization campaign (17 perf commits, 16.4s → 10.0s, -39%, byte-identical): GEMM dispatch fixes, f16 scratch, L2 layout tuning, serial-segment parallelization across tokens, P/E/LP-E work-stealing
+- [x] `--calibrate` auto-calibration subcommand (interleaved sweep + confirmation gate, one-shot recommended env output)
 
-> The roadmap is complete. Further acceleration requires algorithmic changes (drafter early exit / smaller block_size / shared target tap projection) or hardware upgrades (DDR5 dual-channel / HBM), which are beyond the scope of pure code optimization. After investigation, KV cache 4-bit quantization was deemed not worth implementing (KV cache reads account for <0.01% of bandwidth; 4-bit quantization yields <1% and would violate the "must not reduce model accuracy" hard constraint).
+> The roadmap is complete. Under the pure-CPU + Q1_0 + byte-identical constraints the implementation has reached this machine's limits: prefill at ~95% of the FMA roofline, decode at LUT-kernel FMA-port saturation (further breakthroughs require AVX-512/AMX). After investigation, KV cache 4-bit quantization was deemed not worth implementing (KV cache reads account for <0.01% of bandwidth; 4-bit quantization yields <1% and would violate the "must not reduce model accuracy" hard constraint).
 
 ## 📚 References
 
@@ -449,3 +472,5 @@ Test conditions: CPU turbo frequency, greedy/default sampling, short prompt (≤
 ## 📄 License
 
 Apache-2.0 (consistent with the upstream Bonsai 27B model).
+
+> AI生成
