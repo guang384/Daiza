@@ -37,7 +37,7 @@
 //! 8 条独立 FMA 链恰好填满 2 FMA/cycle 的发射槽, 4c 延迟被完全遮盖。
 //!
 //! **四层 blocking (缓存层级对齐)**:
-//! - `r_block` (自适应 4..=32 行, scratch ~700KB 驻 L2): 权重 DRAM 只流一遍,
+//! - `r_block` (自适应 2..=64 行, scratch ~400KB 驻 L2): 权重 DRAM 只流一遍,
 //!   prep 一次, 供块内全部 token tile 复用
 //! - `t0` tile (4 token): 寄存器上限 (8 acc)
 //! - `g_block` (8 group): x 片段 4 token × 8 group × 512B = 16KB 驻 L1,
@@ -361,7 +361,7 @@ pub fn gemm_q1_0_batch(
         }
 
         let groups = cols / Q1_0_GROUP_SIZE;
-        // r_block: scratch ~700KB 为目标的自适应行块 (f16: 2 bytes/element)
+        // r_block: scratch ~400KB 为目标的自适应行块 (f16: 2 bytes/element)
         let r_block = (SCRATCH_TARGET_BYTES / (groups * Q1_0_GROUP_SIZE * 2))
             .clamp(2, R_BLOCK_MAX)
             & !1;

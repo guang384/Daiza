@@ -333,8 +333,13 @@ pub fn dot_product_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
 /// AVX2 水平求和: __m256 → f32 (纯寄存器内 SSE, 无 store)
 ///
 /// 公共实现, 替代 quant.rs / layernorm.rs / rmsnorm.rs / softmax.rs / ssm.rs /
-/// forward.rs / vision/weights.rs / vision/encoder.rs 中重复的 `hsum_ps` /
-/// `horizontal_sum_avx2` / `horizontal_sum_ps` 局部定义。
+/// forward.rs 中重复的 `hsum_ps` / `horizontal_sum_avx2` / `horizontal_sum_ps`
+/// 局部定义。
+///
+/// 注: vision/weights.rs 与 vision/encoder.rs 各保留一份局部 `hsum_ps`
+/// (带 `#[target_feature(enable = "avx2,fma")]`, 本函数为 `avx2` — hsum 不
+/// 使用 FMA 指令, 语义等价, 但 target_feature 差异可能影响内联决策;
+/// 避免跨 crate 边界改动的风险, 暂保留)。
 ///
 /// 算法: 把 256-bit 拆成两个 128-bit, 相加后用 movhdup + movhl 三步 reduce 到标量。
 /// 约 3 cycle (vs store + 7 次标量 add ~5c)。

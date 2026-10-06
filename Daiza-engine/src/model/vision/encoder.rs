@@ -103,12 +103,12 @@ unsafe fn attention_head_avx2(
         let scores_slice = std::slice::from_raw_parts_mut(scores, n_patches);
         softmax_inplace(scores_slice);
 
-        // attn_out += scores @ V (4-acc unroll for store throughput)
+        // attn_out += scores @ V (9-acc unroll: 9 × 8-lane = 72 = head_dim)
         let out_i = out.add(i * HD);
         for j in 0..n_patches {
             let w = _mm256_set1_ps(*scores.add(j));
             let v_j = v.add(j * HD);
-            // 72 = 4×16 + 8, 用 4-acc unroll 处理前 64, 单 acc 处理最后 8
+            // 72 = 9×8, 9 个独立 acc 完全填满 FMA pipeline
             let o0 = _mm256_loadu_ps(out_i);
             let o1 = _mm256_loadu_ps(out_i.add(8));
             let o2 = _mm256_loadu_ps(out_i.add(16));

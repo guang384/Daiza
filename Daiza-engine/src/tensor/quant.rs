@@ -19,8 +19,9 @@
 //! ## Q1_0 GEMM 当前方案: SIGN_LUT 查表 + AVX2 FMA
 //!
 //! 计算 `y = W x`,其中 W 是 Q1_0 矩阵。直接展开成 F32 会失去 Q1_0 的核心带宽优势。
-//! 当前采用 SIGN_LUT 查表方案: 16 字节符号位 → 2 次 `_mm256_shuffle_epi8` 查表
-//! 得到 8 个 ±1.0 f32,再 FMA 累加 x。详见 `SIGN_LUT` 注释与 `dot_q1_0_row_avx2`。
+//! 当前采用 SIGN_LUT 查表方案: 16 字节符号位 → 每 byte 1 次 `_mm256_loadu_ps`
+//! 从 256 项 LUT 取 8 个 ±1.0 f32, 再 FMA 累加 x。详见 `SIGN_LUT` 注释与
+//! `dot_q1_0_row_avx2`。
 //!
 //! 历史上曾尝试 BLENDV/sign-mask 方案,但 port 5 压力 + 4c 依赖链导致退化,已放弃。
 //! AVX-512 上的 popcount 位运算方案在本项目目标 CPU (Meteor Lake, 无 AVX-512) 不可用。
@@ -1373,8 +1374,8 @@ pub unsafe fn dot_q1_0_row_verify4t_avx2(
         let sign_ptr = data.as_ptr().add(block_start + 2);
         let xg = x_base.add(g * gstride); // token t 在 xg + t*128
 
-        // ★ 8 条独立 FMA 链 (每 token 2 链: 偶/奇 byte) + 手动全展开
-        //   16 bytes 平铺消除循环开销, 编译器静态调度 loads/FMA 交错。
+        // ★ 8 条独立 FMA 链 (每 token 2 链: 偶/奇 byte), 8 轮 while 循环 (r += 2)
+        //   编译器静态调度 loads/FMA 交错, 循环开销被 FMA 延迟完全遮盖。
         let mut g0a = _mm256_setzero_ps();
         let mut g1a = _mm256_setzero_ps();
         let mut g0b = _mm256_setzero_ps();
@@ -1383,7 +1384,7 @@ pub unsafe fn dot_q1_0_row_verify4t_avx2(
         let mut g1c = _mm256_setzero_ps();
         let mut g0d = _mm256_setzero_ps();
         let mut g1d = _mm256_setzero_ps();
-        // 手动展开的 8 轮 (原 (0..16).step_by(2))
+        // 8 轮循环 (r=0,2,..14, 每轮 2 bytes)
         let mut r = 0usize;
         while r < 16 {
             let lut0 = _mm256_loadu_ps(SIGN_LUT[*sign_ptr.add(r) as usize].0.as_ptr());

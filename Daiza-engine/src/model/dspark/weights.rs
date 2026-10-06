@@ -177,8 +177,8 @@ impl DrafterMatrix {
     /// Batched matvec: `y[t*rows + i] = dot(W_row_i, x[t*cols..(t+1)*cols])` 对 t ∈ 0..n_batch。
     ///
     /// ★ 同一 W 行被所有 n_batch 个 token 共享 (只 unpack 一次), 节省 (n_batch-1)/n_batch
-    /// 的权重读取带宽。Q4_1 走 batched AVX2 kernel (2-token 分块共享 nibble unpack +
-    /// d/m broadcast), 大矩阵多线程并行。n_batch=1 退化为普通 matvec。
+    /// 的权重读取带宽。Q4_1 走 batched AVX2 kernel (4-token 主循环共享 nibble unpack +
+    /// d/m broadcast, 余数 2/1-token fallback), 大矩阵多线程并行。n_batch=1 退化为普通 matvec。
     ///
     /// 布局: x = [n_batch, cols] row-major, y = [n_batch, rows] row-major。
     #[allow(unsafe_code)]
