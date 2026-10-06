@@ -61,13 +61,23 @@ struct Candidate {
 impl Candidate {
     fn explicit(v: String) -> Self {
         let label = v.clone();
-        Self { label, env_value: Some(v) }
+        Self {
+            label,
+            env_value: Some(v),
+        }
     }
     /// 编译期默认 (子进程 env_remove; 与硬编码默认值等价但不随代码漂移)
     fn default() -> Self {
-        Self { label: "默认".into(), env_value: None }
+        Self {
+            label: "默认".into(),
+            env_value: None,
+        }
     }
-    fn envs_for<'a>(&'a self, env_key: &'a str, base_envs: &'a [(&'a str, &'a str)]) -> Vec<(&'a str, Option<&'a str>)> {
+    fn envs_for<'a>(
+        &'a self,
+        env_key: &'a str,
+        base_envs: &'a [(&'a str, &'a str)],
+    ) -> Vec<(&'a str, Option<&'a str>)> {
         let mut envs: Vec<(&str, Option<&str>)> =
             base_envs.iter().map(|(k, v)| (*k, Some(*v))).collect();
         match &self.env_value {
@@ -96,11 +106,14 @@ fn run_child(
 ) -> Result<ChildBench, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(exe);
-    cmd.arg("--model").arg(model)
-        .arg("--prompt").arg(prompt)
-        .arg("--max-tokens").arg(max_tokens.to_string())
+    cmd.arg("--model")
+        .arg(model)
+        .arg("--prompt")
+        .arg(prompt)
+        .arg("--max-tokens")
+        .arg(max_tokens.to_string())
         .arg("--greedy")
-        .stdout(std::process::Stdio::null())   // 生成文本不进终端
+        .stdout(std::process::Stdio::null()) // 生成文本不进终端
         .stderr(std::process::Stdio::piped()); // [bench] 行在 stderr
     for v in SWEPT_VARS {
         cmd.env_remove(v);
@@ -138,7 +151,10 @@ fn run_child(
     if prefill_ms.is_nan() {
         return Err("未找到 [bench] prefill 行".into());
     }
-    Ok(ChildBench { prefill_ms, decode_ms_per_tok: decode_ms })
+    Ok(ChildBench {
+        prefill_ms,
+        decode_ms_per_tok: decode_ms,
+    })
 }
 
 /// `[bench] load=2239ms prefill(142t)=10715ms (~75ms/tok)` → 10715
@@ -237,7 +253,13 @@ fn sweep_stage(
     let order: Vec<usize> = (0..n).chain((0..n).rev()).collect();
     for &ci in &order {
         if let Some(m) = bench_once(
-            model, prompt, max_tokens, env_key, &candidates[ci], base_envs, metric,
+            model,
+            prompt,
+            max_tokens,
+            env_key,
+            &candidates[ci],
+            base_envs,
+            metric,
         ) {
             samples[ci].push(m);
         }
@@ -247,7 +269,11 @@ fn sweep_stage(
         println!(
             "  汇总 {label:<10} 样本 [{vals}] → min {min:.1} {unit}",
             label = candidates[ci].label,
-            vals = s.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join("/"),
+            vals = s
+                .iter()
+                .map(|v| format!("{v:.0}"))
+                .collect::<Vec<_>>()
+                .join("/"),
             min = s.iter().cloned().reduce(f64::min).unwrap_or(f64::INFINITY),
             unit = metric.unit(),
         );
@@ -257,13 +283,19 @@ fn sweep_stage(
         .enumerate()
         .filter(|(_, s)| !s.is_empty())
         .min_by(|a, b| {
-            a.1.iter().cloned().reduce(f64::min).unwrap()
+            a.1.iter()
+                .cloned()
+                .reduce(f64::min)
+                .unwrap()
                 .partial_cmp(&b.1.iter().cloned().reduce(f64::min).unwrap())
                 .unwrap()
         })
         .map(|(i, _)| i)
         .ok_or_else(|| format!("{title}: 所有候选均失败"))?;
-    println!("  → sweep 初筛最优: {label}", label = candidates[winner].label);
+    println!(
+        "  → sweep 初筛最优: {label}",
+        label = candidates[winner].label
+    );
     Ok((winner, samples))
 }
 
@@ -344,7 +376,15 @@ fn calibrate_knob(
     metric: Metric,
 ) -> Result<Candidate, String> {
     let (winner_idx, _) = sweep_stage(
-        title, env_key, candidates, base_envs, model, prompt, sweep_tokens, cooldown, metric,
+        title,
+        env_key,
+        candidates,
+        base_envs,
+        model,
+        prompt,
+        sweep_tokens,
+        cooldown,
+        metric,
     )?;
     if winner_idx == default_idx {
         println!("  → 与默认一致, 无需覆盖");
@@ -361,13 +401,19 @@ fn calibrate_knob(
         cooldown,
         metric,
     )?;
-    Ok(if confirmed { candidates[winner_idx].clone() } else { candidates[default_idx].clone() })
+    Ok(if confirmed {
+        candidates[winner_idx].clone()
+    } else {
+        candidates[default_idx].clone()
+    })
 }
 
 /// `--calibrate` 入口
 pub fn run(model: &Path, prompt: Option<&str>) -> Result<(), String> {
     let prompt = prompt.unwrap_or(DEFAULT_PROMPT);
-    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
     let n_workers = n_threads.saturating_sub(1).max(1);
     println!("[calibrate] 逻辑核 {n_threads} ({n_workers} worker + main)");
     println!(
@@ -405,11 +451,21 @@ pub fn run(model: &Path, prompt: Option<&str>) -> Result<(), String> {
     }];
     for off in [0usize, 2, 4, 6] {
         let v = n_workers.saturating_sub(off).max(1);
-        if aw_cands.iter().any(|c| c.env_value.as_deref() == Some(v.to_string().as_str())) {
+        if aw_cands
+            .iter()
+            .any(|c| c.env_value.as_deref() == Some(v.to_string().as_str()))
+        {
             continue;
         }
-        let label = if off == 0 { format!("{v} (全核)") } else { v.to_string() };
-        aw_cands.push(Candidate { label, env_value: Some(v.to_string()) });
+        let label = if off == 0 {
+            format!("{v} (全核)")
+        } else {
+            v.to_string()
+        };
+        aw_cands.push(Candidate {
+            label,
+            env_value: Some(v.to_string()),
+        });
     }
     let aw = calibrate_knob(
         "Stage 2/3: ACTIVE_WORKERS (decode 热平衡)",
@@ -452,9 +508,21 @@ pub fn run(model: &Path, prompt: Option<&str>) -> Result<(), String> {
     // ---- 报告 ----
     println!();
     println!("[calibrate] ─────────── 推荐配置 ───────────");
-    print_env_line("DAIZA_GEMM_T_SUB", tsub.env_value.as_ref(), "prefill GEMM t-subdivision");
-    print_env_line("DAIZA_ACTIVE_WORKERS", aw.env_value.as_ref(), "长跑热平衡 (worker 数, 不含 main)");
-    print_env_line("DAIZA_MATVEC_CHUNK", chunk.env_value.as_ref(), "decode matvec work-stealing 粒度");
+    print_env_line(
+        "DAIZA_GEMM_T_SUB",
+        tsub.env_value.as_ref(),
+        "prefill GEMM t-subdivision",
+    );
+    print_env_line(
+        "DAIZA_ACTIVE_WORKERS",
+        aw.env_value.as_ref(),
+        "长跑热平衡 (worker 数, 不含 main)",
+    );
+    print_env_line(
+        "DAIZA_MATVEC_CHUNK",
+        chunk.env_value.as_ref(),
+        "decode matvec work-stealing 粒度",
+    );
     println!();
     println!("[calibrate] 与默认一致时无需设置; 上述 $env: 行可直接粘贴到当前会话, 写入 $PROFILE 可持久化。");
     println!("[calibrate] 注意: decode 为短跑近似指标, 长跑稳态以实际 workload 验证为准;");

@@ -1042,6 +1042,8 @@ pub unsafe fn dot_q1_0_row_batch_avx2(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
+// 4 行展开的 row-0 项刻意保留 `0 *` 前缀, 与 row1/2/3 保持对称可读
+#[allow(clippy::erasing_op)]
 #[inline]
 pub unsafe fn dot_q1_0_row_batch4_avx2(
     data: &[u8],

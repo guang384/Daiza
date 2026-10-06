@@ -303,25 +303,22 @@ fn start_backend(
         }
     });
 
-    // 等待后台线程确认进入 accept 循环 (ready_rx) 或出错 (err_rx)
+    // 等待后台线程确认进入 accept 循环 (ready_rx) 或出错 (err_rx) — 单次等待, 无重试
     // 这是唯一可靠的就绪检测: TCP connect 成功只代表 listener 已 bind,
     // 不代表后端在 accept (backlog 会自动完成三次握手)
-    loop {
-        match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(()) => {
-                eprintln!("[daiza-app] Backend accept loop ready.");
-                break;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err("Backend service startup timed out (10s), please check logs".to_string());
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // 后台线程已退出, 检查是否留下了错误信息
-                return Err(match err_rx.try_recv() {
-                    Ok(err) => format!("Backend service failed to start: {err}"),
-                    Err(_) => "Backend thread exited unexpectedly".to_string(),
-                });
-            }
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(()) => {
+            eprintln!("[daiza-app] Backend accept loop ready.");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err("Backend service startup timed out (10s), please check logs".to_string());
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            // 后台线程已退出, 检查是否留下了错误信息
+            return Err(match err_rx.try_recv() {
+                Ok(err) => format!("Backend service failed to start: {err}"),
+                Err(_) => "Backend thread exited unexpectedly".to_string(),
+            });
         }
     }
 

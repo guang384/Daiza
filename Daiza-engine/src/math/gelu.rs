@@ -126,7 +126,7 @@ const ERF_A2: f32 = -0.284496736;
 const ERF_A3: f32 = 1.421413741;
 const ERF_A4: f32 = -1.453152027;
 const ERF_A5: f32 = 1.061405429;
-const INV_SQRT_2: f32 = 0.7071067811865476; // 1/sqrt(2)
+const INV_SQRT_2: f32 = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2)
 
 /// AVX2 精确 GELU 内核 (erf 版本)
 #[target_feature(enable = "avx2,fma")]

@@ -4,13 +4,10 @@
 # 学习项目,不考虑二进制可移植性。
 rustflags = ["-C", "target-cpu=native"]
 
-# 国内镜像源 (rsproxy 字节跳动, sparse 协议最快)
-# 修复国内访问 crates.io 慢/失败的问题
-[source.crates-io]
-replace-with = "rsproxy-sparse"
-
-[source.rsproxy-sparse]
-registry = "sparse+https://rsproxy.cn/index/"
-
-[source.rsproxy]
-registry = "https://rsproxy.cn/crates.io-index"
+# 国内网络访问 crates.io 慢/失败时,可自行启用 rsproxy 镜像
+# (默认注释: 不强制所有构建者经第三方镜像拉取依赖)
+# [source.crates-io]
+# replace-with = "rsproxy-sparse"
+#
+# [source.rsproxy-sparse]
+# registry = "sparse+https://rsproxy.cn/index/"

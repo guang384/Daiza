@@ -51,6 +51,8 @@ unsafe fn hsum_ps(v: __m256) -> f32 {
 /// - y.len() >= 8
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
+// 8 行展开的 row-0 项刻意保留 `0 *` 前缀, 与 row1..7 保持对称可读
+#[allow(clippy::erasing_op)]
 #[inline]
 unsafe fn dot_8rows_avx2(rows: *const f32, x: *const f32, y: *mut f32, k: usize) {
     let mut acc = [_mm256_setzero_ps(); 8];
@@ -84,6 +86,7 @@ unsafe fn dot_8rows_avx2(rows: *const f32, x: *const f32, y: *mut f32, k: usize)
 /// AVX2 8-row dot product kernel (累加版): y[i] += dot(rows[i*k..], x[0..k])
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
+#[allow(clippy::erasing_op)] // 8 行展开的 row-0 项刻意保留 `0 *` 前缀 (同 dot_8rows_avx2)
 #[inline]
 unsafe fn dot_8rows_add_avx2(rows: *const f32, x: *const f32, y: *mut f32, k: usize) {
     let mut acc = [_mm256_setzero_ps(); 8];
