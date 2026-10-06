@@ -226,8 +226,8 @@ impl VisionMatrix {
         const I_TILE: usize = 8;   // 8 output rows per tile (匹配 AVX2 8-row kernel)
         const P_TILE: usize = 64;  // 64 patches per tile
 
-        let n_i_tiles = (n + I_TILE - 1) / I_TILE;
-        let n_p_tiles = (n_batch + P_TILE - 1) / P_TILE;
+        let n_i_tiles = n.div_ceil(I_TILE);
+        let n_p_tiles = n_batch.div_ceil(P_TILE);
         let total_tiles = n_i_tiles * n_p_tiles;
 
         let pool = get_thread_pool().unwrap();
@@ -305,8 +305,8 @@ impl VisionMatrix {
         const I_TILE: usize = 8;
         const P_TILE: usize = 64;
 
-        let n_i_tiles = (n + I_TILE - 1) / I_TILE;
-        let n_p_tiles = (n_batch + P_TILE - 1) / P_TILE;
+        let n_i_tiles = n.div_ceil(I_TILE);
+        let n_p_tiles = n_batch.div_ceil(P_TILE);
         let total_tiles = n_i_tiles * n_p_tiles;
 
         let pool = get_thread_pool().unwrap();

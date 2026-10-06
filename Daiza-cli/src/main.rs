@@ -1040,7 +1040,7 @@ fn main() -> Result<()> {
             println!("\n--- last 200 bytes (hex) ---");
             for i in tail_start..bytes.len() {
                 print!("{:02x} ", bytes[i]);
-                if (i - tail_start + 1) % 16 == 0 {
+                if (i - tail_start + 1).is_multiple_of(16) {
                     println!();
                 }
             }

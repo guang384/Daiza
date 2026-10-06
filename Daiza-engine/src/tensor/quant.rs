@@ -788,7 +788,7 @@ pub fn dot_q1_0_row_scalar(data: &[u8], row_idx: usize, n_cols: usize, x: &[f32]
 /// 将 F32 向量量化为简化 Q8_0 字节流
 /// 格式: 每 32 值一组, 4 字节 f32 scale + 32 字节 int8 values = 36 字节/block
 pub fn quantize_f32_to_q8_0_simple(x: &[f32]) -> Vec<u8> {
-    debug_assert!(x.len() % 32 == 0, "Q8_0 requires len % 32 == 0, got {}", x.len());
+    debug_assert!(x.len().is_multiple_of(32), "Q8_0 requires len % 32 == 0, got {}", x.len());
     let n_blocks = x.len() / 32;
     let mut out = vec![0u8; n_blocks * 36];
     for b in 0..n_blocks {
@@ -1599,7 +1599,7 @@ pub unsafe fn dot_q4_1_row_avx2(
     let row_byte_offset = row_idx * (groups_per_row * Q4_1_BLOCK_BYTES);
 
     let mut acc_vec = _mm256_setzero_ps();
-    let nibble_mask = _mm_set1_epi8(0x0F as i8);
+    let nibble_mask = _mm_set1_epi8(0x0F);
 
     for g in 0..groups_per_row {
         let bs = row_byte_offset + g * Q4_1_BLOCK_BYTES;
@@ -1694,7 +1694,7 @@ pub unsafe fn dot_q4_1_row_batch_avx2(
     use std::arch::x86_64::*;
     let groups_per_row = n_cols / Q4_1_GROUP_SIZE;
     let row_byte_offset = row_idx * (groups_per_row * Q4_1_BLOCK_BYTES);
-    let nibble_mask = _mm_set1_epi8(0x0F as i8);
+    let nibble_mask = _mm_set1_epi8(0x0F);
 
     let mut t_start = 0usize;
 
@@ -1862,7 +1862,7 @@ pub fn dot_q4_1_row_batch(
 /// 反量化 `x' = qs[i] * d`。
 pub fn quantize_dequantize_q8_0_into(x: &[f32], y: &mut [f32]) {
     debug_assert_eq!(x.len(), y.len());
-    debug_assert!(x.len() % 32 == 0, "Q8_0 requires len % 32 == 0, got {}", x.len());
+    debug_assert!(x.len().is_multiple_of(32), "Q8_0 requires len % 32 == 0, got {}", x.len());
     let n_blocks = x.len() / 32;
     for b in 0..n_blocks {
         let off = b * 32;

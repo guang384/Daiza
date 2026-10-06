@@ -278,7 +278,7 @@ fn forward_single_token_core(
                 cfg,
                 Some(kv),
                 None,
-                (&cos, &sin),
+                (cos, sin),
                 &mut ctx.workspace,
             );
         } else {
@@ -290,7 +290,7 @@ fn forward_single_token_core(
                 cfg,
                 None,
                 Some(ssm),
-                (&cos, &sin),
+                (cos, sin),
                 &mut ctx.workspace,
             );
         }
@@ -1177,7 +1177,7 @@ pub fn forward_batch_with_vision(
                     let nvh = num_v_heads;
                     let eps = l2norm_eps;
 
-                    let chunk = (num_v_heads + n_threads - 1) / n_threads;
+                    let chunk = num_v_heads.div_ceil(n_threads);
                     pool.scatter_wait(n_threads, move |tid| {
                         let start_vh = tid * chunk;
                         let end_vh = (start_vh + chunk).min(nvh);

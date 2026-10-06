@@ -110,7 +110,7 @@ pub fn project_vision(
     // ★ P2: 内层标量循环改 AVX2 saxpy (y = 1.0*bias + y)
     //   merged_hidden=4608, 576 patch × 576c 标量 ≈ 33Kc → AVX2 72c × 576 = 41Kc
     //   注: saxpy_avx2 要求 len 为 8 的倍数 (merged_hidden=4608=8×576 ✓)
-    debug_assert!(merged_hidden % 8 == 0, "merged_hidden must be 8-aligned for saxpy_avx2");
+    debug_assert!(merged_hidden.is_multiple_of(8), "merged_hidden must be 8-aligned for saxpy_avx2");
     for m in 0..n_merged {
         let y = &mut pctx.mm_0_out[m * merged_hidden..(m + 1) * merged_hidden];
         crate::math::simd_exp::saxpy_avx2(1.0, mm_0_b, y, merged_hidden);
@@ -137,7 +137,7 @@ pub fn project_vision(
 
     // + bias (per-patch)
     // ★ P2: 内层标量循环改 AVX2 saxpy (proj_dim=5120=8×640 ✓)
-    debug_assert!(proj_dim % 8 == 0, "proj_dim must be 8-aligned for saxpy_avx2");
+    debug_assert!(proj_dim.is_multiple_of(8), "proj_dim must be 8-aligned for saxpy_avx2");
     for m in 0..n_merged {
         let y = &mut pctx.projected[m * proj_dim..(m + 1) * proj_dim];
         crate::math::simd_exp::saxpy_avx2(1.0, mm_2_b, y, proj_dim);

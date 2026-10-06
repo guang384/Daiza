@@ -92,7 +92,7 @@ impl DrafterMatrix {
                 // 大矩阵多线程并行
                 let pool = get_thread_pool().unwrap();
                 let n_threads = pool.n_threads();
-                let chunk = (n + n_threads - 1) / n_threads;
+                let chunk = n.div_ceil(n_threads);
                 let bytes_addr = self.bytes.as_ptr() as usize;
                 let bytes_len = self.bytes.len();
                 let x_addr = x.as_ptr() as usize;
@@ -137,7 +137,7 @@ impl DrafterMatrix {
                 }
                 let pool = get_thread_pool().unwrap();
                 let n_threads = pool.n_threads();
-                let chunk = (n + n_threads - 1) / n_threads;
+                let chunk = n.div_ceil(n_threads);
                 let bytes_addr = self.bytes.as_ptr() as usize;
                 let bytes_len = self.bytes.len();
                 let x_addr = x.as_ptr() as usize;
@@ -233,7 +233,7 @@ impl DrafterMatrix {
                 // 大矩阵多线程并行 (按行分块, 每行计算 n_batch 个输出)
                 let pool = get_thread_pool().unwrap();
                 let n_threads = pool.n_threads();
-                let chunk = (n + n_threads - 1) / n_threads;
+                let chunk = n.div_ceil(n_threads);
                 let bytes_addr = self.bytes.as_ptr() as usize;
                 let bytes_len = self.bytes.len();
                 let x_addr = x.as_ptr() as usize;

@@ -849,7 +849,8 @@ fn session_reply_with_vision_inner(
             }
         }
         if !broke {
-            if let Some(cb) = on_delta.as_deref_mut() {
+            // on_delta 末次使用, 直接 move 出 Option (as_deref_mut 的 deref 目标与原类型相同, 无意义)
+            if let Some(cb) = on_delta {
                 if !pending_bytes.is_empty() {
                     let tail = String::from_utf8_lossy(&pending_bytes);
                     if !tail.is_empty() { cb(&tail); }

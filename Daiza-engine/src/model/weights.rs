@@ -297,7 +297,7 @@ impl Q1_0Matrix {
         // 回退: std::thread::scope
         let bytes = &self.bytes;
         std::thread::scope(|s| {
-            let chunk = (n + n_threads - 1) / n_threads;
+            let chunk = n.div_ceil(n_threads);
             let mut handles = Vec::with_capacity(n_threads);
             let mut row_start = 0usize;
             for y_chunk in y.chunks_mut(chunk) {
@@ -437,7 +437,7 @@ impl Q1_0Matrix {
         // 回退: std::thread::scope
         let bytes = &self.bytes;
         std::thread::scope(|s| {
-            let chunk = (n + n_threads - 1) / n_threads;
+            let chunk = n.div_ceil(n_threads);
             let mut handles = Vec::with_capacity(n_threads);
             let mut row_start = 0usize;
             for y_chunk in y.chunks_mut(chunk) {
@@ -551,7 +551,7 @@ impl Q1_0Matrix {
             let bytes_len = self.bytes.len();
             let x_addr = x.as_ptr() as usize;
             let y_addr = y.as_mut_ptr() as usize;
-            let chunk = (n + n_threads - 1) / n_threads;
+            let chunk = n.div_ceil(n_threads);
 
             pool.scatter_wait(n_threads, move |tid| {
                 let start = tid * chunk;
@@ -629,7 +629,7 @@ impl Q1_0Matrix {
         let bytes = &self.bytes;
         let y_addr = y.as_mut_ptr() as usize;
         std::thread::scope(|s| {
-            let chunk = (n + n_threads - 1) / n_threads;
+            let chunk = n.div_ceil(n_threads);
             let mut handles = Vec::with_capacity(n_threads);
             for tid in 0..n_threads {
                 let start = tid * chunk;
@@ -995,7 +995,7 @@ impl Q1_0Matrix {
             crate::tensor::gemm::gemm_q1_0_batch(&self.bytes, n, n_cols, x, n_batch, &mut tmp);
             // y[t][i] += tmp[t][i] — AVX2 向量化 (n=5120 是 8 的倍数, 无尾处理)
             #[cfg(target_arch = "x86_64")]
-            if crate::tensor::quant::avx2_q1_0_available() && n % 8 == 0 {
+            if crate::tensor::quant::avx2_q1_0_available() && n.is_multiple_of(8) {
                 use std::arch::x86_64::*;
                 unsafe {
                     for t in 0..n_batch {
@@ -1079,7 +1079,7 @@ impl Q1_0Matrix {
             let bytes_len = self.bytes.len();
             let x_addr = x.as_ptr() as usize;
             let y_addr = y.as_mut_ptr() as usize;
-            let chunk = (n + n_threads - 1) / n_threads;
+            let chunk = n.div_ceil(n_threads);
 
             pool.scatter_wait(n_threads, move |tid| {
                 let start = tid * chunk;
@@ -1155,7 +1155,7 @@ impl Q1_0Matrix {
         let bytes = &self.bytes;
         let y_addr = y.as_mut_ptr() as usize;
         std::thread::scope(|s| {
-            let chunk = (n + n_threads - 1) / n_threads;
+            let chunk = n.div_ceil(n_threads);
             let mut handles = Vec::with_capacity(n_threads);
             for tid in 0..n_threads {
                 let start = tid * chunk;

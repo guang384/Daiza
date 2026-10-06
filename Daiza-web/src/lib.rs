@@ -924,7 +924,7 @@ fn handle_chat_dspark(
                 DsparkEvent::Draft(text) => {
                     // 乐观显示: 前端灰色显示 drafter 预测文本
                     // token 数近似: draft 文本字符数 / 2 (中英文混合粗估)
-                    *n_tokens += (text.chars().count() + 1) / 2;
+                    *n_tokens += text.chars().count().div_ceil(2);
                     let payload = format!("{{\"text\":\"{}\"}}", json_escape(&text));
                     sse_write(stream, "draft", &payload)
                 }
