@@ -944,6 +944,11 @@ pub unsafe fn dot_q1_0_row_batch_avx2(
     let mut t_start = 0usize;
     while t_start < n_batch {
         let has_pair = t_start + 1 < n_batch;
+        // ★ 第二 token 行步长: 无配对时置 0 (= x_base0, 界内且不参与任何 load)。
+        //   ptr::add 计算越过 one-past-end 的指针本身即 UB (即使从不解引用),
+        //   奇数 n_batch 的最后一个单 token 会越界; has_pair 为循环不变量, 分支
+        //   完全可预测, 且 GEP 数学与原式逐字节一致 (x_base0 + x_stride == 原 x_base1)。
+        let x_step1 = if has_pair { x_stride } else { 0 };
 
         // 行级累加器 (跨 group 累加, 行末一次 hsum)
         let mut row_acc0 = _mm256_setzero_ps();
@@ -960,9 +965,7 @@ pub unsafe fn dot_q1_0_row_batch_avx2(
             let scale_v = _mm256_cvtph_ps(_mm_set1_epi16(scale_bits as i16));
             let sign_ptr = data.as_ptr().add(block_start + 2);
             let x_base0 = x.as_ptr().add(t_start * x_stride + g * Q1_0_GROUP_SIZE);
-            let x_base1 = x
-                .as_ptr()
-                .add((t_start + 1) * x_stride + g * Q1_0_GROUP_SIZE);
+            let x_base1 = x_base0.add(x_step1);
 
             // group 级 4 路并行 acc (每 token 一组)
             let mut g0a = _mm256_setzero_ps();
