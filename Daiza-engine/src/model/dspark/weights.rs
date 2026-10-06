@@ -78,13 +78,13 @@ impl DrafterMatrix {
                 if n < 64 || get_thread_pool().is_none() {
                     #[cfg(target_arch = "x86_64")]
                     if use_avx2 {
-                        for i in 0..n {
-                            unsafe { y[i] = dot_q4_1_row_avx2(&self.bytes, i, k, x); }
+                        for (i, y_i) in y.iter_mut().enumerate() {
+                            unsafe { *y_i = dot_q4_1_row_avx2(&self.bytes, i, k, x); }
                         }
                         return;
                     }
-                    for i in 0..n {
-                        y[i] = dot_q4_1_row_scalar(&self.bytes, i, k, x);
+                    for (i, y_i) in y.iter_mut().enumerate() {
+                        *y_i = dot_q4_1_row_scalar(&self.bytes, i, k, x);
                     }
                     return;
                 }
@@ -117,21 +117,21 @@ impl DrafterMatrix {
                 });
             }
             TensorType::Q1_0 => {
-                for i in 0..n {
-                    y[i] = dot_q1_0_row_scalar(&self.bytes, i, k, x);
+                for (i, y_i) in y.iter_mut().enumerate() {
+                    *y_i = dot_q1_0_row_scalar(&self.bytes, i, k, x);
                 }
             }
             TensorType::Iq1M => {
-                for i in 0..n {
-                    y[i] = dot_iq1m_row_scalar(&self.bytes, i, k, x);
+                for (i, y_i) in y.iter_mut().enumerate() {
+                    *y_i = dot_iq1m_row_scalar(&self.bytes, i, k, x);
                 }
             }
             TensorType::Bf16 => {
                 // BF16 行优先: 每 element 2 字节, 高 16 位 = f32 高 16 位
                 // 大矩阵 (markov_w1 127MB, log_snr_fc2_w 52MB) 走多线程
                 if n < 64 || get_thread_pool().is_none() {
-                    for i in 0..n {
-                        y[i] = dot_bf16_row_scalar(&self.bytes, i, k, x);
+                    for (i, y_i) in y.iter_mut().enumerate() {
+                        *y_i = dot_bf16_row_scalar(&self.bytes, i, k, x);
                     }
                     return;
                 }
@@ -154,19 +154,20 @@ impl DrafterMatrix {
             }
             TensorType::F32 => {
                 // F32 行优先: bytes 当 f32 读
-                for i in 0..n {
+                for (i, y_i) in y.iter_mut().enumerate() {
                     let row_off = i * k * 4;
                     let mut acc = 0.0f32;
-                    for j in 0..k {
+                    for (j, &xj) in x[..k].iter().enumerate() {
+                        let bo = row_off + j * 4;
                         let b = [
-                            self.bytes[row_off + j * 4],
-                            self.bytes[row_off + j * 4 + 1],
-                            self.bytes[row_off + j * 4 + 2],
-                            self.bytes[row_off + j * 4 + 3],
+                            self.bytes[bo],
+                            self.bytes[bo + 1],
+                            self.bytes[bo + 2],
+                            self.bytes[bo + 3],
                         ];
-                        acc += f32::from_le_bytes(b) * x[j];
+                        acc += f32::from_le_bytes(b) * xj;
                     }
-                    y[i] = acc;
+                    *y_i = acc;
                 }
             }
             _ => panic!("unsupported drafter dtype: {:?}", self.dtype),

@@ -474,9 +474,11 @@ pub fn forward_batch_with_vision(
         }
         debug_assert_eq!(out_idx, n_batch);
     } else {
-        for t in 0..n_input {
-            ctx.weights.global.token_embd
-                .row_into_slice(token_ids[t] as usize, &mut ctx.h_buf[t * hidden..(t + 1) * hidden]);
+        for (&tid, h_row) in token_ids[..n_input]
+            .iter()
+            .zip(ctx.h_buf.chunks_exact_mut(hidden))
+        {
+            ctx.weights.global.token_embd.row_into_slice(tid as usize, h_row);
         }
     }
     if let Some(t) = t0 { p_emb = t.elapsed(); }

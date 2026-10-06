@@ -116,8 +116,8 @@ unsafe fn l2norm_inplace_avx2(x: &mut [f32], eps: f32) {
         i += 8;
     }
     let mut ss = hsum_ps(ss_v);
-    for j in n8..n {
-        ss += x[j] * x[j];
+    for &v in &x[n8..n] {
+        ss += v * v;
     }
     // Pass 2: scale
     let inv_norm = 1.0 / (ss + eps).sqrt();
@@ -129,8 +129,8 @@ unsafe fn l2norm_inplace_avx2(x: &mut [f32], eps: f32) {
         _mm256_storeu_ps(x.as_mut_ptr().add(i), r);
         i += 8;
     }
-    for j in n8..n {
-        x[j] *= inv_norm;
+    for xj in &mut x[n8..n] {
+        *xj *= inv_norm;
     }
 }
 
@@ -323,8 +323,8 @@ pub(crate) fn ssm_output_gate_head(
         return;
     }
     let mut ss = 0.0f32;
-    for i in 0..head_dim {
-        ss += y[i] * y[i];
+    for &v in &y[..head_dim] {
+        ss += v * v;
     }
     let inv_rms = 1.0 / (ss / head_dim as f32 + eps).sqrt();
     for i in 0..head_dim {

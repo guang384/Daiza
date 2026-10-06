@@ -1858,8 +1858,8 @@ fn sample_bonus(
     }
     // 转为 logits (log of residual prob) 供 top_k_top_p 采样
     let inv = 1.0 / sum;
-    for i in 0..vocab {
-        residual[i] = (residual[i] * inv).ln();
+    for r in &mut residual[..vocab] {
+        *r = (*r * inv).ln();
     }
     sample_top_k_top_p_into(residual, params, rng, sampling_buf)
 }

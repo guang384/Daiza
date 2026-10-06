@@ -486,18 +486,17 @@ fn forward_vit_block(
                 let scores = std::slice::from_raw_parts_mut(scores_h, n_patches);
                 for i in 0..n_patches {
                     let q_i = std::slice::from_raw_parts(q_h.add(i * head_dim), head_dim);
-                    for j in 0..n_patches {
+                    for (j, sc_j) in scores.iter_mut().enumerate() {
                         let k_j = std::slice::from_raw_parts(k_h.add(j * head_dim), head_dim);
                         let mut s = 0.0f32;
                         for d in 0..head_dim {
                             s += q_i[d] * k_j[d];
                         }
-                        scores[j] = s * scale;
+                        *sc_j = s * scale;
                     }
                     softmax_inplace(&mut scores[..n_patches]);
                     let out_i_base = (h * n_patches + i) * head_dim;
-                    for j in 0..n_patches {
-                        let w = scores[j];
+                    for (j, &w) in scores[..n_patches].iter().enumerate() {
                         let v_j = std::slice::from_raw_parts(v_h.add(j * head_dim), head_dim);
                         let out_i = std::slice::from_raw_parts_mut(attn_out_ptr.as_ptr().add(out_i_base), head_dim);
                         for d in 0..head_dim {

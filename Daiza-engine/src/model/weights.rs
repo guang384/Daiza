@@ -146,8 +146,8 @@ impl Q1_0Matrix {
             if use_int_kernel {
                 // ★ 整数乘加 kernel (模仿 llama.cpp)
                 let x_q8_bytes = quantize_f32_to_q8_0_simple(x);
-                for i in 0..n {
-                    y[i] = unsafe { dot_q1_0_q8_0_row_avx2(&self.bytes, i, k, &x_q8_bytes) };
+                for (i, y_i) in y.iter_mut().enumerate() {
+                    *y_i = unsafe { dot_q1_0_q8_0_row_avx2(&self.bytes, i, k, &x_q8_bytes) };
                 }
                 return;
             }
@@ -164,7 +164,7 @@ impl Q1_0Matrix {
                     if i < n { y[i] = unsafe { dot_q1_0_row_avx2(&self.bytes, i, k, x) }; }
                     return;
                 } else if kernel_mode == "single" {
-                    for i in 0..n { y[i] = unsafe { dot_q1_0_row_avx2(&self.bytes, i, k, x) }; }
+                    for (i, y_i) in y.iter_mut().enumerate() { *y_i = unsafe { dot_q1_0_row_avx2(&self.bytes, i, k, x) }; }
                     return;
                 }
                 // 默认: quad (P0-H 四行并行, 共享 x load)
@@ -192,8 +192,8 @@ impl Q1_0Matrix {
                 }
                 return;
             }
-            for i in 0..n {
-                y[i] = dot_q1_0_row_scalar(&self.bytes, i, k, x);
+            for (i, y_i) in y.iter_mut().enumerate() {
+                *y_i = dot_q1_0_row_scalar(&self.bytes, i, k, x);
             }
             return;
         }
@@ -372,8 +372,8 @@ impl Q1_0Matrix {
                 }
                 return;
             }
-            for i in 0..n {
-                y[i] += dot_q1_0_row_scalar(&self.bytes, i, k, x);
+            for (i, y_i) in y.iter_mut().enumerate() {
+                *y_i += dot_q1_0_row_scalar(&self.bytes, i, k, x);
             }
             return;
         }
@@ -608,8 +608,8 @@ impl Q1_0Matrix {
                                 let x_slice = std::slice::from_raw_parts(x.as_ptr().add(x_off), rem * n_cols);
                                 dot_q1_0_row_batch_avx2(bytes, i, n_cols, x_slice, n_cols, rem, &mut tmp[..rem], 1);
                             }
-                            for t in 0..rem {
-                                unsafe { *((y_addr as *mut f32).add((t_start + t) * n + i)) = tmp[t]; }
+                            for (t, &v) in tmp[..rem].iter().enumerate() {
+                                unsafe { *((y_addr as *mut f32).add((t_start + t) * n + i)) = v; }
                             }
                         }
                     }
@@ -617,8 +617,8 @@ impl Q1_0Matrix {
                 }
                 for i in start..end {
                     dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
-                    for t in 0..n_batch {
-                        unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
+                    for (t, &v) in tmp[..n_batch].iter().enumerate() {
+                        unsafe { *((y_addr as *mut f32).add(t * n + i)) = v; }
                     }
                 }
             });
@@ -662,16 +662,16 @@ impl Q1_0Matrix {
                             unsafe {
                                 dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                             }
-                            for t in 0..n_batch {
-                                unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
+                            for (t, &v) in tmp[..n_batch].iter().enumerate() {
+                                unsafe { *((y_addr as *mut f32).add(t * n + i)) = v; }
                             }
                         }
                         return;
                     }
                     for i in start..end {
                         dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
-                        for t in 0..n_batch {
-                            unsafe { *((y_addr as *mut f32).add(t * n + i)) = tmp[t]; }
+                        for (t, &v) in tmp[..n_batch].iter().enumerate() {
+                            unsafe { *((y_addr as *mut f32).add(t * n + i)) = v; }
                         }
                     }
                 });
@@ -1134,8 +1134,8 @@ impl Q1_0Matrix {
                                 let x_slice = std::slice::from_raw_parts(x.as_ptr().add(x_off), rem * n_cols);
                                 dot_q1_0_row_batch_avx2(bytes, i, n_cols, x_slice, n_cols, rem, &mut tmp[..rem], 1);
                             }
-                            for t in 0..rem {
-                                unsafe { *((y_addr as *mut f32).add((t_start + t) * n + i)) += tmp[t]; }
+                            for (t, &v) in tmp[..rem].iter().enumerate() {
+                                unsafe { *((y_addr as *mut f32).add((t_start + t) * n + i)) += v; }
                             }
                         }
                     }
@@ -1143,8 +1143,8 @@ impl Q1_0Matrix {
                 }
                 for i in start..end {
                     dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
-                    for t in 0..n_batch {
-                        unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
+                    for (t, &v) in tmp[..n_batch].iter().enumerate() {
+                        unsafe { *((y_addr as *mut f32).add(t * n + i)) += v; }
                     }
                 }
             });
@@ -1188,16 +1188,16 @@ impl Q1_0Matrix {
                             unsafe {
                                 dot_q1_0_row_batch_avx2(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
                             }
-                            for t in 0..n_batch {
-                                unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
+                            for (t, &v) in tmp[..n_batch].iter().enumerate() {
+                                unsafe { *((y_addr as *mut f32).add(t * n + i)) += v; }
                             }
                         }
                         return;
                     }
                     for i in start..end {
                         dot_q1_0_row_batch(bytes, i, n_cols, x, n_cols, n_batch, tmp, 1);
-                        for t in 0..n_batch {
-                            unsafe { *((y_addr as *mut f32).add(t * n + i)) += tmp[t]; }
+                        for (t, &v) in tmp[..n_batch].iter().enumerate() {
+                            unsafe { *((y_addr as *mut f32).add(t * n + i)) += v; }
                         }
                     }
                 });

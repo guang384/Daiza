@@ -72,8 +72,8 @@ unsafe fn dot_8rows_avx2(rows: *const f32, x: *const f32, y: *mut f32, k: usize)
         j += 8;
     }
     // horizontal sum + tail (k 不是 8 的倍数时)
-    for i in 0..8 {
-        let mut s = hsum_ps(acc[i]);
+    for (i, &acc_i) in acc.iter().enumerate() {
+        let mut s = hsum_ps(acc_i);
         let mut jj = n8;
         while jj < k {
             s += *rows.add(i * k + jj) * *x.add(jj);
@@ -104,8 +104,8 @@ unsafe fn dot_8rows_add_avx2(rows: *const f32, x: *const f32, y: *mut f32, k: us
         acc[7] = _mm256_fmadd_ps(_mm256_loadu_ps(rows.add(7 * k + j)), x_v, acc[7]);
         j += 8;
     }
-    for i in 0..8 {
-        let mut s = hsum_ps(acc[i]);
+    for (i, &acc_i) in acc.iter().enumerate() {
+        let mut s = hsum_ps(acc_i);
         let mut jj = n8;
         while jj < k {
             s += *rows.add(i * k + jj) * *x.add(jj);

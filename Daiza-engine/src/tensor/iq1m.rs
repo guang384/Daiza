@@ -719,17 +719,17 @@ fn dequantize_block_into(block: &[u8], out: &mut Vec<f32>) {
         let grid2 = IQ1S_GRID[idx2 as usize].to_le_bytes();
         let grid3 = IQ1S_GRID[idx3 as usize].to_le_bytes();
 
-        for j in 0..8 {
-            out.push(dl1 * (grid0[j] as i8 as f32 + delta0));
+        for &g in &grid0 {
+            out.push(dl1 * (g as i8 as f32 + delta0));
         }
-        for j in 0..8 {
-            out.push(dl1 * (grid1[j] as i8 as f32 + delta1));
+        for &g in &grid1 {
+            out.push(dl1 * (g as i8 as f32 + delta1));
         }
-        for j in 0..8 {
-            out.push(dl2 * (grid2[j] as i8 as f32 + delta2));
+        for &g in &grid2 {
+            out.push(dl2 * (g as i8 as f32 + delta2));
         }
-        for j in 0..8 {
-            out.push(dl2 * (grid3[j] as i8 as f32 + delta3));
+        for &g in &grid3 {
+            out.push(dl2 * (g as i8 as f32 + delta3));
         }
 
         qs_off += 4;
@@ -784,24 +784,24 @@ fn dequantize_block_into_checked(block: &[u8], out: &mut [f32], out_idx: &mut us
         let grid2 = IQ1S_GRID[idx2 as usize].to_le_bytes();
         let grid3 = IQ1S_GRID[idx3 as usize].to_le_bytes();
 
-        for j in 0..8 {
+        for &g in &grid0 {
             if *out_idx >= cap { return; }
-            out[*out_idx] = dl1 * (grid0[j] as i8 as f32 + delta0);
+            out[*out_idx] = dl1 * (g as i8 as f32 + delta0);
             *out_idx += 1;
         }
-        for j in 0..8 {
+        for &g in &grid1 {
             if *out_idx >= cap { return; }
-            out[*out_idx] = dl1 * (grid1[j] as i8 as f32 + delta1);
+            out[*out_idx] = dl1 * (g as i8 as f32 + delta1);
             *out_idx += 1;
         }
-        for j in 0..8 {
+        for &g in &grid2 {
             if *out_idx >= cap { return; }
-            out[*out_idx] = dl2 * (grid2[j] as i8 as f32 + delta2);
+            out[*out_idx] = dl2 * (g as i8 as f32 + delta2);
             *out_idx += 1;
         }
-        for j in 0..8 {
+        for &g in &grid3 {
             if *out_idx >= cap { return; }
-            out[*out_idx] = dl2 * (grid3[j] as i8 as f32 + delta3);
+            out[*out_idx] = dl2 * (g as i8 as f32 + delta3);
             *out_idx += 1;
         }
 

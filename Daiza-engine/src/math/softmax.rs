@@ -55,9 +55,9 @@ pub fn softmax_inplace(x: &mut [f32]) {
                 i += 8;
             }
             let mut sum = hsum_ps(sum_v);
-            for j in n8..n {
-                let e = (x[j] - max).exp();
-                x[j] = e;
+            for xi in &mut x[n8..n] {
+                let e = (*xi - max).exp();
+                *xi = e;
                 sum += e;
             }
 
@@ -71,8 +71,8 @@ pub fn softmax_inplace(x: &mut [f32]) {
                 _mm256_storeu_ps(x.as_mut_ptr().add(i), r);
                 i += 8;
             }
-            for j in n8..n {
-                x[j] *= inv;
+            for xi in &mut x[n8..n] {
+                *xi *= inv;
             }
             return;
         }

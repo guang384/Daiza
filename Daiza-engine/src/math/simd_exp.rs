@@ -184,8 +184,8 @@ pub fn exp_inplace_simd(x: &mut [f32]) {
                 _mm256_storeu_ps(x.as_mut_ptr().add(i), r);
             }
             // 尾部标量
-            for i in n8..n {
-                x[i] = x[i].exp();
+            for xi in &mut x[n8..n] {
+                *xi = xi.exp();
             }
             return;
         }
@@ -208,8 +208,8 @@ pub fn sigmoid_inplace_simd(x: &mut [f32]) {
                 let r = sigmoid_ps(v);
                 _mm256_storeu_ps(x.as_mut_ptr().add(i), r);
             }
-            for i in n8..n {
-                x[i] = 1.0 / (1.0 + (-x[i]).exp());
+            for xi in &mut x[n8..n] {
+                *xi = 1.0 / (1.0 + (-*xi).exp());
             }
             return;
         }
@@ -232,8 +232,8 @@ pub fn silu_inplace_simd(x: &mut [f32]) {
                 let r = silu_ps(v);
                 _mm256_storeu_ps(x.as_mut_ptr().add(i), r);
             }
-            for i in n8..n {
-                x[i] = x[i] / (1.0 + (-x[i]).exp());
+            for xi in &mut x[n8..n] {
+                *xi = *xi / (1.0 + (-*xi).exp());
             }
             return;
         }
@@ -574,9 +574,9 @@ pub fn argmax_avx2(x: &[f32]) -> (usize, f32) {
                 }
                 i += 8;
             }
-            for v in n8..len {
-                if x[v] > best_val {
-                    best_val = x[v];
+            for (v, &val) in (n8..len).zip(x[n8..len].iter()) {
+                if val > best_val {
+                    best_val = val;
                     best_id = v;
                 }
             }

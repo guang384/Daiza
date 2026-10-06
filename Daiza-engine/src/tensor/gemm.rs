@@ -350,9 +350,9 @@ pub fn gemm_q1_0_batch(
     #[cfg(target_arch = "x86_64")]
     if crate::tensor::quant::avx2_q1_0_available() {
         if n_tokens == 1 {
-            for r in 0..rows {
+            for (r, y_r) in y.iter_mut().enumerate() {
                 unsafe {
-                    y[r] = crate::tensor::quant::dot_q1_0_row_avx2(w_bytes, r, cols, x);
+                    *y_r = crate::tensor::quant::dot_q1_0_row_avx2(w_bytes, r, cols, x);
                 }
             }
             return;

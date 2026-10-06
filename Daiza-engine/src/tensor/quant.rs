@@ -132,8 +132,7 @@ pub fn dequantize_q1_0(data: &[u8], n_elements: usize) -> Vec<f32> {
         let scale = f16_to_f32(scale_bits);
         let sign_bytes = &data[block_start + 2..block_start + Q1_0_BLOCK_BYTES];
         // 16 字节 = 128 bits,逐 bit 展开
-        for byte_idx in 0..16 {
-            let b = sign_bytes[byte_idx];
+        for &b in sign_bytes {
             for bit_idx in 0..8 {
                 // bit=1 → +scale,bit=0 → -scale
                 let bit = (b >> bit_idx) & 1;
@@ -173,8 +172,7 @@ pub fn dequantize_q1_0_row_into(data: &[u8], row_idx: usize, n_cols: usize, out:
         let scale_bits = u16::from_le_bytes([row_bytes[block_start], row_bytes[block_start + 1]]);
         let scale = f16_to_f32(scale_bits);
         let sign_bytes = &row_bytes[block_start + 2..block_start + Q1_0_BLOCK_BYTES];
-        for byte_idx in 0..16 {
-            let b = sign_bytes[byte_idx];
+        for &b in sign_bytes {
             for bit_idx in 0..8 {
                 let bit = ((b >> bit_idx) & 1) as f32;
                 // 无分支:bit=1 → +scale,bit=0 → -scale
@@ -757,8 +755,7 @@ pub fn dot_q1_0_row_scalar(data: &[u8], row_idx: usize, n_cols: usize, x: &[f32]
         let sign_bytes = &row_bytes[block_start + 2..block_start + Q1_0_BLOCK_BYTES];
         let x_off = g * Q1_0_GROUP_SIZE;
 
-        for byte_idx in 0..16 {
-            let b = sign_bytes[byte_idx];
+        for (byte_idx, &b) in sign_bytes.iter().enumerate() {
             let dst_off = byte_idx * 8;
             signs_buf[dst_off + 0] = 2.0 * (((b >> 0) & 1) as f32) - 1.0;
             signs_buf[dst_off + 1] = 2.0 * (((b >> 1) & 1) as f32) - 1.0;
@@ -1451,15 +1448,13 @@ pub fn dequantize_q4_1_row_into(data: &[u8], row_idx: usize, n_cols: usize, out:
         let m = f16_to_f32_fast(m_bits);
         let packed = &row_bytes[bs + 4..bs + Q4_1_BLOCK_BYTES];
         // llama.cpp Q4_1 nibble 布局: 低 nibble → 前半 0..15, 高 nibble → 后半 16..31
-        for byte_idx in 0..16 {
-            let b = packed[byte_idx];
+        for &b in packed {
             if out_idx < n_cols {
                 out[out_idx] = m + d * (b & 0x0F) as f32;
                 out_idx += 1;
             }
         }
-        for byte_idx in 0..16 {
-            let b = packed[byte_idx];
+        for &b in packed {
             if out_idx < n_cols {
                 out[out_idx] = m + d * ((b >> 4) & 0x0F) as f32;
                 out_idx += 1;

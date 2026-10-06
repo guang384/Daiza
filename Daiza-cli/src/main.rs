@@ -1038,9 +1038,9 @@ fn main() -> Result<()> {
             // 输出最后 200 字节的十六进制 + 可打印 ASCII
             let tail_start = bytes.len().saturating_sub(200);
             println!("\n--- last 200 bytes (hex) ---");
-            for i in tail_start..bytes.len() {
-                print!("{:02x} ", bytes[i]);
-                if (i - tail_start + 1).is_multiple_of(16) {
+            for (c, &b) in bytes[tail_start..].iter().enumerate() {
+                print!("{:02x} ", b);
+                if (c + 1).is_multiple_of(16) {
                     println!();
                 }
             }

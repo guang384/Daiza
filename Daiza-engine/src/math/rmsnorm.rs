@@ -46,8 +46,8 @@ unsafe fn rmsnorm_inplace_avx2(x: &mut [f32], w: &[f32], eps: f32) {
     sum0 = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
     let mut ss = hsum_ps(sum0);
     // tail (n 不是 8 的倍数时)
-    for j in n8..n {
-        ss += x[j] * x[j];
+    for &v in &x[n8..n] {
+        ss += v * v;
     }
 
     let inv_rms = 1.0 / ((ss / nf + eps).sqrt());
@@ -114,8 +114,8 @@ unsafe fn rmsnorm_into_avx2(src: &[f32], dst: &mut [f32], w: &[f32], eps: f32) {
     }
     sum0 = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
     let mut ss = hsum_ps(sum0);
-    for j in n8..n {
-        ss += src[j] * src[j];
+    for &v in &src[n8..n] {
+        ss += v * v;
     }
 
     let inv_rms = 1.0 / ((ss / nf + eps).sqrt());

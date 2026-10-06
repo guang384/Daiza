@@ -44,9 +44,9 @@ unsafe fn layernorm_into_avx2(
     }
     let mut sum = hsum_ps(sum_v);
     let mut sq = hsum_ps(sq_v);
-    for j in i..n {
-        sum += src[j];
-        sq += src[j] * src[j];
+    for &s in &src[i..n] {
+        sum += s;
+        sq += s * s;
     }
     let mean = sum / nf;
     let var = sq / nf - mean * mean;
