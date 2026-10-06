@@ -472,5 +472,3 @@ Test conditions: greedy sampling, 142-token prompt.
 ## 📄 License
 
 Apache-2.0 (consistent with the upstream Bonsai 27B model).
-
-> AI生成

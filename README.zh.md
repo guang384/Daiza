@@ -483,5 +483,3 @@ Vision prefill 从逐 token 注入 (132s) 改为分批 batched 注入 (MAX_VISIO
 ## 📄 许可证
 
 Apache-2.0(与上游 Bonsai 27B 模型一致)
-
-> AI生成
