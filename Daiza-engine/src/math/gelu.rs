@@ -168,7 +168,7 @@ unsafe fn gelu_erf_avx2(x: &[f32], out: &mut [f32]) {
             ))
         );
         // 实际 poly = t * (a1 + t*(a2 + t*(...))), 上面少乘了一个 t, 修正:
-        //   正确 Horner: poly = ((a5*t + a4)*t + a3)*t + a2)*t + a1, 然后整体 * t
+        //   正确 Horner: poly = (((a5*t + a4)*t + a3)*t + a2)*t + a1, 然后整体 * t
         //   简化: poly_t = t * (a1 + t*(a2 + t*(a3 + t*(a4 + t*a5))))
         //   上面计算的是 a1 + t*(a2 + ...), 需再 * t
         let poly_t = _mm256_mul_ps(t, poly);

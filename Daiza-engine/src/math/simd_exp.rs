@@ -90,7 +90,7 @@ pub unsafe fn exp_ps(x: __m256) -> __m256 {
 ///   - _mm256_div_ps: ~10-20c (IEEE-compliant, correctly rounded)
 ///   - rcp + Newton:  ~5c (rcp 1c + 2×FMA + 1×MUL = ~5c, ~1 ULP 误差)
 ///   - sigmoid 输出 ∈ [0,1], 1 ULP 相对误差对模型精度无影响
-///   - 除数 1+exp(-x) ∈ [1, 2], 无 0/inf 边界
+///   - 除数 1+exp(-x) ∈ [1, ∞), 下界 1 保证无除零
 ///
 /// # Safety
 ///

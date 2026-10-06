@@ -934,6 +934,7 @@ pub fn dot_q1_0_row_batch(
 ) {
     debug_assert!(x.len() >= n_batch * x_stride);
     debug_assert!(y.len() >= n_batch * y_stride);
+    debug_assert!(x_stride >= n_cols, "x_stride {x_stride} < n_cols {n_cols}");
     if n_batch == 0 {
         return;
     }
@@ -1762,7 +1763,7 @@ pub unsafe fn dot_q4_1_row_batch_avx2(
         t_start += 4;
     }
 
-    // 余数: 2-token fallback (n_batch % 4 ∈ {2, 3})
+    // 余数: 2-token / 1-token fallback (n_batch % 4 ∈ {1, 2, 3})
     while t_start < n_batch {
         let has_pair = t_start + 1 < n_batch;
 
@@ -1828,6 +1829,8 @@ pub fn dot_q4_1_row_batch(
 ) {
     debug_assert!(x.len() >= n_batch * x_stride);
     debug_assert!(y.len() >= n_batch * y_stride);
+    debug_assert!(x_stride >= n_cols, "x_stride {x_stride} < n_cols {n_cols}");
+    debug_assert!(row_idx < y_stride, "row_idx {row_idx} >= y_stride {y_stride}");
     if n_batch == 0 {
         return;
     }
