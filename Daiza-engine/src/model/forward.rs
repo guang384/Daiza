@@ -431,6 +431,8 @@ pub fn forward_batch_with_vision(
     let mut p_batch_matvec = std::time::Duration::ZERO;
     let mut p_attn_serial = std::time::Duration::ZERO;
     let mut p_ssm_serial = std::time::Duration::ZERO;
+    let mut p_ssm_phase_a = std::time::Duration::ZERO;
+    let mut p_ssm_phase_b = std::time::Duration::ZERO;
     let mut p_swiglu = std::time::Duration::ZERO;
     let mut p_final = std::time::Duration::ZERO;
 
@@ -892,6 +894,7 @@ pub fn forward_batch_with_vision(
                     ssm.conv_head = 0;
                 }
                 let conv_head0 = ssm.conv_head;
+                let ts_pa = if profile { Some(std::time::Instant::now()) } else { None };
                 // ---- Phase A: conv1d + silu + L2norm + qscale + gate silu (stealing, 8-token chunk) ----
                 {
                     let qkv_a = qkv_buf.as_ptr() as usize;
@@ -976,6 +979,8 @@ pub fn forward_batch_with_vision(
                     });
                 }
                 // ---- 环形 history 更新 (Phase A barrier 后串行; 与逐 token 写入的终态一致) ----
+                if let Some(t) = ts_pa { p_ssm_phase_a += t.elapsed(); }
+                let ts_pb = if profile { Some(std::time::Instant::now()) } else { None };
                 {
                     let m = conv_k.min(n_batch);
                     for k in 0..m {
@@ -1005,7 +1010,12 @@ pub fn forward_batch_with_vision(
                     let nkh = num_k_heads;
                     let eps = 1e-6f32;
                     let nb = n_batch;
-                    pool.scatter_wait(nvh, move |vh| {
+                    // ★ work-stealing (chunk=1 条链): 链不可分割 (状态串行演化), 但
+                    //   executor 快慢不均 (P/E/LP-E 混核) — 静态 stride 会让拿 4 条链的
+                    //   慢核成为 straggler (实测 phase_b 4.0ms/block vs 理想 ~1.4ms)。
+                    //   stealing 让快核抢完自己链后继续抢, 慢核自然少拿 → LPT 动态均衡。
+                    //   链间独立 + 链内顺序不变 → 逐字节一致不受抢占顺序影响。
+                    pool.scatter_wait_stealing(nvh, 1, move |vh, _vh_end| {
                         let kh = vh % nkh;
                         let s_off = vh * ssz * ssz;
                         let qkv_all = unsafe {
@@ -1041,6 +1051,7 @@ pub fn forward_batch_with_vision(
                         }
                     });
                 }
+                if let Some(t) = ts_pb { p_ssm_phase_b += t.elapsed(); }
             } else {
             for t in 0..n_batch {
                 let qkv_t = &qkv_buf[t * ssm_qkv_dim..(t + 1) * ssm_qkv_dim];
@@ -1364,6 +1375,11 @@ pub fn forward_batch_with_vision(
             attn_ms = p_attn_serial.as_secs_f64() * 1000.0,
             ssm_ms = p_ssm_serial.as_secs_f64() * 1000.0,
             swiglu_ms = p_swiglu.as_secs_f64() * 1000.0,
+        );
+        eprintln!(
+            "  ssm_detail: phase_a={pa_ms:.1}ms phase_b={pb_ms:.1}ms",
+            pa_ms = p_ssm_phase_a.as_secs_f64() * 1000.0,
+            pb_ms = p_ssm_phase_b.as_secs_f64() * 1000.0,
         );
     }
 
