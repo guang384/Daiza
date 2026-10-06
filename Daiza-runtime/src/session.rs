@@ -304,6 +304,7 @@ pub fn session_reply(
         batch_ssm_alpha: Vec::new(),
         batch_ssm_beta: Vec::new(),
         batch_ssm_gate: Vec::new(),
+        batch_ssm_qkv2: Vec::new(),
         batch_cos_sin: Vec::new(),
     };
 
@@ -512,6 +513,7 @@ fn reply_with_increment_stream(
         batch_ssm_alpha: Vec::new(),
         batch_ssm_beta: Vec::new(),
         batch_ssm_gate: Vec::new(),
+        batch_ssm_qkv2: Vec::new(),
         batch_cos_sin: Vec::new(),
     };
 
@@ -739,6 +741,7 @@ fn session_reply_with_vision_inner(
         batch_ssm_alpha: Vec::new(),
         batch_ssm_beta: Vec::new(),
         batch_ssm_gate: Vec::new(),
+        batch_ssm_qkv2: Vec::new(),
         batch_cos_sin: Vec::new(),
     };
 
@@ -935,6 +938,7 @@ fn session_reply_with_tools(
         batch_ssm_alpha: Vec::new(),
         batch_ssm_beta: Vec::new(),
         batch_ssm_gate: Vec::new(),
+        batch_ssm_qkv2: Vec::new(),
         batch_cos_sin: Vec::new(),
     };
 
@@ -1062,6 +1066,7 @@ pub fn session_reply_with_tool_response(
         batch_ssm_alpha: Vec::new(),
         batch_ssm_beta: Vec::new(),
         batch_ssm_gate: Vec::new(),
+        batch_ssm_qkv2: Vec::new(),
         batch_cos_sin: Vec::new(),
     };
 

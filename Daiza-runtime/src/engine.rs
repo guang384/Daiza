@@ -1024,6 +1024,7 @@ impl Engine {
                 batch_ssm_alpha: Vec::new(),
                 batch_ssm_beta: Vec::new(),
                 batch_ssm_gate: Vec::new(),
+                batch_ssm_qkv2: Vec::new(),
                 batch_cos_sin: Vec::new(),
             }
         } else {

@@ -2,10 +2,15 @@
 
 use crate::cache::{KvCache, SsmState};
 use crate::math;
-use crate::math::simd_exp::hsum_ps;
 use crate::model::config::Config;
 use crate::model::weights::LoadedWeights;
 use crate::model::workspace::Workspace;
+
+/// 串行段并行化的最小批量阈值 (与 PrefillWorkers::boost_if_large 对齐):
+/// ≥ 此值时 prefill 有全核 boost, attention online softmax / SSM scan / swiglu
+/// 走跨 token 并行路径; 小批量 (DSpark 增量 prefill) 保留旧串行路径,
+/// 避免每 block 额外 barrier 开销 (~64 block × ~20μs) 反噬。
+const BATCH_PARALLEL_MIN: usize = 32;
 
 /// 多模态 vision embedding 注入参数 (用于 forward_batch_with_vision)
 ///
@@ -116,6 +121,9 @@ pub struct ForwardContext<'a> {
     pub batch_ssm_beta: Vec<f32>,
     /// `[n_batch * ssm_gate_dim]` SSM gate
     pub batch_ssm_gate: Vec<f32>,
+    /// `[n_batch * ssm_qkv_dim]` SSM conv1d+silu+norm 后的 [q|k|v] 行 (大批量并行路径用)
+    /// 布局: 每 token 一行 [q(2048) | k(2048) | v(6144)], phase B 按 v_head 链读
+    pub batch_ssm_qkv2: Vec<f32>,
     /// `[n_batch * rope_dim * 2]` 扁平 cos/sin (cos 在前, sin 在后, 每 token 一段)
     /// 替代原 `Vec<([f32; 128], [f32; 128])>`, 消除每 prefill 的 n_batch × 1KB alloc
     pub batch_cos_sin: Vec<f32>,
@@ -500,6 +508,8 @@ pub fn forward_batch_with_vision(
     ctx.batch_ssm_alpha.resize(n_batch * ssm_alpha_dim, 0.0);
     ctx.batch_ssm_beta.resize(n_batch * ssm_alpha_dim, 0.0);
     ctx.batch_ssm_gate.resize(n_batch * ssm_gate_dim, 0.0);
+    // ★ SSM 并行路径的 conv 后 [q|k|v] 行 buffer (n_batch ≥ BATCH_PARALLEL_MIN 时使用)
+    ctx.batch_ssm_qkv2.resize(n_batch * ssm_qkv_dim, 0.0);
     let mut normed_batch = std::mem::take(&mut ctx.batch_normed);
     let mut qkv_buf = std::mem::take(&mut ctx.batch_qkv);
     let mut attn_out_buf = std::mem::take(&mut ctx.batch_out);
@@ -509,6 +519,7 @@ pub fn forward_batch_with_vision(
     let mut ssm_alpha_buf = std::mem::take(&mut ctx.batch_ssm_alpha);
     let mut ssm_beta_buf = std::mem::take(&mut ctx.batch_ssm_beta);
     let mut ssm_gate_buf = std::mem::take(&mut ctx.batch_ssm_gate);
+    let mut ssm_qkv2_buf = std::mem::take(&mut ctx.batch_ssm_qkv2);
 
     // 3. 逐 block 前向
     let debug_blocks = debug_blocks_enabled();
@@ -544,6 +555,13 @@ pub fn forward_batch_with_vision(
     let tap_enabled_batch = !ctx.hidden_tap_layers.is_empty();
     let mut tap_idx_batch = 0usize;
 
+    // ★ 串行段并行化 (n_batch ≥ BATCH_PARALLEL_MIN): attention online softmax 跨 token 并行、
+    //   SSM conv/scan 两阶段并行 (每 block 2 barrier 替代每 token 1 barrier)、swiglu 并行。
+    //   各工作单元互不重叠, 与旧串行路径逐元素运算序列一致 (greedy 逐字节可验证)。
+    //   小批量 (DSpark 增量 prefill / session_reply 尾块) 保留旧路径, 避免额外 barrier 反噬。
+    let use_parallel_serial = n_batch >= BATCH_PARALLEL_MIN
+        && crate::model::workspace::get_thread_pool().is_some();
+
     for blk_idx in 0..cfg.block_count {
         let is_full = cfg.is_full_attention_block(blk_idx);
         let block_ts = if debug_blocks { Some(std::time::Instant::now()) } else { None };
@@ -571,6 +589,130 @@ pub fn forward_batch_with_vision(
 
             // 3d. Per-token attention (sequential)
             let ts_attn = if profile { Some(std::time::Instant::now()) } else { None };
+            if use_parallel_serial {
+                // ★ 并行路径 (n_batch ≥ BATCH_PARALLEL_MIN, 实测 serial_ratio 7.9% 中的 attn 段):
+                //   阶段 1 (串行, ~0.2ms/block): K norm+RoPE + KV append 前置 —
+                //     online softmax 各 token 只读共享 KV cache、写各自独立 out 行,
+                //     append 全部提前后 token 间不再有因果写依赖;
+                //   阶段 2 (并行): 以 (token, kvh) 为工作单元 (LPT 逆序 + work-stealing),
+                //     每单元就地完成 Q-norm/RoPE/scale (interleaved qkv_buf, 免解交错拷贝)
+                //     + online softmax + sigmoid(gate) 调制, 单元间切片互不重叠。
+                //   逐元素运算序列与串行路径一致 (norm→rope→scale→softmax→sigmoid→mul) → 逐字节一致。
+                let pool = crate::model::workspace::get_thread_pool().unwrap();
+                let kv_len_before = kv.len;
+                for t in 0..n_batch {
+                    let kv_off = t * n_kv_heads * head_dim;
+                    let cs_base = t * cos_sin_stride;
+                    let cos = &cos_sin_batch[cs_base..cs_base + rope_dim];
+                    let sin = &cos_sin_batch[cs_base + rope_dim..cs_base + 2 * rope_dim];
+                    let k_t_mut = &mut k_buf[kv_off..kv_off + n_kv_heads * head_dim];
+                    for h_i in 0..n_kv_heads {
+                        let hs = h_i * head_dim;
+                        math::rmsnorm_inplace(&mut k_t_mut[hs..hs + head_dim], &w.attn_k_norm.data, cfg.rms_eps);
+                        math::apply_rope_partial(&mut k_t_mut[hs..hs + head_dim], rope_dim, cos, sin);
+                    }
+                    kv.append(
+                        &k_buf[kv_off..kv_off + n_kv_heads * head_dim],
+                        &v_buf[kv_off..kv_off + n_kv_heads * head_dim],
+                    );
+                }
+                // 阶段 2: (t, kvh) 单元, 逆序 (LPT: n_cached ∝ t, 最贵单元先被抢)
+                let n_units = n_batch * n_kv_heads;
+                let qkv_a = qkv_buf.as_mut_ptr() as usize;
+                let out_a = attn_out_buf.as_mut_ptr() as usize;
+                let cs_a = cos_sin_batch.as_ptr() as usize;
+                let q_norm_a = w.attn_q_norm.data.as_ptr() as usize;
+                let kv_ref: &KvCache = kv;
+                let hd = head_dim;
+                let rd = rope_dim;
+                let group = group_size;
+                let nkvh = n_kv_heads;
+                let q_scale = 1.0f32 / (head_dim as f32).sqrt();
+                let rms_eps = cfg.rms_eps;
+                let qkv_step = qkv_total_dim;
+                let out_step = attn_out_dim;
+                let cs_step = cos_sin_stride;
+                let base_len = kv_len_before;
+                pool.scatter_wait_stealing(n_units, 1, move |i0, i1| {
+                    for i in i0..i1 {
+                        let rev = n_units - 1 - i;
+                        let t = rev / nkvh;
+                        let kvh = rev % nkvh;
+                        let n_cached = base_len + t + 1;
+                        let qkv_all = unsafe {
+                            std::slice::from_raw_parts_mut(qkv_a as *mut f32, (t + 1) * qkv_step)
+                        };
+                        let qkv_t = &mut qkv_all[t * qkv_step..(t + 1) * qkv_step];
+                        let cs_all = unsafe {
+                            std::slice::from_raw_parts(cs_a as *const f32, (t + 1) * cs_step)
+                        };
+                        let cs_base = t * cs_step;
+                        let cos = &cs_all[cs_base..cs_base + rd];
+                        let sin = &cs_all[cs_base + rd..cs_base + 2 * rd];
+                        let q_norm = unsafe {
+                            std::slice::from_raw_parts(q_norm_a as *const f32, hd)
+                        };
+                        // Q-norm + RoPE + scale (就地 interleaved Q 半区, 值与解交错路径逐位一致)
+                        for g in 0..group {
+                            let qh = kvh * group + g;
+                            let hs = qh * (hd * 2);
+                            math::rmsnorm_inplace(&mut qkv_t[hs..hs + hd], q_norm, rms_eps);
+                            math::apply_rope_partial(&mut qkv_t[hs..hs + hd], rd, cos, sin);
+                            for v in &mut qkv_t[hs..hs + hd] {
+                                *v *= q_scale;
+                            }
+                        }
+                        // online softmax (内层与串行路径一致; q_head 直接读 interleaved 布局)
+                        let out_all = unsafe {
+                            std::slice::from_raw_parts_mut(out_a as *mut f32, (t + 1) * out_step)
+                        };
+                        let out_t = &mut out_all[t * out_step..(t + 1) * out_step];
+                        debug_assert!(group <= 8, "online softmax stack buffer requires group_size<=8");
+                        debug_assert!(hd <= 256, "online softmax stack buffer requires head_dim<=256");
+                        let mut m = [f32::NEG_INFINITY; 8];
+                        let mut s = [0.0f32; 8];
+                        let mut out = [[0.0f32; 256]; 8];
+                        for c in 0..n_cached {
+                            let k_head = kv_ref.k_head_at(kvh, c);
+                            let v_head = kv_ref.v_head_at(kvh, c);
+                            for qh_in_group in 0..group {
+                                let qh = kvh * group + qh_in_group;
+                                let q_head = &qkv_t[qh * (hd * 2)..qh * (hd * 2) + hd];
+                                let score = crate::math::simd_exp::dot_product_avx2(q_head, k_head, hd);
+
+                                let m_old = m[qh_in_group];
+                                let m_new = m_old.max(score);
+                                let alpha = crate::math::simd_exp::exp_fast(m_old - m_new);
+                                let beta = crate::math::simd_exp::exp_fast(score - m_new);
+
+                                let s_old = s[qh_in_group];
+                                s[qh_in_group] = s_old * alpha + beta;
+
+                                let out_row = &mut out[qh_in_group];
+                                crate::math::simd_exp::online_softmax_v_update_avx2(
+                                    out_row, alpha, beta, v_head, hd,
+                                );
+                                m[qh_in_group] = m_new;
+                            }
+                        }
+                        for qh_in_group in 0..group {
+                            let qh = kvh * group + qh_in_group;
+                            let out_head = &mut out_t[qh * hd..(qh + 1) * hd];
+                            let inv_s = 1.0 / s[qh_in_group];
+                            crate::math::simd_exp::scale_avx2(
+                                &out[qh_in_group], inv_s, out_head, hd,
+                            );
+                        }
+                        // gate: sigmoid + 调制 (per head, 元素级与串行路径一致)
+                        for g in 0..group {
+                            let qh = kvh * group + g;
+                            let gs = qh * (hd * 2) + hd;
+                            math::sigmoid_inplace_simd(&mut qkv_t[gs..gs + hd]);
+                            math::mul_inplace_simd(&mut out_t[qh * hd..(qh + 1) * hd], &qkv_t[gs..gs + hd]);
+                        }
+                    }
+                });
+            } else {
             for t in 0..n_batch {
                 let qkv_t = &qkv_buf[t * qkv_total_dim..(t + 1) * qkv_total_dim];
 
@@ -685,6 +827,7 @@ pub fn forward_batch_with_vision(
                 math::sigmoid_inplace_simd(&mut ctx.workspace.attn_gate);
                 math::mul_inplace_simd(&mut out_t[..attn_out_dim], &ctx.workspace.attn_gate[..attn_out_dim]);
             }
+            }
             if let Some(ts) = ts_attn { p_attn_serial += ts.elapsed(); }
 
             // 3e. Batch output projection: h += W_out @ attn_out
@@ -731,6 +874,174 @@ pub fn forward_batch_with_vision(
             //   - z (gate) 在 output gate 里读,直接读 batch buffer
             //   - qkv 在 conv1d 里只用于 copy 进 conv_history,直接用 batch buffer
             let ts_ssm = if profile { Some(std::time::Instant::now()) } else { None };
+            if use_parallel_serial {
+                // ★ 两阶段并行路径 (n_batch ≥ BATCH_PARALLEL_MIN; ssm 段占 serial 800ms/142t 热态):
+                //   旧路径每 token 1 次 scatter_wait barrier (142 token × 48 block = 6816 次/prefill,
+                //   barrier 唤醒+同步开销占大半), 且 conv1d/silu/L2norm 逐 token 串行 + 3 次 split copy。
+                //
+                //   Phase A (1 barrier): 全 batch conv1d+silu+L2norm+qscale, 直接写 qkv2_buf 的
+                //     [q|k|v] 行布局 (省 3 次 split copy), gate silu 同批完成。conv 源: 批内
+                //     token 直读 qkv_buf, 批前 token 读环形 history (只读, 更新延后);
+                //   (串行) 环形 history 更新 — 复刻逐 token 写入的最终状态 (末 conv_k 行 + head 前进);
+                //   Phase B (1 barrier): 48 条 v_head 状态链, 每链串行扫全 batch t=0..n_batch
+                //     (scan 逐 token 状态演化顺序不变), scan+gate 逐 (t,vh) 与旧路径同序。
+                //   每元素运算序列与旧路径一致 → 逐字节一致; barrier 6816 → 96/prefill。
+                let pool = ssm_pool.unwrap();
+                if ssm.conv_history.is_empty() {
+                    ssm.conv_history.resize(conv_k * qkv_full_len, 0.0);
+                    ssm.conv_head = 0;
+                }
+                let conv_head0 = ssm.conv_head;
+                // ---- Phase A: conv1d + silu + L2norm + qscale + gate silu (stealing, 8-token chunk) ----
+                {
+                    let qkv_a = qkv_buf.as_ptr() as usize;
+                    let qkv2_a = ssm_qkv2_buf.as_mut_ptr() as usize;
+                    let hist_a = ssm.conv_history.as_ptr() as usize;
+                    let conv_w_a = w.ssm_conv1d.data.as_ptr() as usize;
+                    let gate_a = ssm_gate_buf.as_mut_ptr() as usize;
+                    let qkv_len = ssm_qkv_dim;
+                    let qd = qkv_dim;
+                    let ssz = state_size;
+                    let nkh = num_k_heads;
+                    let inner_ = inner;
+                    let q_scale = ssm_q_scale;
+                    let ck = conv_k;
+                    let h0 = conv_head0;
+                    let eps = 1e-6f32;
+                    pool.scatter_wait_stealing(n_batch, 8, move |t0, t1| {
+                        for t in t0..t1 {
+                            let rows = unsafe {
+                                std::slice::from_raw_parts_mut(qkv2_a as *mut f32, (t + 1) * qkv_len)
+                            };
+                            let row = &mut rows[t * qkv_len..(t + 1) * qkv_len];
+                            row.fill(0.0);
+                            // conv1d: tap ct 源 token = t-conv_k+1+ct;
+                            //   批内 (t+ct ≥ conv_k-1) 直读 qkv_buf, 批前读环形槽 (h0+t+ct+1)%conv_k
+                            for ct in 0..ck {
+                                let src: &[f32] = if t + ct >= ck - 1 {
+                                    let st = t + ct - (ck - 1);
+                                    let qkv_all = unsafe {
+                                        std::slice::from_raw_parts(qkv_a as *const f32, (st + 1) * qkv_len)
+                                    };
+                                    &qkv_all[st * qkv_len..(st + 1) * qkv_len]
+                                } else {
+                                    let slot = (h0 + t + ct + 1) % ck;
+                                    let hist_all = unsafe {
+                                        std::slice::from_raw_parts(hist_a as *const f32, (slot + 1) * qkv_len)
+                                    };
+                                    &hist_all[slot * qkv_len..(slot + 1) * qkv_len]
+                                };
+                                let w_all = unsafe {
+                                    std::slice::from_raw_parts(conv_w_a as *const f32, (ct + 1) * qkv_len)
+                                };
+                                let w_t = &w_all[ct * qkv_len..(ct + 1) * qkv_len];
+                                #[cfg(target_arch = "x86_64")]
+                                if use_avx2 {
+                                    #[allow(unsafe_code)]
+                                    unsafe {
+                                        crate::model::ssm::conv1d_fma_avx2(row, src, w_t, qkv_len);
+                                    }
+                                } else {
+                                    for ch in 0..qkv_len {
+                                        row[ch] += src[ch] * w_t[ch];
+                                    }
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                {
+                                    for ch in 0..qkv_len {
+                                        row[ch] += src[ch] * w_t[ch];
+                                    }
+                                }
+                            }
+                            // silu 全行 (旧路径 conv_out[..2*qkv_dim+inner] = 全长, 等价)
+                            crate::math::simd_exp::silu_inplace_simd(row);
+                            // L2 norm q/k per head (行内偏移: q=0, k=qkv_dim)
+                            for h in 0..nkh {
+                                let hs = h * ssz;
+                                crate::model::ssm::l2norm_inplace(&mut row[hs..hs + ssz], eps);
+                                crate::model::ssm::l2norm_inplace(&mut row[qd + hs..qd + hs + ssz], eps);
+                            }
+                            // q scale (与旧路径同标量循环)
+                            for v in &mut row[..qd] {
+                                *v *= q_scale;
+                            }
+                            // gate silu (与旧路径 per-token silu 一致, Phase B 只读)
+                            let gate_all = unsafe {
+                                std::slice::from_raw_parts_mut(gate_a as *mut f32, (t + 1) * inner_)
+                            };
+                            crate::math::simd_exp::silu_inplace_simd(
+                                &mut gate_all[t * inner_..(t + 1) * inner_],
+                            );
+                        }
+                    });
+                }
+                // ---- 环形 history 更新 (Phase A barrier 后串行; 与逐 token 写入的终态一致) ----
+                {
+                    let m = conv_k.min(n_batch);
+                    for k in 0..m {
+                        let row = (conv_head0 + n_batch - m + k) % conv_k;
+                        let src_t = n_batch - m + k;
+                        ssm.conv_history[row * qkv_full_len..(row + 1) * qkv_full_len]
+                            .copy_from_slice(&qkv_buf[src_t * ssm_qkv_dim..(src_t + 1) * ssm_qkv_dim]);
+                    }
+                    ssm.conv_head = (conv_head0 + n_batch) % conv_k;
+                }
+                // ---- Phase B: 48 条 v_head 状态链 (链等长 → 静态 stride 分块), 每链串行扫全 batch ----
+                {
+                    let qkv2_a = ssm_qkv2_buf.as_ptr() as usize;
+                    let state_a = ssm.state.as_mut_ptr() as usize;
+                    let y_a = attn_out_buf.as_mut_ptr() as usize;
+                    let a_a = a.as_ptr() as usize;
+                    let alpha_a = ssm_alpha_buf.as_ptr() as usize;
+                    let beta_a = ssm_beta_buf.as_ptr() as usize;
+                    let dt_a = dt_bias.as_ptr() as usize;
+                    let nw_a = ssm_norm_w.as_ptr() as usize;
+                    let gate_a = ssm_gate_buf.as_ptr() as usize;
+                    let qkv_len = ssm_qkv_dim;
+                    let qd = qkv_dim;
+                    let ssz = state_size;
+                    let inner_ = inner;
+                    let nvh = num_v_heads;
+                    let nkh = num_k_heads;
+                    let eps = 1e-6f32;
+                    let nb = n_batch;
+                    pool.scatter_wait(nvh, move |vh| {
+                        let kh = vh % nkh;
+                        let s_off = vh * ssz * ssz;
+                        let qkv_all = unsafe {
+                            std::slice::from_raw_parts(qkv2_a as *const f32, nb * qkv_len)
+                        };
+                        let state_all = unsafe {
+                            std::slice::from_raw_parts_mut(state_a as *mut f32, s_off + ssz * ssz)
+                        };
+                        let s = &mut state_all[s_off..s_off + ssz * ssz];
+                        let a_s = unsafe { std::slice::from_raw_parts(a_a as *const f32, nvh) };
+                        let alpha_s = unsafe { std::slice::from_raw_parts(alpha_a as *const f32, nb * nvh) };
+                        let beta_s = unsafe { std::slice::from_raw_parts(beta_a as *const f32, nb * nvh) };
+                        let dt_s = unsafe { std::slice::from_raw_parts(dt_a as *const f32, nvh) };
+                        let norm_w = unsafe { std::slice::from_raw_parts(nw_a as *const f32, ssz) };
+                        let gate_all = unsafe { std::slice::from_raw_parts(gate_a as *const f32, nb * inner_) };
+                        let y_all = unsafe { std::slice::from_raw_parts_mut(y_a as *mut f32, nb * inner_) };
+                        for t in 0..nb {
+                            let row = &qkv_all[t * qkv_len..(t + 1) * qkv_len];
+                            let q_head = &row[kh * ssz..(kh + 1) * ssz];
+                            let k_head = &row[qd + kh * ssz..qd + (kh + 1) * ssz];
+                            let v_head = &row[2 * qd + vh * ssz..2 * qd + (vh + 1) * ssz];
+                            let y_off = t * inner_ + vh * ssz;
+                            let y = &mut y_all[y_off..y_off + ssz];
+                            crate::model::ssm::ssm_scan_vhead(
+                                s, y, q_head, k_head, v_head,
+                                a_s[vh], alpha_s[t * nvh + vh], beta_s[t * nvh + vh], dt_s[vh],
+                                ssz,
+                            );
+                            let g_off = t * inner_ + vh * ssz;
+                            crate::model::ssm::ssm_output_gate_head(
+                                y, &gate_all[g_off..g_off + ssz], norm_w, ssz, eps,
+                            );
+                        }
+                    });
+                }
+            } else {
             for t in 0..n_batch {
                 let qkv_t = &qkv_buf[t * ssm_qkv_dim..(t + 1) * ssm_qkv_dim];
                 let alpha_t = &ssm_alpha_buf[t * ssm_alpha_dim..(t + 1) * ssm_alpha_dim];
@@ -825,44 +1136,11 @@ pub fn forward_batch_with_vision(
                             a[vh], alpha_t[vh], beta_t[vh], dt_bias[vh],
                             state_size,
                         );
-                        // output gate (fused, AVX2)
-                        // ★ 与 ssm.rs 同算法, 内联此处因 y_off 是 per-v_head 偏移
-                        //   head_dim=128 = 16×8-wide, 无尾处理
-                        #[cfg(target_arch = "x86_64")]
-                        if use_avx2 {
-                            #[allow(unsafe_code)]
-                            unsafe {
-                                use std::arch::x86_64::*;
-                                let mut ss_v = _mm256_setzero_ps();
-                                for i in (0..state_size).step_by(8) {
-                                    let yv = _mm256_loadu_ps(y.as_ptr().add(i));
-                                    ss_v = _mm256_fmadd_ps(yv, yv, ss_v);
-                                }
-                                let ss = hsum_ps(ss_v);
-                                let inv_rms = 1.0 / (ss / state_size as f32 + l2norm_eps).sqrt();
-                                let inv_rms_v = _mm256_set1_ps(inv_rms);
-                                let gate_vh = &gate_t[y_off..y_off + state_size];
-                                for i in (0..state_size).step_by(8) {
-                                    let yv = _mm256_loadu_ps(y.as_ptr().add(i));
-                                    let nw = _mm256_loadu_ps(ssm_norm_w.as_ptr().add(i));
-                                    let gv = _mm256_loadu_ps(gate_vh.as_ptr().add(i));
-                                    let scaled = _mm256_mul_ps(yv, inv_rms_v);
-                                    let gated = _mm256_mul_ps(scaled, nw);
-                                    let result = _mm256_mul_ps(gated, gv);
-                                    _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
-                                }
-                            }
-                        } else {
-                            let mut ss = 0.0f32;
-                            for i in 0..state_size {
-                                ss += y[i] * y[i];
-                            }
-                            let inv_rms = 1.0 / (ss / state_size as f32 + l2norm_eps).sqrt();
-                            let gate_vh = &gate_t[y_off..y_off + state_size];
-                            for i in 0..state_size {
-                                y[i] = y[i] * inv_rms * ssm_norm_w[i] * gate_vh[i];
-                            }
-                        }
+                        // output gate (★ 提取为 ssm::ssm_output_gate_head, 与原 inline 逐指令一致)
+                        let gate_vh = &gate_t[y_off..y_off + state_size];
+                        crate::model::ssm::ssm_output_gate_head(
+                            y, gate_vh, ssm_norm_w, state_size, l2norm_eps,
+                        );
                     }
                 } else {
                     let pool = pool.unwrap();
@@ -912,46 +1190,15 @@ pub fn forward_batch_with_vision(
                                 a_s[vh], alpha_s[vh], beta_s[vh], dt_s[vh],
                                 ss,
                             );
-                            // output gate (fused, per-v_head 独立, AVX2)
-                            // ★ 与串行路径同算法, head_dim=128=16×8-wide
-                            #[cfg(target_arch = "x86_64")]
-                            if use_avx2 {
-                                #[allow(unsafe_code)]
-                                unsafe {
-                                    use std::arch::x86_64::*;
-                                    let mut ss_v = _mm256_setzero_ps();
-                                    for i in (0..ss).step_by(8) {
-                                        let yv = _mm256_loadu_ps(y.as_ptr().add(i));
-                                        ss_v = _mm256_fmadd_ps(yv, yv, ss_v);
-                                    }
-                                    let sum_sq = hsum_ps(ss_v);
-                                    let inv_rms = 1.0 / (sum_sq / ss as f32 + eps).sqrt();
-                                    let inv_rms_v = _mm256_set1_ps(inv_rms);
-                                    let gate_vh = &gate_s[y_off..y_off + ss];
-                                    for i in (0..ss).step_by(8) {
-                                        let yv = _mm256_loadu_ps(y.as_ptr().add(i));
-                                        let nw = _mm256_loadu_ps(norm_w.as_ptr().add(i));
-                                        let gv = _mm256_loadu_ps(gate_vh.as_ptr().add(i));
-                                        let scaled = _mm256_mul_ps(yv, inv_rms_v);
-                                        let gated = _mm256_mul_ps(scaled, nw);
-                                        let result = _mm256_mul_ps(gated, gv);
-                                        _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
-                                    }
-                                }
-                            } else {
-                                let mut sum_sq = 0.0f32;
-                                for i in 0..ss {
-                                    sum_sq += y[i] * y[i];
-                                }
-                                let inv_rms = 1.0 / (sum_sq / ss as f32 + eps).sqrt();
-                                let gate_vh = &gate_s[y_off..y_off + ss];
-                                for i in 0..ss {
-                                    y[i] = y[i] * inv_rms * norm_w[i] * gate_vh[i];
-                                }
-                            }
+                            // output gate (★ 提取为 ssm::ssm_output_gate_head, 与原 inline 逐指令一致)
+                            let gate_vh = &gate_s[y_off..y_off + ss];
+                            crate::model::ssm::ssm_output_gate_head(
+                                y, gate_vh, norm_w, ss, eps,
+                            );
                         }
                     });
                 }
+            }
             }
             if let Some(ts) = ts_ssm { p_ssm_serial += ts.elapsed(); }
 
@@ -978,11 +1225,27 @@ pub fn forward_batch_with_vision(
         // 4c. SwiGLU: gate = silu(gate) * up (in-place on qkv_buf, 读 tmp_buf)
         //    ★ 两 buffer 连续, 合并为单次调用 (消除 n_batch-1 次函数调用 + 尾部分支)
         //    ffn_dim=17408 是 8 的倍数, n_batch*ffn_dim 仍是 8 的倍数, 无尾处理
+        //    ★ 并行化: 纯元素级操作 (silu(g)*u), 任一切分与单次全量调用逐元素一致;
+        //      大批量 (swiglu 段实测 110ms/142t 热态) 以 token 行为单元 work-stealing。
         let ts = if profile { Some(std::time::Instant::now()) } else { None };
-        math::swiglu_inplace(
-            &mut qkv_buf[..n_batch * ffn_dim],
-            &tmp_buf[..n_batch * ffn_dim],
-        );
+        if use_parallel_serial {
+            let pool = crate::model::workspace::get_thread_pool().unwrap();
+            let qkv_a = qkv_buf.as_mut_ptr() as usize;
+            let up_a = tmp_buf.as_ptr() as usize;
+            let fd = ffn_dim;
+            pool.scatter_wait_stealing(n_batch, 1, move |t0, t1| {
+                let lo = t0 * fd;
+                let hi = t1 * fd;
+                let gate = unsafe { std::slice::from_raw_parts_mut(qkv_a as *mut f32, hi) };
+                let up = unsafe { std::slice::from_raw_parts(up_a as *const f32, hi) };
+                math::swiglu_inplace(&mut gate[lo..hi], &up[lo..hi]);
+            });
+        } else {
+            math::swiglu_inplace(
+                &mut qkv_buf[..n_batch * ffn_dim],
+                &tmp_buf[..n_batch * ffn_dim],
+            );
+        }
         if let Some(ts) = ts { p_swiglu += ts.elapsed(); }
 
         // 4d. Batch down projection: h += W_down @ gate
@@ -1114,6 +1377,7 @@ pub fn forward_batch_with_vision(
     ctx.batch_ssm_alpha = ssm_alpha_buf;
     ctx.batch_ssm_beta = ssm_beta_buf;
     ctx.batch_ssm_gate = ssm_gate_buf;
+    ctx.batch_ssm_qkv2 = ssm_qkv2_buf;
     ctx.batch_cos_sin = cos_sin_batch;
 
     Ok(())
@@ -1143,6 +1407,7 @@ pub fn make_context<'a>(
         batch_ssm_alpha: Vec::new(),
         batch_ssm_beta: Vec::new(),
         batch_ssm_gate: Vec::new(),
+        batch_ssm_qkv2: Vec::new(),
         batch_cos_sin: Vec::new(),
     }
 }

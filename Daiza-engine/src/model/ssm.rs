@@ -284,6 +284,54 @@ pub(crate) unsafe fn ssm_output_gate_avx2(
     let _ = (inv_hd_v, eps_v);
 }
 
+/// Per-v_head 输出 gate (batch 路径): y = rmsnorm(y) * ssm_norm_w * gate
+///
+/// ★ 从 forward_batch inline 实现逐指令提取, 保证与原 batch 路径字节级一致
+///   (div 语义 `ss / head_dim as f32`); decode 路径 (ssm_output_gate_avx2)
+///   用 mul 语义 (ss * inv_hd), 两者相差 ≤1ulp, 互不影响。
+/// `gate_vh`: 已 silu 的 gate 切片 [head_dim] (per v_head)
+pub(crate) fn ssm_output_gate_head(
+    y: &mut [f32],
+    gate_vh: &[f32],
+    norm_w: &[f32],
+    head_dim: usize,
+    eps: f32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        #[allow(unsafe_code)]
+        unsafe {
+            use core::arch::x86_64::*;
+            let mut ss_v = _mm256_setzero_ps();
+            for i in (0..head_dim).step_by(8) {
+                let yv = _mm256_loadu_ps(y.as_ptr().add(i));
+                ss_v = _mm256_fmadd_ps(yv, yv, ss_v);
+            }
+            let ss = hsum_ps(ss_v);
+            let inv_rms = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+            let inv_rms_v = _mm256_set1_ps(inv_rms);
+            for i in (0..head_dim).step_by(8) {
+                let yv = _mm256_loadu_ps(y.as_ptr().add(i));
+                let nw = _mm256_loadu_ps(norm_w.as_ptr().add(i));
+                let gv = _mm256_loadu_ps(gate_vh.as_ptr().add(i));
+                let scaled = _mm256_mul_ps(yv, inv_rms_v);
+                let gated = _mm256_mul_ps(scaled, nw);
+                let result = _mm256_mul_ps(gated, gv);
+                _mm256_storeu_ps(y.as_mut_ptr().add(i), result);
+            }
+        }
+        return;
+    }
+    let mut ss = 0.0f32;
+    for i in 0..head_dim {
+        ss += y[i] * y[i];
+    }
+    let inv_rms = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+    for i in 0..head_dim {
+        y[i] = y[i] * inv_rms * norm_w[i] * gate_vh[i];
+    }
+}
+
 /// 标量融合 fallback(与 AVX2 版本逻辑一致)
 #[inline(never)]
 fn ssm_scan_fused_scalar(
