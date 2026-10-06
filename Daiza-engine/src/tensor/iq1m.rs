@@ -695,20 +695,20 @@ fn dequantize_block_into(block: &[u8], out: &mut Vec<f32>) {
     for ib in 0..8 {
         let bit_off = 6 * (ib % 2);
         let sc_idx = ib / 2;
-        let s1 = ((sc[sc_idx] >> (bit_off + 0)) & 0x7) as i32;
+        let s1 = ((sc[sc_idx] >> bit_off) & 0x7) as i32;
         let s2 = ((sc[sc_idx] >> (bit_off + 3)) & 0x7) as i32;
         let dl1 = d * (2.0 * s1 as f32 + 1.0);
         let dl2 = d * (2.0 * s2 as f32 + 1.0);
 
         // 4 个 11-bit grid 索引
-        let idx0 = (qs[qs_off + 0] as u16) | (((qh[qh_off + 0] as u16) << 8) & 0x700);
-        let idx1 = (qs[qs_off + 1] as u16) | (((qh[qh_off + 0] as u16) << 4) & 0x700);
+        let idx0 = (qs[qs_off] as u16) | (((qh[qh_off] as u16) << 8) & 0x700);
+        let idx1 = (qs[qs_off + 1] as u16) | (((qh[qh_off] as u16) << 4) & 0x700);
         let idx2 = (qs[qs_off + 2] as u16) | (((qh[qh_off + 1] as u16) << 8) & 0x700);
         let idx3 = (qs[qs_off + 3] as u16) | (((qh[qh_off + 1] as u16) << 4) & 0x700);
 
         // 4 个 delta 符号位
-        let delta0 = if qh[qh_off + 0] & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
-        let delta1 = if qh[qh_off + 0] & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
+        let delta0 = if qh[qh_off] & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
+        let delta1 = if qh[qh_off] & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
         let delta2 = if qh[qh_off + 1] & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
         let delta3 = if qh[qh_off + 1] & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
 
@@ -764,18 +764,18 @@ fn dequantize_block_into_checked(block: &[u8], out: &mut [f32], out_idx: &mut us
     for ib in 0..8 {
         let bit_off = 6 * (ib % 2);
         let sc_idx = ib / 2;
-        let s1 = ((sc[sc_idx] >> (bit_off + 0)) & 0x7) as i32;
+        let s1 = ((sc[sc_idx] >> bit_off) & 0x7) as i32;
         let s2 = ((sc[sc_idx] >> (bit_off + 3)) & 0x7) as i32;
         let dl1 = d * (2.0 * s1 as f32 + 1.0);
         let dl2 = d * (2.0 * s2 as f32 + 1.0);
 
-        let idx0 = (qs[qs_off + 0] as u16) | (((qh[qh_off + 0] as u16) << 8) & 0x700);
-        let idx1 = (qs[qs_off + 1] as u16) | (((qh[qh_off + 0] as u16) << 4) & 0x700);
+        let idx0 = (qs[qs_off] as u16) | (((qh[qh_off] as u16) << 8) & 0x700);
+        let idx1 = (qs[qs_off + 1] as u16) | (((qh[qh_off] as u16) << 4) & 0x700);
         let idx2 = (qs[qs_off + 2] as u16) | (((qh[qh_off + 1] as u16) << 8) & 0x700);
         let idx3 = (qs[qs_off + 3] as u16) | (((qh[qh_off + 1] as u16) << 4) & 0x700);
 
-        let delta0 = if qh[qh_off + 0] & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
-        let delta1 = if qh[qh_off + 0] & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
+        let delta0 = if qh[qh_off] & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
+        let delta1 = if qh[qh_off] & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
         let delta2 = if qh[qh_off + 1] & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
         let delta3 = if qh[qh_off + 1] & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
 

@@ -739,6 +739,8 @@ pub unsafe fn dot_q1_0_row_quad_avx2(
 }
 
 /// scalar fallback(非 AVX2 平台用,逻辑与 v3 一致)
+// 8 行展开的 bit-0 项刻意保留 `+ 0`/`>> 0` 前缀, 与 bit1..7 保持对称可读
+#[allow(clippy::identity_op)]
 pub fn dot_q1_0_row_scalar(data: &[u8], row_idx: usize, n_cols: usize, x: &[f32]) -> f32 {
     debug_assert!(x.len() >= n_cols);
     let groups_per_row = n_cols / Q1_0_GROUP_SIZE;
@@ -1102,8 +1104,8 @@ pub unsafe fn dot_q1_0_row_batch_avx2(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
-// 4 行展开的 row-0 项刻意保留 `0 *` 前缀, 与 row1/2/3 保持对称可读
-#[allow(clippy::erasing_op)]
+// 4 行展开的 row-0 项刻意保留 `0 *`/`1 *` 前缀, 与 row1/2/3 保持对称可读
+#[allow(clippy::erasing_op, clippy::identity_op)]
 #[inline]
 pub unsafe fn dot_q1_0_row_batch4_avx2(
     data: &[u8],
