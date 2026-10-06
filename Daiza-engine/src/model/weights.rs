@@ -10,8 +10,8 @@
 
 use crate::gguf::parser::GgufFile;
 use crate::gguf::tensor_info::TensorType;
-use crate::tensor::tensor::Tensor;
-use crate::tensor::tensor::load_as_f32;
+use crate::tensor::Tensor;
+use crate::tensor::load_as_f32;
 #[cfg(not(target_arch = "x86_64"))]
 use crate::tensor::quant::{
     avx2_q1_0_available, dot_q1_0_row_batch, dot_q1_0_row_scalar,

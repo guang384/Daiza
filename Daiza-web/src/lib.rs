@@ -849,6 +849,7 @@ fn is_supported_image(b: &[u8]) -> bool {
 /// 流式: 每 token 通过 on_delta 回调增量发送 SSE delta
 ///
 /// `fallback_enabled`: DSpark 自动降级开关 (probe 检测慢于 native 时切原生 decode)
+#[allow(clippy::too_many_arguments)]
 fn handle_chat_dspark(
     engine: &mut Engine,
     msg: &str,

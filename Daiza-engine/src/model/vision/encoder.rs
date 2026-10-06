@@ -162,6 +162,8 @@ struct CPtr<T>(*const T);
 unsafe impl<T> Send for CPtr<T> {}
 unsafe impl<T> Sync for CPtr<T> {}
 impl<T> CPtr<T> {
+    // CPtr 是 Copy (包装裸指针), 按值取 self 比 &self 更高效 (无借用开销)
+    #[allow(clippy::wrong_self_convention)]
     #[inline(always)]
     fn as_ptr(self) -> *const T { self.0 }
 }
@@ -171,6 +173,8 @@ struct MPtr<T>(*mut T);
 unsafe impl<T> Send for MPtr<T> {}
 unsafe impl<T> Sync for MPtr<T> {}
 impl<T> MPtr<T> {
+    // MPtr 是 Copy (包装裸指针), 按值取 self 比 &self 更高效 (无借用开销)
+    #[allow(clippy::wrong_self_convention)]
     #[inline(always)]
     fn as_ptr(self) -> *mut T { self.0 }
 }
@@ -358,6 +362,7 @@ pub fn encode_image(
 
 /// 单个 ViT block 前向 (bidirectional attention + MLP, 残差连接)
 /// 所有 per-patch / per-head 循环并行化
+#[allow(clippy::too_many_arguments)]
 fn forward_vit_block(
     blk: &ViTBlockWeights,
     cfg: &VisionConfig,

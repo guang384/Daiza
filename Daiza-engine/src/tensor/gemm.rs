@@ -149,6 +149,7 @@ unsafe fn prep_scratch_avx2(
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn gemm_pair4t_gb_avx2(
     x: &[f32],
     cols: usize,
@@ -228,6 +229,7 @@ unsafe fn gemm_pair4t_gb_avx2(
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 fn gemm_rows_range_avx2(
     w_bytes: &[u8],

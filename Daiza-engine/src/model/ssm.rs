@@ -149,6 +149,7 @@ unsafe fn l2norm_inplace_avx2(x: &mut [f32], eps: f32) {
 ///
 /// ★ P0-2 优化: 内层 j 循环手写 AVX2 (head_dim=128 = 16 × 8-wide FMA)
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ssm_scan_vhead(
     s: &mut [f32],
     y: &mut [f32],
@@ -333,6 +334,7 @@ pub(crate) fn ssm_output_gate_head(
 }
 
 /// 标量融合 fallback(与 AVX2 版本逻辑一致)
+#[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn ssm_scan_fused_scalar(
     s: &mut [f32],
@@ -370,6 +372,7 @@ fn ssm_scan_fused_scalar(
 /// 消除分离实现中 Pass 2 的 L2 重新加载 (S 64KB > L1 32KB)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 #[inline]
 unsafe fn ssm_scan_fused_avx2(

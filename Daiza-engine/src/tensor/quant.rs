@@ -921,6 +921,7 @@ pub unsafe fn dot_q1_0_q8_0_row_avx2(
 ///
 /// - `x`: `[n_batch * x_stride]` 行优先 (通常 `x_stride = n_cols`)
 /// - `y`: `[n_batch * y_stride]` 输出 (通常 `y_stride = 1`, 即 `y[t]` 是第 t 个输出)
+#[allow(clippy::too_many_arguments)]
 pub fn dot_q1_0_row_batch(
     data: &[u8],
     row_idx: usize,
@@ -977,6 +978,7 @@ pub fn dot_q1_0_row_batch(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
 #[inline]
 pub unsafe fn dot_q1_0_row_batch_avx2(
     data: &[u8],
@@ -1676,6 +1678,7 @@ pub unsafe fn dot_q4_1_row_avx2(
 /// - `x` 与 `y` 不得重叠。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
+#[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 #[inline]
 pub unsafe fn dot_q4_1_row_batch_avx2(
@@ -1809,6 +1812,7 @@ pub unsafe fn dot_q4_1_row_batch_avx2(
 
 /// Q4_1 batched matvec 入口 (runtime AVX2 检测 + scalar fallback)
 ///
+#[allow(clippy::too_many_arguments)]
 /// 计算 `y[t * y_stride + row_idx] = dot(W[row_idx], x[t * x_stride..t * x_stride + n_cols])`
 /// 对 t ∈ 0..n_batch。同一 W 行被所有 token 共享 (只 unpack 一次)。
 #[allow(unsafe_code)]

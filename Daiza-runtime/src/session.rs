@@ -413,6 +413,7 @@ pub fn drain_complete_utf8(pending: &mut Vec<u8>) -> String {
 ///
 /// `on_delta(&str)` 返回 false 可中断生成 (已生成部分照常入库)。
 /// 若 session.tools 非空 (tool_call 模式), 回调只触发一次 (完整输出)。
+#[allow(clippy::too_many_arguments)]
 pub fn session_reply_stream(
     cfg: &Config,
     weights: &LoadedWeights,
@@ -432,6 +433,7 @@ pub fn session_reply_stream(
 /// tool_response 回传后的流式生成
 ///
 /// 构造 `<|im_end|>\n<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n<|im_start|>assistant\n` 增量 prompt,
+#[allow(clippy::too_many_arguments)]
 /// 复用 reply_with_increment_stream 核心逻辑。
 pub fn session_reply_tool_response_stream(
     cfg: &Config,
@@ -465,7 +467,7 @@ fn build_tool_response_increment(session: &Session, content: &str) -> String {
     }
     s
 }
-
+#[allow(clippy::too_many_arguments)]
 /// 核心流式生成: 接收已构造好的 increment, 执行 prefill + decode + on_delta 回调
 fn reply_with_increment_stream(
     cfg: &Config,
@@ -600,6 +602,7 @@ fn reply_with_increment_stream(
 /// - 调用方需提供 vision_ctx (从 engine.vision 借用)
 /// - 消费 session.pending_images 并清空
 ///
+#[allow(clippy::too_many_arguments)]
 /// `vision_embeddings`: 扁平 [n_total_patch * hidden] 行优先
 /// `n_vision_per_image`: 单张图展开后的 patch 数
 /// `image_token_id`: image_token 的 token id
@@ -624,6 +627,7 @@ pub fn session_reply_with_vision(
 }
 
 /// 流式版 session_reply_with_vision: 支持 on_delta 增量文本 + on_progress 进度上报
+#[allow(clippy::too_many_arguments)]
 ///
 /// 与 session_reply_with_vision 的区别:
 /// - decode 循环中每步通过 on_delta 上报增量文本 (UTF-8 边界对齐)
@@ -651,6 +655,7 @@ pub fn session_reply_with_vision_stream(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_reply_with_vision_inner(
     cfg: &Config,
     weights: &LoadedWeights,
