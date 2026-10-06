@@ -917,7 +917,7 @@ impl Engine {
     ///
     /// 前端可实现"乐观显示": drafter 预测的文本先灰色显示, verify 通过保留,
     /// verify 拒绝则用 accepted 部分替换。回调返回 false 可中断生成。
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_with_dspark_stream(
         &mut self,
         prompt: &str,

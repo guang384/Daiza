@@ -1831,7 +1831,10 @@ pub fn dot_q4_1_row_batch(
     debug_assert!(x.len() >= n_batch * x_stride);
     debug_assert!(y.len() >= n_batch * y_stride);
     debug_assert!(x_stride >= n_cols, "x_stride {x_stride} < n_cols {n_cols}");
-    debug_assert!(row_idx < y_stride, "row_idx {row_idx} >= y_stride {y_stride}");
+    debug_assert!(
+        row_idx < y_stride,
+        "row_idx {row_idx} >= y_stride {y_stride}"
+    );
     if n_batch == 0 {
         return;
     }
