@@ -14,7 +14,7 @@
 use std::arch::x86_64::*;
 use crate::math::simd_exp::{simd_available, exp_ps};
 
-const SQRT_2_OVER_PI: f32 = 0.7978845608028654; // sqrt(2/pi)
+const SQRT_2_OVER_PI: f32 = 0.7978846; // sqrt(2/pi), f32 最短往返表示 (位级 = 0x3f4c422a)
 const GELU_CONST: f32 = 0.044715;
 
 /// AVX2 tanh 近似 GELU 内核: `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`
@@ -118,14 +118,15 @@ pub fn gelu_inplace(x: &mut [f32]) {
 //   t = 1 / (1 + p*|z|),  p = 0.3275911
 //   erf(z) = sign(z) * (1 - (a1*t + a2*t^2 + a3*t^3 + a4*t^4 + a5*t^5) * exp(-z^2))
 //   a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429
+//   (下方 const 为上述参考值的 f32 最短往返字面量, 与原高精度字面量位级一致)
 // ============================================================================
 
 const ERF_P: f32 = 0.3275911;
-const ERF_A1: f32 = 0.254829592;
-const ERF_A2: f32 = -0.284496736;
-const ERF_A3: f32 = 1.421413741;
-const ERF_A4: f32 = -1.453152027;
-const ERF_A5: f32 = 1.061405429;
+const ERF_A1: f32 = 0.2548296;
+const ERF_A2: f32 = -0.28449672;
+const ERF_A3: f32 = 1.4214138;
+const ERF_A4: f32 = -1.4531521;
+const ERF_A5: f32 = 1.0614054;
 const INV_SQRT_2: f32 = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2)
 
 /// AVX2 精确 GELU 内核 (erf 版本)

@@ -7,7 +7,7 @@
 //!    - 输入 patch 的二维索引 (py, px), n_per_side=48
 //!    - 合并后: n_patches_merged = 2304 / 4 = 576, merged_hidden = 4 * 1152 = 4608
 //!    - 重排: merged[m] = concat(vit_out[py_0, px_0], vit_out[py_0, px_1],
-//!                                vit_out[py_1, px_0], vit_out[py_1, px_1])
+//!      vit_out[py_1, px_0], vit_out[py_1, px_1])
 //!      其中 (py_0, py_1) = (2*my, 2*my+1), (px_0, px_1) = (2*mx, 2*mx+1)
 //!    - 输出: `merged` [n_patches_merged=576, merged_hidden=4608] 行优先
 //!

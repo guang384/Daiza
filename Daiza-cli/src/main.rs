@@ -194,7 +194,7 @@ fn run_repl(
                         continue;
                     }
                     print_repl_reply_header();
-                    match engine.generate_raw(&rest, max_tokens, params.clone()) {
+                    match engine.generate_raw(&rest, max_tokens, params) {
                         Ok(out) => println!("{out}"),
                         Err(e) => eprintln!("[repl] error: {e}"),
                     }
@@ -472,7 +472,7 @@ fn run_repl(
                             }
                             let resp = daiza_runtime::tool_call::ToolResponse { name, content };
                             print_repl_reply_header();
-                            match engine.session_reply_with_tool_response(&[resp], max_tokens, params.clone()) {
+                            match engine.session_reply_with_tool_response(&[resp], max_tokens, params) {
                                 Ok(out) => println!("{out}"),
                                 Err(e) => eprintln!("[repl] tool_response error: {e}"),
                             }
@@ -500,9 +500,9 @@ fn run_repl(
             .unwrap_or(false);
         print_repl_reply_header();
         let result = if has_images {
-            engine.session_reply_with_vision(msg, max_tokens, params.clone())
+            engine.session_reply_with_vision(msg, max_tokens, params)
         } else {
-            engine.session_reply(msg, max_tokens, params.clone())
+            engine.session_reply(msg, max_tokens, params)
         };
         match result {
             Ok(out) => println!("{out}"),
@@ -684,14 +684,14 @@ fn run_self_test(mut engine: Engine, max_tokens: usize) -> Result<()> {
     // 方式 A: generate_with_params (全量重算, 无 session)
     let dump_a_path = tmp_dir.join("selftest_a.txt");
     std::env::set_var("DAIZA_DUMP_TOKENS", dump_a_path.to_str().unwrap());
-    let out_a = engine.generate_with_params(prompt1, max_tokens, params.clone(), Some(sys))?;
+    let out_a = engine.generate_with_params(prompt1, max_tokens, params, Some(sys))?;
     std::env::remove_var("DAIZA_DUMP_TOKENS");
 
     // 方式 B: session_reply (增量 prefill, 首轮与 A 输入完全一致)
     engine.session_begin(true, Some(sys))?;
     let dump_b_path = tmp_dir.join("selftest_b.txt");
     std::env::set_var("DAIZA_DUMP_TOKENS", dump_b_path.to_str().unwrap());
-    let out_b = engine.session_reply(prompt1, max_tokens, params.clone())?;
+    let out_b = engine.session_reply(prompt1, max_tokens, params)?;
     std::env::remove_var("DAIZA_DUMP_TOKENS");
     engine.session_end();
 
@@ -732,7 +732,7 @@ fn run_self_test(mut engine: Engine, max_tokens: usize) -> Result<()> {
         let dump_path = tmp_dir.join(format!("selftest_r{}.txt", i + 1));
         std::env::set_var("DAIZA_DUMP_TOKENS", dump_path.to_str().unwrap());
         let t = std::time::Instant::now();
-        let out = engine.session_reply(p, mt_tokens, params.clone())?;
+        let out = engine.session_reply(p, mt_tokens, params)?;
         let ms = t.elapsed().as_millis();
         std::env::remove_var("DAIZA_DUMP_TOKENS");
         times.push(ms);
@@ -806,17 +806,17 @@ fn run_self_test(mut engine: Engine, max_tokens: usize) -> Result<()> {
     engine.session = Some(loaded_session);
     let verify_prompt = "我叫什么名字?";
     let t = std::time::Instant::now();
-    let out_loaded = engine.session_reply(verify_prompt, max_tokens, params.clone())?;
+    let out_loaded = engine.session_reply(verify_prompt, max_tokens, params)?;
     let loaded_reply_ms = t.elapsed().as_millis();
 
     // 4d: 重新跑一个连续 session 到相同状态, 对比输出
     engine.session_end();
     engine.session_begin(false, Some(sys))?; // think off, 与 test2 一致
     for p in &prompts {
-        engine.session_reply(p, max_tokens, params.clone())?;
+        engine.session_reply(p, max_tokens, params)?;
     }
     let t = std::time::Instant::now();
-    let out_continuous = engine.session_reply(verify_prompt, max_tokens, params.clone())?;
+    let out_continuous = engine.session_reply(verify_prompt, max_tokens, params)?;
     let continuous_reply_ms = t.elapsed().as_millis();
 
     let pass4 = out_loaded == out_continuous;
@@ -842,7 +842,7 @@ fn run_self_test(mut engine: Engine, max_tokens: usize) -> Result<()> {
     engine.session_end();
     engine.session_begin(false, Some(sys))?; // think off
     mgr.set_active_id(Some("session_a".to_string()));
-    let _ = engine.session_reply("请记住我的名字叫张三丰", max_tokens, params.clone())?;
+    let _ = engine.session_reply("请记住我的名字叫张三丰", max_tokens, params)?;
     let a_pos_before_park = engine.session.as_ref().map(|s| s.state.pos).unwrap_or(0);
     let a_hist_before_park = engine.session.as_ref().map(|s| s.history_tokens.len()).unwrap_or(0);
     println!("  5a: session_a replied, pos={a_pos_before_park}, hist={a_hist_before_park}");
@@ -857,7 +857,7 @@ fn run_self_test(mut engine: Engine, max_tokens: usize) -> Result<()> {
     // 5c: 创建 session_b, 告知不同名字
     engine.session_begin(false, Some(sys))?;
     mgr.set_active_id(Some("session_b".to_string()));
-    let _ = engine.session_reply("请记住我的名字叫李四光", max_tokens, params.clone())?;
+    let _ = engine.session_reply("请记住我的名字叫李四光", max_tokens, params)?;
     let b_pos = engine.session.as_ref().map(|s| s.state.pos).unwrap_or(0);
     println!("  5c: session_b replied, pos={b_pos}");
 
@@ -887,7 +887,7 @@ fn run_self_test(mut engine: Engine, max_tokens: usize) -> Result<()> {
         if hist_conserved { "PASS" } else { "FAIL" });
 
     // 5g: 回复验证 (info only — 依赖模型质量 + max_tokens, 不影响 pass/fail)
-    let out_a_recall = engine.session_reply("我叫什么名字?", max_tokens, params.clone())?;
+    let out_a_recall = engine.session_reply("我叫什么名字?", max_tokens, params)?;
     let a_remembered = out_a_recall.contains("张三丰");
     let a_not_confused = !out_a_recall.contains("李四光");
     let recall_preview: String = out_a_recall.char_indices().take(60).last().map(|(i,_)| out_a_recall[..i].to_string()).unwrap_or_else(|| out_a_recall.clone());
@@ -950,7 +950,7 @@ fn run_self_test(mut engine: Engine, max_tokens: usize) -> Result<()> {
     println!("Overall: {}", if total_pass { "PASS" } else { "FAIL" });
 
     // 清理临时文件: 整个 selftest_tmp/ 目录一次性删除 (包含所有 selftest_*.txt / .dzss / mgr_sessions/)
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(tmp_dir);
 
     Ok(())
 }

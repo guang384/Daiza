@@ -559,11 +559,9 @@ fn reply_with_increment_stream(
             // 增量解码: 仅追加本 token 的 bytes, 再对齐 UTF-8 边界输出 delta
             decode_token_bytes(tokenizer, next_id as u32, &mut pending_bytes);
             let delta = drain_complete_utf8(&mut pending_bytes);
-            if !delta.is_empty() {
-                if !on_delta(&delta) {
-                    broke = true;
-                    break;
-                }
+            if !delta.is_empty() && !on_delta(&delta) {
+                broke = true;
+                break;
             }
         }
         // 收尾: 未提前中断时, 把残留的不完整字节以 lossy 形式上报
@@ -880,8 +878,8 @@ fn session_reply_with_vision_inner(
 /// 与普通 session_reply 的区别:
 /// - 每次都从 0 开始 prefill 完整 messages (tool_call 需要 multi-step 完整重渲染)
 ///   TODO(perf): 多轮 tool_call 下每轮都从 pos=0 重 prefill 整段历史 → 跨轮 O(N²)。
-///               后续可考虑增量 prefill + KV cache 复用 (需解决 tool_call 模板
-///               增量拼接的复杂性, 当前为正确性优先而完整重渲染)。
+///   后续可考虑增量 prefill + KV cache 复用 (需解决 tool_call 模板
+///   增量拼接的复杂性, 当前为正确性优先而完整重渲染)。
 /// - 不走增量 prefill (messages 历史复杂, 增量拼接易出错)
 /// - 渲染 system prompt 时注入 tools 定义
 /// - decode 后解析 <tool_call> 标签, 返回结构化 ToolCall 结果
@@ -1013,7 +1011,7 @@ fn session_reply_with_tools(
 /// 1. 把 ToolResponse 追加到 session.messages
 /// 2. 从 0 开始完整 prefill + decode (与 session_reply_with_tools 一致)
 ///    TODO(perf): 与 session_reply_with_tools 相同的跨轮 O(N²) 重 prefill 问题;
-///                每次 tool response 都重跑整段历史。后续可与 tools 路径一并优化。
+///    每次 tool response 都重跑整段历史。后续可与 tools 路径一并优化。
 pub fn session_reply_with_tool_response(
     cfg: &Config,
     weights: &LoadedWeights,

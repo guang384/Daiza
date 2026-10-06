@@ -74,8 +74,8 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, String, Optio
                 let head = String::from_utf8_lossy(&buf[..pos]);
                 for line in head.lines() {
                     let l = line.to_ascii_lowercase();
-                    if l.starts_with("content-length:") {
-                        content_len = l[15..].trim().parse().unwrap_or(0);
+                    if let Some(v) = l.strip_prefix("content-length:") {
+                        content_len = v.trim().parse().unwrap_or(0);
                     }
                 }
             }
@@ -744,9 +744,7 @@ fn decode_loop(
             // flush 残留字节
             if !pending_bytes.is_empty() {
                 let tail = String::from_utf8_lossy(&pending_bytes);
-                if !tail.is_empty() {
-                    if !on_delta(&tail) { return Ok("stop"); }
-                }
+                if !tail.is_empty() && !on_delta(&tail) { return Ok("stop"); }
             }
             return Ok("stop");
         }
@@ -764,9 +762,7 @@ fn decode_loop(
             }
         }
 
-        if !delta.is_empty() {
-            if !on_delta(&delta) { return Ok("stop"); }
-        }
+        if !delta.is_empty() && !on_delta(&delta) { return Ok("stop"); }
 
         if stop_hit {
             return Ok("stop");

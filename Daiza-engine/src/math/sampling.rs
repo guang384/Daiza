@@ -76,7 +76,7 @@ pub fn apply_repetition_penalty(
             let tok = window_slice[i];
             // 跳过本 token 之前已处理过的相同 token (避免重复应用)
             // 简单去重: 若 window_slice[..i] 已包含 tok, 跳过
-            if window_slice[..i].iter().any(|&t| t == tok) {
+            if window_slice[..i].contains(&tok) {
                 continue;
             }
             // 统计 tok 在整个窗口的出现次数

@@ -74,7 +74,7 @@ pub fn run_server_with_listener(
         std::path::Path::new(SESSIONS_DIR),
         MAX_INACTIVE_SESSIONS,
     )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
     let upload_dir = std::path::PathBuf::from(SESSIONS_DIR).join("uploads");
     std::fs::create_dir_all(&upload_dir)?;
     let history_dir = std::path::PathBuf::from(SESSIONS_DIR).join("history");
@@ -322,8 +322,8 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, String)> {
                 let head = String::from_utf8_lossy(&buf[..pos]);
                 for line in head.lines() {
                     let l = line.to_ascii_lowercase();
-                    if l.starts_with("content-length:") {
-                        content_len = l[15..].trim().parse().unwrap_or(0);
+                    if let Some(v) = l.strip_prefix("content-length:") {
+                        content_len = v.trim().parse().unwrap_or(0);
                     }
                 }
             }
@@ -569,7 +569,7 @@ fn handle_chat(stream: &mut TcpStream, shared: &Shared, body: &str) {
     }
 
     let stream_ref = &mut *stream;
-    let params = shared.params.lock().unwrap().clone();
+    let params = *shared.params.lock().unwrap();
     let max_tokens = *shared.max_tokens.lock().unwrap();
     let abort_ref = &shared.abort;
 
@@ -1386,7 +1386,7 @@ fn handle_sessions_history(stream: &mut TcpStream, shared: &Shared, path: &str) 
     // 从 query string 解析 id 参数: ?id=Chat%20123456
     let id = path.split("?id=").nth(1)
         .map(|s| s.split('&').next().unwrap_or(""))
-        .map(|s| url_decode(s))
+        .map(url_decode)
         .unwrap_or_default();
     if id.is_empty() {
         http_response(stream, "400 Bad Request", "application/json; charset=utf-8",
@@ -1715,7 +1715,7 @@ fn handle_chat_tool_response(stream: &mut TcpStream, shared: &Shared, body: &str
     let _use_dspark = shared.use_dspark.load(std::sync::atomic::Ordering::Relaxed)
         && shared.dspark_available;
     let stream_ref = &mut *stream;
-    let params = shared.params.lock().unwrap().clone();
+    let params = *shared.params.lock().unwrap();
     let max_tokens = *shared.max_tokens.lock().unwrap();
     let abort_ref = &shared.abort;
     let mut t_first: Option<std::time::Instant> = None;

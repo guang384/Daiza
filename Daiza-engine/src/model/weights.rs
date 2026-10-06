@@ -763,7 +763,7 @@ impl Q1_0Matrix {
         // x 交错缓冲: thread_local 复用 (每 worker 独立, scatter 内部按行不跨 worker)
         use std::cell::RefCell;
         thread_local! {
-            static X_INT: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+            static X_INT: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
         }
         let interleaved = X_INT.with(|buf| {
             let mut b = buf.borrow_mut();

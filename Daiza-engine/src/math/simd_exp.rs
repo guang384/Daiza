@@ -34,6 +34,11 @@ const LN2_INV: f32 = 1.0 / LN2_F; // 1.4426950
 ///   原 exp_ps(-inf) 产生 NaN (r = -inf - (-inf*ln2) = -inf + inf = NaN),
 ///   导致 attention output 全 NaN。clamp x 到 [-88, 88] 使 exp(-88)≈0 (denormal),
 ///   既消除 NaN 又与 libm 行为一致 (超出 [-88, 88] 返回 0/inf)。
+///
+/// # Safety
+///
+/// 仅可在支持 `avx2+fma` 的 CPU 上调用 (见 `simd_available`), 否则触发 SIGILL;
+/// 纯寄存器计算, 无内存访问, 无其他契约。
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
 pub unsafe fn exp_ps(x: __m256) -> __m256 {
@@ -86,6 +91,11 @@ pub unsafe fn exp_ps(x: __m256) -> __m256 {
 ///   - rcp + Newton:  ~5c (rcp 1c + 2×FMA + 1×MUL = ~5c, ~1 ULP 误差)
 ///   - sigmoid 输出 ∈ [0,1], 1 ULP 相对误差对模型精度无影响
 ///   - 除数 1+exp(-x) ∈ [1, 2], 无 0/inf 边界
+///
+/// # Safety
+///
+/// 仅可在支持 `avx2+fma` 的 CPU 上调用 (见 `simd_available`), 否则触发 SIGILL;
+/// 纯寄存器计算, 无内存访问, 无其他契约。
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
 pub unsafe fn sigmoid_ps(x: __m256) -> __m256 {
@@ -101,6 +111,11 @@ pub unsafe fn sigmoid_ps(x: __m256) -> __m256 {
 }
 
 /// SIMD silu(x) = x * sigmoid(x)
+///
+/// # Safety
+///
+/// 仅可在支持 `avx2+fma` 的 CPU 上调用 (见 `simd_available`), 否则触发 SIGILL;
+/// 纯寄存器计算, 无内存访问, 无其他契约。
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
 pub unsafe fn silu_ps(x: __m256) -> __m256 {
@@ -323,6 +338,10 @@ pub fn dot_product_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
 ///
 /// 算法: 把 256-bit 拆成两个 128-bit, 相加后用 movhdup + movhl 三步 reduce 到标量。
 /// 约 3 cycle (vs store + 7 次标量 add ~5c)。
+///
+/// # Safety
+///
+/// 仅可在支持 `avx2` 的 CPU 上调用, 否则触发 SIGILL; 纯寄存器计算, 无内存访问。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
@@ -340,6 +359,10 @@ pub unsafe fn hsum_ps(v: __m256) -> f32 {
 /// AVX2 水平 max: __m256 → f32 (纯寄存器内 SSE, 无 store)
 ///
 /// 公共实现, 供 softmax.rs 等模块复用。
+///
+/// # Safety
+///
+/// 仅可在支持 `avx2` 的 CPU 上调用, 否则触发 SIGILL; 纯寄存器计算, 无内存访问。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]

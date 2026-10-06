@@ -407,7 +407,7 @@ pub fn gemm_q1_0_batch(
             let t_hi = (t_lo + t_sub).min(n_tokens);
             pool.scatter_wait_stealing(rows, steal_chunk, move |start, end| {
                 thread_local! {
-                    static SCRATCH: RefCell<Vec<u16>> = RefCell::new(Vec::new());
+                    static SCRATCH: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
                 }
                 SCRATCH.with(|buf| {
                     let mut b = buf.borrow_mut();

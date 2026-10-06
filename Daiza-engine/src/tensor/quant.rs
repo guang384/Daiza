@@ -253,6 +253,14 @@ pub fn avx2_q1_0_available() -> bool {
 /// 1. **Sign bit LUT 查表**:256 项 `__m256` LUT(8KB,驻 L1),用一条 `loadu_ps`
 ///    替代 AND+CMPGT+BLENDV 三步依赖链。
 /// 2. **向量累加器**:横向求和延迟到行末只做一次。
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma+f16c` 的 CPU 上调用 (见 `avx2_q1_0_available`), 否则触发 SIGILL。
+/// - `n_cols` 须为 `Q1_0_GROUP_SIZE` (128) 的倍数 (整除截断, 余数列被忽略)。
+/// - `data` 须至少覆盖 `(row_idx + 1) * groups_per_row * Q1_0_BLOCK_BYTES` 字节
+///   (`groups_per_row = n_cols / 128`; 内部 `get_unchecked` 读 scale/sign, 无边界检查)。
+/// - `x` 须至少 `n_cols` 个元素 (全部 unaligned load, 无对齐要求)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
@@ -339,6 +347,14 @@ pub unsafe fn dot_q1_0_row_avx2(
 ///   - 双行: 52B/FMA → 1.23 FMA/cycle (+31%)
 ///
 /// 寄存器: 8 group_acc (4/row × 2) + 2 row_acc + 2 scale = 12/16 YMM
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma+f16c` 的 CPU 上调用 (见 `avx2_q1_0_available`), 否则触发 SIGILL。
+/// - `n_cols` 须为 128 的倍数 (整除截断, 余数列被忽略)。
+/// - `data` 须至少覆盖 `(max(row_idx0, row_idx1) + 1) * groups_per_row * Q1_0_BLOCK_BYTES`
+///   字节 (内部 `get_unchecked` 读 scale/sign, 无边界检查)。
+/// - `x` 须至少 `n_cols` 个元素 (全部 unaligned load, 无对齐要求)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
@@ -462,6 +478,14 @@ pub unsafe fn dot_q1_0_row_dual_avx2(
 /// **寄存器**: 6 group_acc (2/row × 3) + 3 row_acc + 3 scale = 12/16 YMM
 /// 内层循环: 2 sign bytes/iter (8 iter/group), 8 loads + 6 FMAs per iter
 /// load port: 8 loads / 2 ports = 4 cycles, 6 FMAs / 2 ports = 3 cycles → load-bound 4c/6 FMA
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma+f16c` 的 CPU 上调用 (见 `avx2_q1_0_available`), 否则触发 SIGILL。
+/// - `n_cols` 须为 128 的倍数 (整除截断, 余数列被忽略)。
+/// - `data` 须至少覆盖 `(max(row_idx0, row_idx1, row_idx2) + 1) * groups_per_row *
+///   Q1_0_BLOCK_BYTES` 字节 (内部 `get_unchecked` 读 scale/sign, 无边界检查)。
+/// - `x` 须至少 `n_cols` 个元素 (全部 unaligned load, 无对齐要求)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
@@ -576,6 +600,14 @@ pub unsafe fn dot_q1_0_row_triple_avx2(
 /// **寄存器**: 8 group_acc (2/row × 4) + 4 row_acc + 4 scale = 16/16 YMM (满)
 /// 内层循环: 2 sign bytes/iter (8 iter/group), 10 loads + 8 FMAs per iter
 /// load port: 10 loads / 2 ports = 5 cycles, 8 FMAs / 2 ports = 4 cycles → load-bound 5c/8 FMA
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma+f16c` 的 CPU 上调用 (见 `avx2_q1_0_available`), 否则触发 SIGILL。
+/// - `n_cols` 须为 128 的倍数 (整除截断, 余数列被忽略)。
+/// - `data` 须至少覆盖 `(max(row_idx0..=row_idx3) + 1) * groups_per_row * Q1_0_BLOCK_BYTES`
+///   字节 (内部 `get_unchecked` 读 scale/sign, 无边界检查)。
+/// - `x` 须至少 `n_cols` 个元素 (全部 unaligned load, 无对齐要求)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
@@ -792,6 +824,16 @@ pub fn quantize_f32_to_q8_0_simple(x: &[f32]) -> Vec<u8> {
 ///   3. 浮点累加: cvtepi32_ps + fmadd(y_d, sum32, acc_block)
 ///
 /// 浮点 FMA 数量: 5/block (vs LUT 方案 16/block) — 降低功耗密度 70%
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma` 的 CPU 上调用 (f16 scale 走 `f16_to_f32_fast` 位运算, 无需 f16c),
+///   否则触发 SIGILL。
+/// - `n_cols` 须为 128 的倍数 (整除截断, 余数列被忽略)。
+/// - `data` 须至少覆盖 `(row_idx + 1) * groups_per_row * Q1_0_BLOCK_BYTES` 字节
+///   (内部 `get_unchecked` + `read_unaligned`, 无边界检查、无对齐要求)。
+/// - `x_q8` 须为简化 Q8_0 (36 字节/block), 至少 `groups_per_row * 4 * 36` 字节
+///   (每 group 128 值 = 4 个 Q8 block)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
@@ -922,6 +964,17 @@ pub fn dot_q1_0_row_batch(
 /// - LUT load 次数从 n_batch × 64 降到 64 (节省 ~75%)
 /// - scale F16C + broadcast 从 n_batch 降到 1 (节省 ~96%)
 /// - hsum 次数不变 (n_batch, 每 token 行末一次)
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma+f16c` 的 CPU 上调用 (见 `avx2_q1_0_available`), 否则触发 SIGILL。
+/// - `n_cols` 须为 128 的倍数 (整除截断, 余数列被忽略)。
+/// - `data` 须至少覆盖 `(row_idx + 1) * groups_per_row * Q1_0_BLOCK_BYTES` 字节。
+/// - `x` 行优先: 第 t 行始于 `x[t * x_stride]`, 每行须可读 `n_cols` 个元素
+///   (与安全包装 `dot_q1_0_row_batch` 的 debug 断言一致: `x.len() >= n_batch * x_stride`、
+///   `x_stride >= n_cols`)。
+/// - `y` 须满足 `y.len() >= n_batch * y_stride`, 写入 `y[t * y_stride]`。
+/// - `x` 与 `y` 不得重叠 (pair 内先读 x 后写 y, 重叠会读到被改写的数据)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
@@ -1042,6 +1095,13 @@ pub unsafe fn dot_q1_0_row_batch_avx2(
 /// - 权重 DRAM 读取: 1× vs 2-4× (主要收益)
 /// - LUT loads: 16 vs 32 (pair-based 重复)
 /// - FMA 数: 64 vs 64 (相同)
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma+f16c` 的 CPU 上调用 (见 `avx2_q1_0_available`), 否则触发 SIGILL。
+/// - `n_cols` 须为 128 的倍数; `x.len() >= 4 * n_cols`、`y.len() >= 4` (debug 断言)。
+/// - `data` 须至少覆盖 `(row_idx + 1) * groups_per_row * Q1_0_BLOCK_BYTES` 字节。
+/// - `x` 与 `y` 不得重叠 (末尾一次性写 `y[0..4]`)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
@@ -1161,6 +1221,13 @@ pub unsafe fn dot_q1_0_row_batch4_avx2(
 ///
 /// 用途: speculative decode 的 batch verify — 一次权重 DRAM 流产出
 /// 4 个 token 的该行点积, 将 257 barriers/token 的同步开销摊薄 4 倍。
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma+f16c` 的 CPU 上调用 (见 `avx2_q1_0_available`), 否则触发 SIGILL。
+/// - `n_cols` 须为 128 的倍数; `x.len() >= 4 * n_cols`、`y.len() >= 4` (debug 断言)。
+/// - `data` 须至少覆盖 `(row_idx + 1) * groups_per_row * Q1_0_BLOCK_BYTES` 字节。
+/// - `x` 与 `y` 不得重叠 (末尾一次性写 `y[0..4]`)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
@@ -1252,6 +1319,15 @@ pub fn interleave_x4_verify(x4: &[f32], n_cols: usize, out: &mut [f32]) {
 ///
 /// x_int 必须由 `interleave_x4_verify` 生成: [group][token][128] 交错,
 /// 每 group 512B 连续 —— 与 verify4 相比 x loads 从 L2 降为 L1。
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma+f16c` 的 CPU 上调用 (见 `avx2_q1_0_available`), 否则触发 SIGILL。
+/// - `n_cols` 须为 128 的倍数; `x_int` 为交错布局且 `x_int.len() >= 4 * n_cols`、
+///   `y.len() >= 4` (debug 断言)。
+/// - `data` 须至少覆盖 `(row_idx + 1) * groups_per_row * Q1_0_BLOCK_BYTES` 字节
+///   (含对下一 group sign bytes 的 `_mm_prefetch` — prefetch 越界仅为提示, 不构成 UB)。
+/// - `x_int` 与 `y` 不得重叠 (末尾一次性写 `y[0..4]`)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
@@ -1499,6 +1575,14 @@ pub fn avx2_q4_1_available() -> bool {
 ///   6. acc = w * x + acc (FMA)
 ///
 /// 注: nibble 值 0..15 < 128, 用有符号 cvtepi8_epi32 安全 (u8 当 i8 解读不变)
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma+f16c` 的 CPU 上调用 (见 `avx2_q4_1_available`), 否则触发 SIGILL。
+/// - `n_cols` 须为 `Q4_1_GROUP_SIZE` (32) 的倍数 (整除截断, 余数列被忽略)。
+/// - `data` 须至少覆盖 `(row_idx + 1) * groups_per_row * Q4_1_BLOCK_BYTES` 字节
+///   (`groups_per_row = n_cols / 32`; 内部 `get_unchecked`/`loadu_si128`, 无边界检查)。
+/// - `x` 须至少 `n_cols` 个元素 (全部 unaligned load, 无对齐要求)。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
@@ -1582,6 +1666,17 @@ pub unsafe fn dot_q4_1_row_avx2(
 /// - hsum 次数不变 (n_batch, 每 token 行末一次)
 ///
 /// 寄存器分配 (4-token path): 4 w (shared) + 4 row_acc + 2 (d_v, m_v) + 4 x (transient) = 14/16 YMM
+///
+/// # Safety
+///
+/// - 仅可在支持 `avx2+fma+f16c` 的 CPU 上调用 (见 `avx2_q4_1_available`), 否则触发 SIGILL。
+/// - `n_cols` 须为 32 的倍数 (整除截断, 余数列被忽略)。
+/// - `data` 须至少覆盖 `(row_idx + 1) * groups_per_row * Q4_1_BLOCK_BYTES` 字节。
+/// - `x` 行优先: 第 t 行始于 `x[t * x_stride]`, 每行须可读 `n_cols` 个元素
+///   (`x.len() >= n_batch * x_stride`、`x_stride >= n_cols`)。
+/// - `y` 写入 `y[t * y_stride + row_idx]`, 须满足 `y.len() >= n_batch * y_stride` 且
+///   `row_idx < y_stride` (与安全包装 `dot_q4_1_row_batch` 的 debug 断言一致)。
+/// - `x` 与 `y` 不得重叠。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]

@@ -1158,8 +1158,8 @@ pub fn forward_batch_with_vision(
                             y, gate_vh, ssm_norm_w, state_size, l2norm_eps,
                         );
                     }
-                } else {
-                    let pool = pool.unwrap();
+                } else if let Some(pool) = pool {
+                    // (n_threads <= 1 || pool.is_none()) 已被上支条件排除, 此 if-let 必命中
                     // 捕获 raw 地址 (closure 是 Fn+Send+Sync, 需用 raw ptr 共享可变状态)
                     let ssm_q_addr = ctx.workspace.ssm_q.as_ptr() as usize;
                     let ssm_k_addr = ctx.workspace.ssm_k.as_ptr() as usize;

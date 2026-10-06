@@ -49,7 +49,7 @@ fn ms_per(total_ms: u128, n: usize) -> u128 {
 /// - Draft: drafter 预测的文本 (前端灰色乐观显示)
 /// - Accept: draft 全部通过 verify (前端保留灰色文本, 可选转黑)
 /// - Reject: draft 部分被拒, text 为通过 verify 的 accepted 部分
-///           (前端删除上一个 Draft 的全部文本, 用 text 替换, 黑色)
+///   (前端删除上一个 Draft 的全部文本, 用 text 替换, 黑色)
 /// - Delta: 正常增量 (bonus token / fallback greedy, 黑色)
 pub enum DsparkEvent {
     /// drafter 预测的文本 (乐观显示)
@@ -1277,11 +1277,9 @@ impl Engine {
                 }
                 // lossy decode: draft 可能含不完整 UTF-8 (跨 token 字符), verify 后会修正
                 let draft_text = String::from_utf8_lossy(&draft_buf).into_owned();
-                if !draft_text.is_empty() {
-                    if !on_event(DsparkEvent::Draft(draft_text)) {
-                        broke = true;
-                        break;
-                    }
+                if !draft_text.is_empty() && !on_event(DsparkEvent::Draft(draft_text)) {
+                    broke = true;
+                    break;
                 }
             }
 
