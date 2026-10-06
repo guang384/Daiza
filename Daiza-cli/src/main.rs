@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+mod calibrate;
+
 use daiza_runtime::engine::Engine;
 use daiza_engine::math::SamplingParams;
 use daiza_runtime::session::Session;
@@ -57,6 +59,7 @@ fn print_usage() {
     eprintln!("  --dump-template             输出 chat_template 原始字节 (调试用)");
     eprintln!("  --interactive               启动交互式 REPL (多轮对话, 复用 KV/SSM state)");
     eprintln!("  --self-test                 自动化验证: 对比 generate_with_params vs session_reply");
+    eprintln!("  --calibrate                 自调优: sweep GEMM_T_SUB/ACTIVE_WORKERS/MATVEC_CHUNK + 确认门限, 输出推荐 env (~8-15min)");
     eprintln!("  --help, -h                  显示本帮助");
 }
 
@@ -974,7 +977,8 @@ fn main() -> Result<()> {
         }
     };
 
-    let prompt = get_opt(&args, "--prompt").unwrap_or("你好").to_string();
+    let prompt_opt: Option<&str> = get_opt(&args, "--prompt");
+    let prompt = prompt_opt.unwrap_or("你好").to_string();
     let max_tokens: usize = get_opt(&args, "--max-tokens")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4096);
@@ -991,6 +995,18 @@ fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
     let pld = args.iter().any(|a| a == "--pld");
+    let is_calibrate = args.iter().any(|a| a == "--calibrate");
+
+    // --calibrate 模式: 交错子进程 sweep 旋钮后退出 (不加载引擎)
+    // ★ 必须在任何进程内 env 默认设置 (DAIZA_WAIT_MODE/ACTIVE_WORKERS, 见下) 之前,
+    //   让子进程从用户真实环境出发做 sweep
+    if is_calibrate {
+        // 未显式传 --prompt 时用 calibrate 内置 142-token 基准 prompt
+        // (GEMM dispatch 需 n_batch ≥ 64, 太短的 prompt 无法校准 t_sub)
+        calibrate::run(&gguf_path, prompt_opt)
+            .map_err(|e| daiza_engine::BonsaiError::Unsupported(format!("--calibrate: {e}")))?;
+        return Ok(());
+    }
 
     println!("[daiza-cli] Loading: {}", gguf_path.display());
 
