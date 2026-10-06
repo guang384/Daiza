@@ -49,7 +49,7 @@ fn bench(n_tokens: usize, iters: usize, mats: &[Q1_0Matrix]) {
     }
     // 数值验证：用 dot_q1_0_row_avx2 单行单 token 做参照 (前 64 行)
     let mut y_ref = vec![0.0f32; n_tokens * rows];
-    for m in mats {
+    if let Some(m) = mats.first() {
         for t in 0..n_tokens {
             for i in 0..rows.min(64) {
                 unsafe {
@@ -59,7 +59,6 @@ fn bench(n_tokens: usize, iters: usize, mats: &[Q1_0Matrix]) {
                 }
             }
         }
-        break; // one matrix for correctness spot check
     }
 
     // 实测路径 (与 weights.rs dispatch 条件一致): >=64 走 GEMM, 其余走 batch kernel
@@ -100,14 +99,14 @@ fn bench_workers(mats: &[Q1_0Matrix], saved_active: usize) {
     let configs = [9usize, 12, 13];
     const ROUNDS: usize = 3;
     let mut times = [[0f64; 3]; ROUNDS];
-    for r in 0..ROUNDS {
+    for row in times.iter_mut() {
         for (ci, &n) in configs.iter().enumerate() {
             workspace::set_active_workers(n);
             let t0 = Instant::now();
             for m in mats {
                 m.matvec_batch_into_slice(&x, n_tokens, &mut y);
             }
-            times[r][ci] = t0.elapsed().as_secs_f64() * 1000.0;
+            row[ci] = t0.elapsed().as_secs_f64() * 1000.0;
         }
     }
     workspace::set_active_workers(saved_active);

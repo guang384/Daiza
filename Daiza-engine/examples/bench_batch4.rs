@@ -129,13 +129,12 @@ fn main() {
 
     // Correctness: verify4t vs single (token0 lanes must match single output)
     let mut max_err_c = 0.0f32;
-    for m in &mats {
+    if let Some(m) = mats.first() {
         m.matvec_into_slice(&x_single[..m.cols], &mut y_single);
-        for i in 0..m.rows {
-            let e = (y_single[i] - y_verify_t[i]).abs();
+        for (i, &ys) in y_single[..m.rows].iter().enumerate() {
+            let e = (ys - y_verify_t[i]).abs();
             if e > max_err_c { max_err_c = e; }
         }
-        break; // one matrix is enough for the spot check
     }
 
     println!("DRAM-resident workload: {} matrices x {} rows (total {:.0} MB)", N_MATRICES, ROWS, total_mb);

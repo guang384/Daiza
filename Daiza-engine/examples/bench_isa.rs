@@ -48,8 +48,8 @@ unsafe fn fma_avx512(iters: usize) -> f32 {
     let b = _mm512_set1_ps(1.0000001);
     let c = _mm512_set1_ps(0.0000001);
     for _ in 0..iters {
-        for i in 0..8 {
-            acc[i] = _mm512_fmadd_ps(b, acc[i], c);
+        for a in &mut acc {
+            *a = _mm512_fmadd_ps(b, *a, c);
         }
     }
     let mut s = 0.0f32;
@@ -155,6 +155,6 @@ fn main() {
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
-    let r = unsafe { std::arch::x86_64::__cpuid_count(leaf, sub) };
+    let r = std::arch::x86_64::__cpuid_count(leaf, sub);
     (r.eax, r.ebx, r.ecx, r.edx)
 }

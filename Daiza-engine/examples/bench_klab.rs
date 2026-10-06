@@ -99,6 +99,7 @@ static LUT8K: [f32; 2048] = {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn quad_v1(
     bytes: &[u8],
     ptrs: &[*const f32; 256],
@@ -208,6 +209,7 @@ unsafe fn hsum(v: std::arch::x86_64::__m256) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 #[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn quad_v4(
     bytes: &[u8],
     signs16: &[u16],
@@ -486,12 +488,12 @@ fn main() {
         .iter()
         .map(|m| make_signs16(&m.bytes, m.rows, m.cols))
         .collect();
-    let mut ptrs_table: Vec<[*const f32; 256]> = mats
+    let ptrs_table: Vec<[*const f32; 256]> = mats
         .iter()
         .map(|_| {
             let mut t: [*const f32; 256] = [LUT8K.as_ptr(); 256];
-            for b in 0..256 {
-                t[b] = unsafe { LUT8K.as_ptr().add(b * 8) };
+            for (b, slot) in t.iter_mut().enumerate() {
+                *slot = unsafe { LUT8K.as_ptr().add(b * 8) };
             }
             t
         })
@@ -547,12 +549,12 @@ fn main() {
 
     for round in 0..rounds {
         let mut row_t = [0f64; N_VARIANTS];
-        for v in 0..N_VARIANTS {
+        for (v, slot) in row_t.iter_mut().enumerate() {
             let t = Instant::now();
             for mi in 0..N_MATRICES {
                 dispatch_variant(v, &mats, &signs, &ptrs_table, mi, &x, &mut y, lab_chunk());
             }
-            row_t[v] = t.elapsed().as_secs_f64() * 1000.0;
+            *slot = t.elapsed().as_secs_f64() * 1000.0;
         }
         if round >= warmup {
             times.push(row_t);
@@ -561,16 +563,16 @@ fn main() {
 
     let names = ["V0 engine-quad", "V1 ptr-table ", "V4 u16-presign", "V5 boundary-fold", "V5b zero-start "];
     let mut med = [0f64; N_VARIANTS];
-    for v in 0..N_VARIANTS {
+    for (v, m) in med.iter_mut().enumerate() {
         let mut ts: Vec<f64> = times.iter().map(|t| t[v]).collect();
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        med[v] = ts[ts.len() / 2];
+        *m = ts[ts.len() / 2];
     }
     println!("\n{:<16} {:>10} {:>12} {:>10}", "variant", "ms/rot", "ms/matvec", "GMAC/s");
-    for v in 0..N_VARIANTS {
-        let mm = med[v] / N_MATRICES as f64;
+    for (v, &m) in med.iter().enumerate() {
+        let mm = m / N_MATRICES as f64;
         let gmacs = (ROWS as f64 * COLS as f64) / mm / 1000.0;
-        println!("{:<16} {:>10.2} {:>12.3} {:>10.0}", names[v], med[v], mm, gmacs);
+        println!("{:<16} {:>10.2} {:>12.3} {:>10.0}", names[v], m, mm, gmacs);
     }
     let base = med[0];
     for v in 1..N_VARIANTS {
@@ -617,6 +619,7 @@ fn main() {
     println!("({} paired rounds)", pairs.len());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_variant(
     v: usize,
     mats: &[Q1_0Matrix],
