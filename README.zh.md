@@ -437,7 +437,9 @@ Vision prefill 从逐 token 注入 (132s) 改为分批 batched 注入 (MAX_VISIO
 | prefill (142 token) | ~10.0s (~71ms/token) | 达 FMA roofline ~95%(实测 ~715 GFLOPS vs 峰值 755) |
 | decode | ~143ms/token (7.0 tok/s) | Q1_0 LUT 内核 FMA port 饱和,V0-V6 变体空间已穷尽 |
 
-- decode 阶段 block 分解(热态 profile):attn(16) ~34ms + ssm(48) ~102ms + mlp(64) ~85ms + lm_head 6ms,MLP 占 58% 已饱和
+- decode 阶段分解(DAIZA_PROFILE 实测,每 token):attention 前向段 ~11.5ms + SSM 前向段
+  ~38.5ms + MLP ~83.5ms(64 块,占 ~60%) + post_norm ~0.2ms + lm_head ~5.6ms ≈ 143ms/token;
+  MLP 以 Q1_0 LUT 计算为主,已随 V0-V6 内核变体搜索到 FMA port 饱和
 - 内存带宽实测 ~120 GB/s;decode 为 compute-bound(带宽地板 ~29ms vs 实测 143ms),瓶颈在 LUT 查表的 FMA 吞吐而非带宽
 - 内存占用:~13 GB (Q1_0 权重) + ~1.3 GB (KV/SSM/激活) + ~1.6 GB (mmproj,可选)
 - prefill 优化战役(17 个 perf commit):GEMM dispatch 修复 + f16 scratch + L2 布局参数调优 +

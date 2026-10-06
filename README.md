@@ -436,7 +436,7 @@ Test conditions: greedy sampling, 142-token prompt.
 | Prefill (142 tokens) | ~10.0s (~71ms/token) | ~95% of the FMA roofline (~715 GFLOPS measured vs 755 peak) |
 | Decode | ~143ms/token (7.0 tok/s) | Q1_0 LUT kernel saturated at FMA ports; V0-V6 variant space exhausted |
 
-- Decode block breakdown (hot-state profile): attn(16) ~34ms + ssm(48) ~102ms + mlp(64) ~85ms + lm_head 6ms; MLP takes 58% and is saturated.
+- Decode breakdown (DAIZA_PROFILE, per token): attention-forward ~11.5ms + SSM-forward ~38.5ms + MLP ~83.5ms (64 blocks, ~60%) + post_norm ~0.2ms + lm_head ~5.6ms ≈ 143ms/token; the MLP is dominated by Q1_0 LUT compute and is saturated at FMA ports after the V0-V6 kernel-variant search.
 - Measured memory bandwidth ~120 GB/s; decode is compute-bound (bandwidth floor ~29ms vs 143ms measured) — the bottleneck is FMA throughput of the LUT lookups, not bandwidth.
 - Memory footprint: ~13 GB (Q1_0 weights) + ~1.3 GB (KV/SSM/activations) + ~1.6 GB (mmproj, optional).
 - Prefill optimization campaign (17 perf commits): GEMM dispatch fixes + f16 scratch + L2 layout tuning + serial-segment parallelization (attention online-softmax / SSM scan / swiglu across tokens) + heterogeneous work-stealing, 16.4s → 10.0s (-39%); all optimizations byte-identical under greedy, zero quality loss.

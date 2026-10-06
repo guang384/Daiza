@@ -432,6 +432,8 @@ pub fn forward_batch_with_vision(
     let mut p_batch_matvec = std::time::Duration::ZERO;
     let mut p_attn_serial = std::time::Duration::ZERO;
     let mut p_ssm_serial = std::time::Duration::ZERO;
+    // SSM 两阶段细分计时 (DAIZA_PROFILE 下随 ssm_detail 行打印;
+    // phase_a = Phase A scatter + 环形更新, phase_b = Phase B v_head 链)
     let mut p_ssm_phase_a = std::time::Duration::ZERO;
     let mut p_ssm_phase_b = std::time::Duration::ZERO;
     let mut p_swiglu = std::time::Duration::ZERO;

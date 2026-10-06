@@ -31,6 +31,9 @@ const SWEPT_VARS: &[&str] = &[
     "DAIZA_GEMM_T_SUB",
     "DAIZA_ACTIVE_WORKERS",
     "DAIZA_MATVEC_CHUNK",
+    // DAIZA_THREADS 决定池大小 (n_workers): 不清除时 ACTIVE_WORKERS 候选会被
+    // min(n_workers, x) 截断, Stage 2 sweep 失真 — 必须清除走默认全核
+    "DAIZA_THREADS",
     "DAIZA_PREFILL_WORKERS",
     "DAIZA_WAIT_MODE",
     "DAIZA_SPIN_ROUNDS",
